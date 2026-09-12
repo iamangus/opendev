@@ -352,10 +352,10 @@ func publishApprovedJob(ctx context.Context, jobID string, config Config) (*pipe
 		return nil, fmt.Errorf("job %s is not approved for publication", job.ID)
 	}
 
-	if job.PullRequestTitle == "" || job.PullRequestBody == "" {
-		return nil, fmt.Errorf("job %s has no generated pull request presentation", job.ID)
-	}
 	if job.PullRequestNumber == 0 {
+		if job.PullRequestTitle == "" || job.PullRequestBody == "" {
+			return nil, fmt.Errorf("job %s has no generated pull request presentation", job.ID)
+		}
 		pr, err := config.GitHub.CreatePR(ctx, githubpkg.CreatePROptions{
 			Repo: job.Repository, Title: job.PullRequestTitle, Head: job.IntegrationBranch,
 			Base: job.TargetBranch, Body: job.PullRequestBody, Draft: false,
@@ -367,8 +367,13 @@ func publishApprovedJob(ctx context.Context, jobID string, config Config) (*pipe
 		if err != nil {
 			return nil, fmt.Errorf("record pull request: %w", err)
 		}
-	} else if err := config.GitHub.UpdatePR(ctx, job.Repository, job.PullRequestNumber, job.PullRequestTitle, job.PullRequestBody); err != nil {
-		return nil, fmt.Errorf("update pull request: %w", err)
+	} else if job.PullRequestTitle != "" && job.PullRequestBody != "" {
+		if err := config.GitHub.UpdatePR(ctx, job.Repository, job.PullRequestNumber, job.PullRequestTitle, job.PullRequestBody); err != nil {
+			return nil, fmt.Errorf("update pull request: %w", err)
+		}
+	} else {
+		// Terminal reviews recorded before generated PR content was introduced
+		// retain their existing GitHub presentation during reconciliation.
 	}
 
 	pr, err := config.GitHub.GetPR(ctx, job.Repository, job.PullRequestNumber)
