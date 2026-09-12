@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -242,9 +243,6 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 	// Agent outcomes are applied only by the dispatcher after its terminal
 	// response has been durably stored; role MCP endpoints are inspection-only.
 	jobDispatcher.outcomeHandler = jobmcp.OutcomeHandler(jobMCPConfig)
-	if _, err := jobDispatcher.get(context.Background()); err != nil {
-		logger.Error("startup dispatch reconciliation failed", "error", err)
-	}
 	mcpMux.Handle("/mcp", jobmcp.New(jobMCPConfig))
 	if graphServer != nil {
 		mcpMux.Handle("/mcp/repository-graph", graphServer)
@@ -282,11 +280,23 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 	// intentionally left unregistered.
 	top := requireMCPToken(mcpToken, mcpMux)
 
-	logger.Info("starting multi-server", "addr", addr, "repos_dir", reposDir)
-	if err := http.ListenAndServe(addr, top); err != nil {
-		logger.Error("server failed", "error", err)
-		os.Exit(1)
+	// Reconciliation can launch agent runs with MCP attachments. Accept those
+	// connections before dispatching anything from durable state.
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		logger.Error("server failed to listen", "error", err)
+		return
 	}
+	logger.Info("starting multi-server", "addr", addr, "repos_dir", reposDir)
+	go func() {
+		if err := http.Serve(listener, top); err != nil {
+			logger.Error("server failed", "error", err)
+		}
+	}()
+	if _, err := jobDispatcher.get(context.Background()); err != nil {
+		logger.Error("startup dispatch reconciliation failed", "error", err)
+	}
+	select {}
 }
 
 // syncOwnedRepositories gives a standalone OpenDev installation its own local
