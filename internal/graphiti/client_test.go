@@ -52,13 +52,14 @@ func TestClientPostsMessagesAndSearchesConfiguredGroup(t *testing.T) {
 func TestClientReportsNonSuccessAndHonorsCanceledContext(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"detail":"Graphiti unavailable"}`))
 	}))
 	defer server.Close()
 	client, err := NewClient(server.URL, "opendev-repositories")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.Search(context.Background(), "status", SearchOptions{}); err == nil || !strings.Contains(err.Error(), "503") {
+	if _, err := client.Search(context.Background(), "status", SearchOptions{}); err == nil || !strings.Contains(err.Error(), "503") || !strings.Contains(err.Error(), "Graphiti unavailable") {
 		t.Fatalf("Search error = %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())

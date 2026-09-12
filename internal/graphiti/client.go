@@ -108,7 +108,10 @@ func (c *Client) doJSON(ctx context.Context, path string, input, output any) err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if detail := strings.TrimSpace(string(body)); detail != "" {
+			return fmt.Errorf("Graphiti request failed: %s: %s", resp.Status, detail)
+		}
 		return fmt.Errorf("Graphiti request failed: %s", resp.Status)
 	}
 	if output != nil {
