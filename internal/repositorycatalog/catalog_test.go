@@ -25,7 +25,7 @@ func (r *fakeMetadataReader) ReadGitMetadata(_ context.Context, path string) (Gi
 func TestCatalogRefreshPersistsCanonicalRepositoryRecord(t *testing.T) {
 	dir := t.TempDir()
 	reader := &fakeMetadataReader{metadata: GitMetadata{
-		OriginURL: "https://github.com/Owner/Repo.git",
+		OriginURL: "https://x-access-token:secret@github.com/Owner/Repo.git",
 		HeadSHA:   "abc123",
 		Aliases:   []string{"repo", "repo"},
 		Domains:   []string{"api.example.test", "example.test"},
@@ -41,6 +41,9 @@ func TestCatalogRefreshPersistsCanonicalRepositoryRecord(t *testing.T) {
 	}
 	if reader.path != "/repos/repo" || saved.Name != "owner/repo" || saved.Path != "/repos/repo" || saved.HeadSHA != "abc123" {
 		t.Fatalf("Refresh = %+v, reader path = %q", saved, reader.path)
+	}
+	if saved.OriginURL != "https://github.com/Owner/Repo.git" {
+		t.Fatalf("OriginURL = %q", saved.OriginURL)
 	}
 	if !reflect.DeepEqual(saved.Aliases, []string{"repo"}) || !reflect.DeepEqual(saved.Domains, []string{"api.example.test", "example.test"}) || !reflect.DeepEqual(saved.Topics, []string{"go", "tools"}) {
 		t.Fatalf("normalized fields = %+v", saved)

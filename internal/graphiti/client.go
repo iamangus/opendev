@@ -15,6 +15,7 @@ import (
 // Message is one item to add to a Graphiti group.
 type Message struct {
 	Content           string `json:"content"`
+	Role              string `json:"role"`
 	RoleType          string `json:"role_type"`
 	Name              string `json:"name"`
 	SourceDescription string `json:"source_description"`
@@ -66,8 +67,8 @@ func (c *Client) AddMessages(ctx context.Context, messages []Message) error {
 		if strings.TrimSpace(message.Content) == "" {
 			return fmt.Errorf("Graphiti message %d content is required", i)
 		}
-		if strings.TrimSpace(message.RoleType) == "" || strings.TrimSpace(message.Name) == "" || strings.TrimSpace(message.SourceDescription) == "" || strings.TrimSpace(message.Timestamp) == "" {
-			return fmt.Errorf("Graphiti message %d role type, name, source description, and timestamp are required", i)
+		if strings.TrimSpace(message.Role) == "" || strings.TrimSpace(message.RoleType) == "" || strings.TrimSpace(message.Name) == "" || strings.TrimSpace(message.SourceDescription) == "" || strings.TrimSpace(message.Timestamp) == "" {
+			return fmt.Errorf("Graphiti message %d role, role type, name, source description, and timestamp are required", i)
 		}
 	}
 	return c.doJSON(ctx, "/messages", map[string]any{"group_id": c.groupID, "messages": messages}, nil)

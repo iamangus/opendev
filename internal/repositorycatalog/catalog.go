@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -127,6 +128,7 @@ func (c *Catalog) Save(record Record) (*Record, error) {
 		return nil, fmt.Errorf("repository path is required")
 	}
 	record.Name = name
+	record.OriginURL = sanitizeOriginURL(record.OriginURL)
 	record.Aliases = normalizedStrings(record.Aliases)
 	record.Domains = normalizedStrings(record.Domains)
 	record.Topics = normalizedStrings(record.Topics)
@@ -233,4 +235,14 @@ func normalizedStrings(values []string) []string {
 	}
 	sort.Strings(result)
 	return result
+}
+
+func sanitizeOriginURL(origin string) string {
+	origin = strings.TrimSpace(origin)
+	u, err := url.Parse(origin)
+	if err != nil || u.User == nil {
+		return origin
+	}
+	u.User = nil
+	return u.String()
 }

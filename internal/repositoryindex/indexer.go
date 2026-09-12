@@ -80,6 +80,7 @@ func (i *Indexer) Index(ctx context.Context, snapshot Snapshot) (*State, error) 
 	}
 	message := graphiti.Message{
 		Content:           buildEvidence(snapshot),
+		Role:              "user",
 		RoleType:          "user",
 		Name:              "opendev-repository-indexer",
 		SourceDescription: fmt.Sprintf("repository %s at commit %s", snapshot.Name, snapshot.SHA),
