@@ -10,6 +10,34 @@ import (
 	"testing"
 )
 
+func TestHTTPClient_ListOwnedRepositories(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("expected GET, got %s", r.Method)
+		}
+		if r.URL.Path != "/user/repos" || r.URL.Query().Get("affiliation") != "owner" || r.URL.Query().Get("per_page") != "100" {
+			t.Errorf("unexpected request: %s", r.URL.String())
+		}
+		if r.Header.Get("Authorization") != "Bearer test-token" {
+			t.Errorf("wrong auth header: %s", r.Header.Get("Authorization"))
+		}
+		json.NewEncoder(w).Encode([]map[string]any{
+			{"name": "owned", "full_name": "owner/owned", "clone_url": "https://github.com/owner/owned.git", "default_branch": "main"},
+			{"name": "other", "full_name": "other/other", "clone_url": "https://github.com/other/other.git", "default_branch": "main"},
+		})
+	}))
+	defer srv.Close()
+
+	c := NewHTTPClient("test-token", "owner", slog.Default(), WithBaseURL(srv.URL))
+	repos, err := c.ListOwnedRepositories(context.Background())
+	if err != nil {
+		t.Fatalf("ListOwnedRepositories: %v", err)
+	}
+	if len(repos) != 1 || repos[0].FullName != "owner/owned" {
+		t.Fatalf("unexpected repositories: %+v", repos)
+	}
+}
+
 func TestHTTPClient_GetRepository(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -62,7 +90,7 @@ func TestHTTPClient_CreateRepository(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Errorf("expected POST, got %s", r.Method)
 		}
-		if r.URL.Path != "/orgs/owner/repos" {
+		if r.URL.Path != "/user/repos" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
 		var body map[string]any

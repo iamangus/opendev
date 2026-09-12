@@ -143,6 +143,9 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 		logger.Error("manager initialization failed", "error", err)
 		os.Exit(1)
 	}
+	if ghClient != nil {
+		syncOwnedRepositories(context.Background(), ghClient, mgr, logger)
+	}
 
 	var mu sync.RWMutex
 	handlers := make(map[string]http.Handler)
@@ -281,6 +284,31 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 		logger.Error("server failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+// syncOwnedRepositories gives a standalone OpenDev installation its own local
+// mirrors. Failures are logged per repository so one inaccessible repository
+// never prevents already-synced jobs from running.
+type repositorySyncer interface {
+	SyncRepo(repoURL, name string) error
+}
+
+func syncOwnedRepositories(ctx context.Context, ghClient githubpkg.Client, syncer repositorySyncer, logger *slog.Logger) {
+	repos, err := ghClient.ListOwnedRepositories(ctx)
+	if err != nil {
+		logger.Warn("owned repository bootstrap failed", "error", err)
+		return
+	}
+	for _, repo := range repos {
+		if strings.TrimSpace(repo.Name) == "" || strings.TrimSpace(repo.CloneURL) == "" {
+			logger.Warn("owned repository bootstrap skipped incomplete repository metadata", "repository", repo.FullName)
+			continue
+		}
+		if err := syncer.SyncRepo(repo.CloneURL, repo.Name); err != nil {
+			logger.Warn("owned repository sync failed", "repository", repo.Name, "error", err)
+		}
+	}
+	logger.Info("owned repository bootstrap complete", "count", len(repos))
 }
 
 // initializeRepositoryGraph refreshes the local catalog and indexes only clean,

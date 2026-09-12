@@ -10,6 +10,7 @@ var ErrNotFound = errors.New("github: resource not found")
 
 // Client is the interface for GitHub API operations.
 type Client interface {
+	ListOwnedRepositories(ctx context.Context) ([]Repository, error)
 	GetRepository(ctx context.Context, name string) (*Repository, error)
 	CreateRepository(ctx context.Context, name, description string, private bool) (*Repository, error)
 	ForkPublicRepository(ctx context.Context, upstreamOwner, upstreamRepo, name string, private bool) (*Repository, error)

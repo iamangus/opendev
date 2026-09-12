@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,11 +14,45 @@ import (
 	"strings"
 	"testing"
 
+	githubpkg "github.com/iamangus/code-mcp/internal/github"
 	"github.com/iamangus/code-mcp/internal/gitops"
 	"github.com/iamangus/code-mcp/internal/locks"
 	"github.com/iamangus/code-mcp/internal/manager"
 	"github.com/mark3labs/mcp-go/server"
 )
+
+type fakeRepositorySyncer struct {
+	calls [][2]string
+	err   error
+}
+
+func (s *fakeRepositorySyncer) SyncRepo(url, name string) error {
+	s.calls = append(s.calls, [2]string{url, name})
+	return s.err
+}
+
+func TestSyncOwnedRepositories(t *testing.T) {
+	client := githubpkg.NewFakeClient()
+	client.ListOwnedRepositoriesResult = []githubpkg.Repository{
+		{Name: "valid", FullName: "owner/valid", CloneURL: "https://github.com/owner/valid.git"},
+		{Name: "missing-url", FullName: "owner/missing-url"},
+	}
+	syncer := &fakeRepositorySyncer{}
+	syncOwnedRepositories(context.Background(), client, syncer, slog.Default())
+	if len(syncer.calls) != 1 || syncer.calls[0] != [2]string{"https://github.com/owner/valid.git", "valid"} {
+		t.Fatalf("unexpected sync calls: %#v", syncer.calls)
+	}
+}
+
+func TestSyncOwnedRepositoriesContinuesAfterSyncError(t *testing.T) {
+	client := githubpkg.NewFakeClient()
+	client.ListOwnedRepositoriesResult = []githubpkg.Repository{{Name: "valid", CloneURL: "https://github.com/owner/valid.git"}}
+	syncer := &fakeRepositorySyncer{err: errors.New("clone failed")}
+	syncOwnedRepositories(context.Background(), client, syncer, slog.Default())
+	if len(syncer.calls) != 1 {
+		t.Fatalf("expected one sync attempt, got %d", len(syncer.calls))
+	}
+}
 
 // initGitRepo creates a minimal git repository with an initial commit.
 func initGitRepo(t *testing.T, dir string) {

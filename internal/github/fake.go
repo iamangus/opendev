@@ -10,21 +10,23 @@ type FakeClient struct {
 	mu    sync.Mutex
 	Calls []FakeCall
 
-	GetRepositoryResult        *Repository
-	GetRepositoryError         error
-	CreateRepositoryResult     *Repository
-	CreateRepositoryError      error
-	ForkPublicRepositoryResult *Repository
-	ForkPublicRepositoryError  error
-	CreatePRResult             *PR
-	CreatePRError              error
-	UpdatePRError              error
-	PromotePRError             error
-	GetPRResult                *PR
-	GetPRError                 error
-	GetPRChecksResult          *PRChecks
-	GetPRChecksError           error
-	MergePRError               error
+	ListOwnedRepositoriesResult []Repository
+	ListOwnedRepositoriesError  error
+	GetRepositoryResult         *Repository
+	GetRepositoryError          error
+	CreateRepositoryResult      *Repository
+	CreateRepositoryError       error
+	ForkPublicRepositoryResult  *Repository
+	ForkPublicRepositoryError   error
+	CreatePRResult              *PR
+	CreatePRError               error
+	UpdatePRError               error
+	PromotePRError              error
+	GetPRResult                 *PR
+	GetPRError                  error
+	GetPRChecksResult           *PRChecks
+	GetPRChecksError            error
+	MergePRError                error
 }
 
 // FakeCall records a method invocation.
@@ -36,12 +38,20 @@ type FakeCall struct {
 // NewFakeClient creates a FakeClient with sensible defaults.
 func NewFakeClient() *FakeClient {
 	return &FakeClient{
-		GetRepositoryResult:        &Repository{Name: "test", FullName: "test/test", CloneURL: "https://github.com/test/test.git", DefaultBranch: "main"},
-		CreateRepositoryResult:     &Repository{Name: "test", FullName: "test/test", CloneURL: "https://github.com/test/test.git", DefaultBranch: "main"},
-		ForkPublicRepositoryResult: &Repository{Name: "test", FullName: "test/test", CloneURL: "https://github.com/test/test.git", DefaultBranch: "main", Fork: true},
-		CreatePRResult:             &PR{Number: 1, HTMLURL: "https://github.com/test/test/pull/1"},
-		GetPRResult:                &PR{Number: 1, HTMLURL: "https://github.com/test/test/pull/1"},
+		ListOwnedRepositoriesResult: []Repository{{Name: "test", FullName: "test/test", CloneURL: "https://github.com/test/test.git", DefaultBranch: "main"}},
+		GetRepositoryResult:         &Repository{Name: "test", FullName: "test/test", CloneURL: "https://github.com/test/test.git", DefaultBranch: "main"},
+		CreateRepositoryResult:      &Repository{Name: "test", FullName: "test/test", CloneURL: "https://github.com/test/test.git", DefaultBranch: "main"},
+		ForkPublicRepositoryResult:  &Repository{Name: "test", FullName: "test/test", CloneURL: "https://github.com/test/test.git", DefaultBranch: "main", Fork: true},
+		CreatePRResult:              &PR{Number: 1, HTMLURL: "https://github.com/test/test/pull/1"},
+		GetPRResult:                 &PR{Number: 1, HTMLURL: "https://github.com/test/test/pull/1"},
 	}
+}
+
+func (f *FakeClient) ListOwnedRepositories(_ context.Context) ([]Repository, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, FakeCall{Method: "ListOwnedRepositories"})
+	return f.ListOwnedRepositoriesResult, f.ListOwnedRepositoriesError
 }
 
 func (f *FakeClient) GetRepository(_ context.Context, name string) (*Repository, error) {

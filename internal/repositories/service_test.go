@@ -44,6 +44,10 @@ func newFakeGitHub() *fakeGitHub {
 	return &fakeGitHub{repositories: make(map[string]*github.Repository)}
 }
 
+func (f *fakeGitHub) ListOwnedRepositories(context.Context) ([]github.Repository, error) {
+	return nil, nil
+}
+
 func (f *fakeGitHub) GetRepository(_ context.Context, name string) (*github.Repository, error) {
 	f.getCalls++
 	repo, ok := f.repositories[name]

@@ -45,6 +45,29 @@ func NewHTTPClient(token, owner string, logger *slog.Logger, opts ...HTTPClientO
 	return c
 }
 
+// ListOwnedRepositories returns repositories owned by the authenticated user
+// that belong to this client's configured owner. This seeds OpenDev's local
+// repository mirror without exposing arbitrary clone URLs to agents.
+func (c *HTTPClient) ListOwnedRepositories(ctx context.Context) ([]Repository, error) {
+	start := time.Now()
+	var repos []Repository
+	if err := c.do(ctx, http.MethodGet, "/user/repos?affiliation=owner&per_page=100", nil, &repos); err != nil {
+		c.logger.Error("github: ListOwnedRepositories failed", "owner", c.owner, "error", err, "duration_ms", time.Since(start).Milliseconds())
+		return nil, err
+	}
+
+	prefix := c.owner + "/"
+	owned := repos[:0]
+	for _, repo := range repos {
+		if repo.FullName == "" || repo.FullName == prefix[:len(prefix)-1] || len(repo.FullName) <= len(prefix) || repo.FullName[:len(prefix)] != prefix {
+			continue
+		}
+		owned = append(owned, repo)
+	}
+	c.logger.Info("github: owned repositories retrieved", "owner", c.owner, "count", len(owned), "duration_ms", time.Since(start).Milliseconds())
+	return owned, nil
+}
+
 func (c *HTTPClient) GetRepository(ctx context.Context, name string) (*Repository, error) {
 	start := time.Now()
 	path := fmt.Sprintf("/repos/%s/%s", c.owner, name)
@@ -60,7 +83,7 @@ func (c *HTTPClient) GetRepository(ctx context.Context, name string) (*Repositor
 
 func (c *HTTPClient) CreateRepository(ctx context.Context, name, description string, private bool) (*Repository, error) {
 	start := time.Now()
-	path := fmt.Sprintf("/orgs/%s/repos", c.owner)
+	path := "/user/repos"
 	payload := map[string]any{
 		"name":        name,
 		"description": description,
