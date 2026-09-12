@@ -242,6 +242,9 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 	// Agent outcomes are applied only by the dispatcher after its terminal
 	// response has been durably stored; role MCP endpoints are inspection-only.
 	jobDispatcher.outcomeHandler = jobmcp.OutcomeHandler(jobMCPConfig)
+	if _, err := jobDispatcher.get(context.Background()); err != nil {
+		logger.Error("startup dispatch reconciliation failed", "error", err)
+	}
 	mcpMux.Handle("/mcp", jobmcp.New(jobMCPConfig))
 	if graphServer != nil {
 		mcpMux.Handle("/mcp/repository-graph", graphServer)
@@ -463,24 +466,29 @@ func (d *lazyDispatcher) StartHolistic(ctx context.Context, job *pipeline.Job) (
 
 func (d *lazyDispatcher) get(ctx context.Context) (*dispatcher.Dispatcher, error) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.dispatcher != nil {
-		return d.dispatcher, nil
+		inner := d.dispatcher
+		d.mu.Unlock()
+		return inner, nil
 	}
 	url := strings.TrimSpace(os.Getenv("AGENTFOUNDRY_URL"))
 	if url == "" {
+		d.mu.Unlock()
 		return nil, fmt.Errorf("AGENTFOUNDRY_URL is required to dispatch an agent run")
 	}
 	client, err := agentfoundry.NewClient(url, os.Getenv("AGENTFOUNDRY_API_KEY"))
 	if err != nil {
+		d.mu.Unlock()
 		return nil, fmt.Errorf("configure AgentFoundry dispatcher: %w", err)
 	}
 	inner, err := dispatcher.New(client, d.runStore, dispatcher.Config{Logger: d.logger, OutcomeHandler: d.outcomeHandler})
 	if err != nil {
+		d.mu.Unlock()
 		return nil, err
 	}
 	d.dispatcher = inner
 	d.runner = client
+	d.mu.Unlock()
 	if err := inner.Reconcile(ctx); err != nil {
 		return nil, fmt.Errorf("reconcile AgentFoundry runs: %w", err)
 	}
