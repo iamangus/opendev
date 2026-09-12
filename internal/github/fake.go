@@ -10,10 +10,21 @@ type FakeClient struct {
 	mu    sync.Mutex
 	Calls []FakeCall
 
-	CreatePRResult *PR
-	CreatePRError  error
-	UpdatePRError  error
-	PromotePRError error
+	GetRepositoryResult        *Repository
+	GetRepositoryError         error
+	CreateRepositoryResult     *Repository
+	CreateRepositoryError      error
+	ForkPublicRepositoryResult *Repository
+	ForkPublicRepositoryError  error
+	CreatePRResult             *PR
+	CreatePRError              error
+	UpdatePRError              error
+	PromotePRError             error
+	GetPRResult                *PR
+	GetPRError                 error
+	GetPRChecksResult          *PRChecks
+	GetPRChecksError           error
+	MergePRError               error
 }
 
 // FakeCall records a method invocation.
@@ -25,8 +36,33 @@ type FakeCall struct {
 // NewFakeClient creates a FakeClient with sensible defaults.
 func NewFakeClient() *FakeClient {
 	return &FakeClient{
-		CreatePRResult: &PR{Number: 1, HTMLURL: "https://github.com/test/test/pull/1"},
+		GetRepositoryResult:        &Repository{Name: "test", FullName: "test/test", CloneURL: "https://github.com/test/test.git", DefaultBranch: "main"},
+		CreateRepositoryResult:     &Repository{Name: "test", FullName: "test/test", CloneURL: "https://github.com/test/test.git", DefaultBranch: "main"},
+		ForkPublicRepositoryResult: &Repository{Name: "test", FullName: "test/test", CloneURL: "https://github.com/test/test.git", DefaultBranch: "main", Fork: true},
+		CreatePRResult:             &PR{Number: 1, HTMLURL: "https://github.com/test/test/pull/1"},
+		GetPRResult:                &PR{Number: 1, HTMLURL: "https://github.com/test/test/pull/1"},
 	}
+}
+
+func (f *FakeClient) GetRepository(_ context.Context, name string) (*Repository, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, FakeCall{Method: "GetRepository", Args: []any{name}})
+	return f.GetRepositoryResult, f.GetRepositoryError
+}
+
+func (f *FakeClient) CreateRepository(_ context.Context, name, description string, private bool) (*Repository, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, FakeCall{Method: "CreateRepository", Args: []any{name, description, private}})
+	return f.CreateRepositoryResult, f.CreateRepositoryError
+}
+
+func (f *FakeClient) ForkPublicRepository(_ context.Context, upstreamOwner, upstreamRepo, name string, private bool) (*Repository, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, FakeCall{Method: "ForkPublicRepository", Args: []any{upstreamOwner, upstreamRepo, name, private}})
+	return f.ForkPublicRepositoryResult, f.ForkPublicRepositoryError
 }
 
 func (f *FakeClient) CreatePR(_ context.Context, opts CreatePROptions) (*PR, error) {
@@ -48,6 +84,27 @@ func (f *FakeClient) PromotePR(_ context.Context, repo string, number int) error
 	defer f.mu.Unlock()
 	f.Calls = append(f.Calls, FakeCall{Method: "PromotePR", Args: []any{repo, number}})
 	return f.PromotePRError
+}
+
+func (f *FakeClient) GetPR(_ context.Context, repo string, number int) (*PR, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, FakeCall{Method: "GetPR", Args: []any{repo, number}})
+	return f.GetPRResult, f.GetPRError
+}
+
+func (f *FakeClient) GetPRChecks(_ context.Context, repo, ref string) (*PRChecks, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, FakeCall{Method: "GetPRChecks", Args: []any{repo, ref}})
+	return f.GetPRChecksResult, f.GetPRChecksError
+}
+
+func (f *FakeClient) MergePR(_ context.Context, repo string, number int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, FakeCall{Method: "MergePR", Args: []any{repo, number}})
+	return f.MergePRError
 }
 
 // Compile-time check that FakeClient implements Client.

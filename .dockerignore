@@ -2,7 +2,7 @@
 .git
 
 # Build artifacts
-/code-mcp
+/opendev
 /dist/
 
 # Secrets

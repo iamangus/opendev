@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 )
 
 var validBranchName = regexp.MustCompile(`^[a-zA-Z0-9._/-]+$`)
@@ -25,6 +24,9 @@ func (m *Manager) worktreeDirLocked(repo, branch string) (string, error) {
 	}
 
 	wtDir := m.BranchWorktreeDir(repo, branch)
+	if filepath.Clean(wtDir) == filepath.Clean(repoDir) {
+		return "", fmt.Errorf("cannot remove primary worktree for repo %q", repo)
+	}
 	if _, err := os.Stat(wtDir); os.IsNotExist(err) {
 		return "", fmt.Errorf("worktree %q not found for repo %q", branch, repo)
 	}
@@ -116,6 +118,9 @@ func (m *Manager) RemoveWorktree(repo, branch string) error {
 	ctx := context.Background()
 	repoDir := m.RepoDir(repo)
 	wtDir := m.BranchWorktreeDir(repo, branch)
+	if filepath.Clean(wtDir) == filepath.Clean(repoDir) {
+		return fmt.Errorf("cannot remove primary worktree for repo %q", repo)
+	}
 
 	if _, err := os.Stat(wtDir); os.IsNotExist(err) {
 		return fmt.Errorf("worktree %q not found for repo %q", branch, repo)
@@ -139,27 +144,5 @@ func (m *Manager) ListBranches(repo string) ([]BranchInfo, error) {
 		return nil, fmt.Errorf("repo %q not found", repo)
 	}
 
-	ctx := context.Background()
-	defaultBranch, _ := m.git.DefaultBranch(ctx, repoDir)
-
-	entries, err := os.ReadDir(m.reposDir)
-	if err != nil {
-		return nil, err
-	}
-
-	prefix := repo + "+"
-	var branches []BranchInfo
-	if defaultBranch != "" {
-		branches = append(branches, BranchInfo{Name: defaultBranch, Dir: repoDir})
-	}
-	for _, e := range entries {
-		if e.IsDir() && strings.HasPrefix(e.Name(), prefix) {
-			branchName := strings.TrimPrefix(e.Name(), prefix)
-			branches = append(branches, BranchInfo{
-				Name: branchName,
-				Dir:  filepath.Join(m.reposDir, e.Name()),
-			})
-		}
-	}
-	return branches, nil
+	return m.listWorktrees(repoDir), nil
 }

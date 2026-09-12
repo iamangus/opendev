@@ -1,4 +1,4 @@
-# code-mcp
+# opendev
 
 A Go MCP server that exposes coding tools scoped to a single Git worktree (branch).
 
@@ -37,7 +37,7 @@ All `filepath` and `dirpath` values are relative to the worktree root. Path trav
 ### Single-server mode
 
 ```
-code-mcp --dir /path/to/worktree [--mode stdio|http] [--addr :8080]
+opendev --dir /path/to/worktree [--mode stdio|http] [--addr :8080]
 ```
 
 In HTTP mode each profile is available at `/{profile}/mcp`:
@@ -61,7 +61,7 @@ When `--dir` is omitted the server runs in multi-repo mode, scanning `--repos-di
 repositories and their worktrees on startup.
 
 ```
-code-mcp [--repos-dir /repos] [--addr :8080]
+opendev [--repos-dir /repos] [--addr :8080]
 ```
 
 MCP endpoints follow the pattern:
@@ -102,13 +102,13 @@ A `Dockerfile` is provided that builds the server and runs it in multi-server mo
 ### Build
 
 ```sh
-docker build -t code-mcp .
+docker build -t ghcr.io/iamangus/opendev .
 ```
 
 ### Run
 
 ```sh
-docker run --rm -p 8080:8080 code-mcp
+docker run --rm -p 8080:8080 ghcr.io/iamangus/opendev
 ```
 
 Use the management API to add repositories after startup:
@@ -125,5 +125,8 @@ curl -X POST http://localhost:8080/api/repos \
 |----------|----------|---------|-------------|
 | `REPOS_DIR` | no | `/repos` | Root directory for repositories |
 | `MCP_ADDR` | no | `:8080` | HTTP listen address |
+| `OPENDEV_TOKEN` | yes | | Bearer token required for MCP endpoints |
+| `OPENDEV_URL` | no | derived from `MCP_ADDR` | Public MCP URL used in dispatched job callbacks |
+| `OPENDEV_ALLOW_EMPTY_PR_CHECKS` | no | `false` | Allow pull requests with no configured checks |
 
 > **Private repositories** — set `GIT_TOKEN` on the clone request body or embed it in the URL (`https://TOKEN@host/…`).

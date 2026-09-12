@@ -1,7 +1,7 @@
 // Package config loads the per-repo OpenDev configuration file.
 //
 // Each target repository is expected to contain a file at
-// .opendev/config.yaml relative to its root. code-mcp reads this file
+// .opendev/config.yaml relative to its root. opendev reads this file
 // whenever a worktree is registered (at startup or on branch creation) to
 // automatically register the repo-wide test command without requiring any
 // agent involvement.

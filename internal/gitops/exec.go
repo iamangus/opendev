@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -19,7 +21,7 @@ func NewExec(logger *slog.Logger, token string) *Exec {
 }
 
 func (e *Exec) Clone(ctx context.Context, url, dir string) error {
-	_, err := e.run(ctx, "", "git", "clone", "--bare", e.authURL(url), dir)
+	_, err := e.run(ctx, "", "git", "clone", e.authURL(url), dir)
 	return err
 }
 
@@ -38,6 +40,59 @@ func (e *Exec) WorktreeRemove(ctx context.Context, repoDir, wtDir string) error 
 	return err
 }
 
+func (e *Exec) WorktreeList(ctx context.Context, repoDir string) ([]Worktree, error) {
+	out, err := e.run(ctx, repoDir, "git", "worktree", "list", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+
+	var worktrees []Worktree
+	var current *Worktree
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			worktrees = append(worktrees, Worktree{Path: strings.TrimPrefix(line, "worktree ")})
+			current = &worktrees[len(worktrees)-1]
+		case current != nil && strings.HasPrefix(line, "branch refs/heads/"):
+			current.Branch = strings.TrimPrefix(line, "branch refs/heads/")
+		case current != nil && line == "detached":
+			current.Detached = true
+		}
+	}
+	return worktrees, nil
+}
+
+func (e *Exec) EnsureLocalExcludes(ctx context.Context, dir string, patterns []string) error {
+	excludePath, err := e.run(ctx, dir, "git", "rev-parse", "--git-path", "info/exclude")
+	if err != nil {
+		return err
+	}
+	excludePath = strings.TrimSpace(excludePath)
+	if !filepath.IsAbs(excludePath) {
+		excludePath = filepath.Join(dir, excludePath)
+	}
+
+	contents, err := os.ReadFile(excludePath)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	for _, pattern := range patterns {
+		if !containsLine(string(contents), pattern) {
+			contents = append(contents, []byte(pattern+"\n")...)
+		}
+	}
+	return os.WriteFile(excludePath, contents, 0600)
+}
+
+func containsLine(contents, line string) bool {
+	for _, existing := range strings.Split(contents, "\n") {
+		if existing == line {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Exec) Merge(ctx context.Context, dir, branch string) error {
 	_, err := e.run(ctx, dir, "git", "merge", branch)
 	return err
@@ -45,6 +100,27 @@ func (e *Exec) Merge(ctx context.Context, dir, branch string) error {
 
 func (e *Exec) Push(ctx context.Context, dir, branch string) error {
 	_, err := e.run(ctx, dir, "git", "push", "origin", branch)
+	return err
+}
+
+func (e *Exec) Commit(ctx context.Context, dir, message string) error {
+	if _, err := e.run(ctx, dir, "git", "add", "--all"); err != nil {
+		return err
+	}
+	_, err := e.run(ctx, dir, "git", "commit", "-m", message)
+	return err
+}
+
+func (e *Exec) HeadCommit(ctx context.Context, dir string) (string, error) {
+	return e.run(ctx, dir, "git", "rev-parse", "HEAD")
+}
+
+func (e *Exec) OriginURL(ctx context.Context, dir string) (string, error) {
+	return e.run(ctx, dir, "git", "remote", "get-url", "origin")
+}
+
+func (e *Exec) CherryPick(ctx context.Context, dir, commit string) error {
+	_, err := e.run(ctx, dir, "git", "cherry-pick", commit)
 	return err
 }
 
@@ -92,6 +168,15 @@ func (e *Exec) CreateBranch(ctx context.Context, dir, branch, startPoint string)
 
 func (e *Exec) Status(ctx context.Context, dir string) (string, error) {
 	return e.run(ctx, dir, "git", "status", "--short")
+}
+
+func (e *Exec) ResolveRevision(ctx context.Context, dir, revision string) (string, error) {
+	return e.run(ctx, dir, "git", "rev-parse", "--verify", "--end-of-options", revision+"^{commit}")
+}
+
+func (e *Exec) WorktreeAddDetached(ctx context.Context, repoDir, wtDir, revision string) error {
+	_, err := e.run(ctx, repoDir, "git", "worktree", "add", "--detach", wtDir, revision)
+	return err
 }
 
 func (e *Exec) authURL(rawURL string) string {

@@ -45,6 +45,55 @@ func NewHTTPClient(token, owner string, logger *slog.Logger, opts ...HTTPClientO
 	return c
 }
 
+func (c *HTTPClient) GetRepository(ctx context.Context, name string) (*Repository, error) {
+	start := time.Now()
+	path := fmt.Sprintf("/repos/%s/%s", c.owner, name)
+
+	var repo Repository
+	if err := c.do(ctx, http.MethodGet, path, nil, &repo); err != nil {
+		c.logger.Error("github: GetRepository failed", "repo", name, "error", err, "duration_ms", time.Since(start).Milliseconds())
+		return nil, err
+	}
+	c.logger.Debug("github: repository retrieved", "repo", name, "duration_ms", time.Since(start).Milliseconds())
+	return &repo, nil
+}
+
+func (c *HTTPClient) CreateRepository(ctx context.Context, name, description string, private bool) (*Repository, error) {
+	start := time.Now()
+	path := fmt.Sprintf("/orgs/%s/repos", c.owner)
+	payload := map[string]any{
+		"name":        name,
+		"description": description,
+		"private":     private,
+	}
+
+	var repo Repository
+	if err := c.do(ctx, http.MethodPost, path, payload, &repo); err != nil {
+		c.logger.Error("github: CreateRepository failed", "repo", name, "error", err, "duration_ms", time.Since(start).Milliseconds())
+		return nil, err
+	}
+	c.logger.Info("github: repository created", "repo", repo.FullName, "duration_ms", time.Since(start).Milliseconds())
+	return &repo, nil
+}
+
+func (c *HTTPClient) ForkPublicRepository(ctx context.Context, upstreamOwner, upstreamRepo, name string, private bool) (*Repository, error) {
+	start := time.Now()
+	path := fmt.Sprintf("/repos/%s/%s/forks", upstreamOwner, upstreamRepo)
+	payload := map[string]any{
+		"owner":   c.owner,
+		"name":    name,
+		"private": private,
+	}
+
+	var repo Repository
+	if err := c.do(ctx, http.MethodPost, path, payload, &repo); err != nil {
+		c.logger.Error("github: ForkPublicRepository failed", "upstream", upstreamOwner+"/"+upstreamRepo, "repo", name, "error", err, "duration_ms", time.Since(start).Milliseconds())
+		return nil, err
+	}
+	c.logger.Info("github: repository forked", "repo", repo.FullName, "upstream", upstreamOwner+"/"+upstreamRepo, "duration_ms", time.Since(start).Milliseconds())
+	return &repo, nil
+}
+
 func (c *HTTPClient) CreatePR(ctx context.Context, opts CreatePROptions) (*PR, error) {
 	start := time.Now()
 	path := fmt.Sprintf("/repos/%s/%s/pulls", c.owner, opts.Repo)
@@ -91,6 +140,52 @@ func (c *HTTPClient) PromotePR(ctx context.Context, repo string, number int) err
 	return nil
 }
 
+func (c *HTTPClient) GetPR(ctx context.Context, repo string, number int) (*PR, error) {
+	start := time.Now()
+	path := fmt.Sprintf("/repos/%s/%s/pulls/%d", c.owner, repo, number)
+
+	var pr PR
+	if err := c.do(ctx, http.MethodGet, path, nil, &pr); err != nil {
+		c.logger.Error("github: GetPR failed", "repo", repo, "number", number, "error", err, "duration_ms", time.Since(start).Milliseconds())
+		return nil, err
+	}
+	c.logger.Debug("github: PR retrieved", "repo", repo, "number", number, "duration_ms", time.Since(start).Milliseconds())
+	return &pr, nil
+}
+
+func (c *HTTPClient) GetPRChecks(ctx context.Context, repo, ref string) (*PRChecks, error) {
+	start := time.Now()
+	path := fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs", c.owner, repo, ref)
+
+	var checks PRChecks
+	if err := c.do(ctx, http.MethodGet, path, nil, &checks); err != nil {
+		c.logger.Error("github: GetPRChecks failed", "repo", repo, "ref", ref, "error", err, "duration_ms", time.Since(start).Milliseconds())
+		return nil, err
+	}
+	c.logger.Debug("github: PR checks retrieved", "repo", repo, "ref", ref, "duration_ms", time.Since(start).Milliseconds())
+	return &checks, nil
+}
+
+func (c *HTTPClient) MergePR(ctx context.Context, repo string, number int) error {
+	start := time.Now()
+	path := fmt.Sprintf("/repos/%s/%s/pulls/%d/merge", c.owner, repo, number)
+	payload := map[string]any{"merge_method": "squash"}
+	var result struct {
+		Merged  bool   `json:"merged"`
+		Message string `json:"message"`
+	}
+
+	if err := c.do(ctx, http.MethodPut, path, payload, &result); err != nil {
+		c.logger.Error("github: MergePR failed", "repo", repo, "number", number, "error", err, "duration_ms", time.Since(start).Milliseconds())
+		return err
+	}
+	if !result.Merged {
+		return fmt.Errorf("github: merge PR %d: %s", number, result.Message)
+	}
+	c.logger.Info("github: PR merged", "repo", repo, "number", number, "duration_ms", time.Since(start).Milliseconds())
+	return nil
+}
+
 func (c *HTTPClient) do(ctx context.Context, method, path string, reqBody any, out any) error {
 	var bodyReader io.Reader
 	if reqBody != nil {
@@ -118,6 +213,9 @@ func (c *HTTPClient) do(ctx context.Context, method, path string, reqBody any, o
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("%w: github API %s %s: %d %s", ErrNotFound, method, path, resp.StatusCode, string(respBody))
+	}
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("github API %s %s: %d %s", method, path, resp.StatusCode, string(respBody))
 	}

@@ -6,7 +6,7 @@
 
 ## Context
 
-code-mcp is a Go MCP server that gives AI agents coding tools scoped to git worktrees. The project has grown organically — adding multi-repo support, GitHub PR management, and test infrastructure. This design addresses three areas that need attention:
+opendev is a Go MCP server that gives AI agents coding tools scoped to git worktrees. The project has grown organically — adding multi-repo support, GitHub PR management, and test infrastructure. This design addresses three areas that need attention:
 
 1. **Observability is minimal** — scattered `log.Printf` calls with no structure, no request tracing, no way to correlate logs across repos/branches
 2. **Architecture is tightly coupled** — `manager.go` handles four jobs, git operations are done via direct `exec.Command` with no abstraction, components are hard to test in isolation
@@ -341,7 +341,7 @@ internal/
 └── config/
     └── (unchanged)
 
-cmd/code-mcp/
+cmd/opendev/
 ├── main.go              # Updated: logger init, flag parsing, DI wiring
 ├── register.go          # Updated: pass logger to tools
 ├── api.go               # Updated: request context enrichment

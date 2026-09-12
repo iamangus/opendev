@@ -8,7 +8,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /code-mcp ./cmd/code-mcp
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /opendev ./cmd/opendev
 
 # ---- runtime ----
 FROM debian:bookworm-slim
@@ -22,13 +22,13 @@ RUN apt-get update -qq \
 COPY --from=builder /usr/local/go /usr/local/go
 ENV PATH="/usr/local/go/bin:$PATH"
 
-COPY --from=builder /code-mcp /usr/local/bin/code-mcp
+COPY --from=builder /opendev /usr/local/bin/opendev
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Default repos root; mount a volume here for persistence.
-RUN mkdir -p /repos
-VOLUME ["/repos"]
+# Repository mirrors and durable job state must survive restarts.
+RUN mkdir -p /repos /data
+VOLUME ["/repos", "/data"]
 
 EXPOSE 8080
 

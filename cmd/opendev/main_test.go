@@ -56,6 +56,33 @@ func TestProfiles(t *testing.T) {
 	}
 }
 
+func TestEphemeralMCPServerNamesAreUniquePerDispatch(t *testing.T) {
+	seen := map[string]bool{}
+	for _, tc := range []struct {
+		jobID   string
+		role    string
+		taskKey string
+		attempt int
+	}{
+		{"job-one", "writer", "task-one", 1},
+		{"job-one", "writer", "task-two", 1},
+		{"job-two", "writer", "task-one", 1},
+		{"job-one", "writer", "task-one", 2},
+		{"job-one", "reviewer", "task-one", 1},
+	} {
+		for _, kind := range []string{"jobs", "read", "write"} {
+			name := ephemeralMCPServerName(tc.jobID, tc.role, tc.taskKey, tc.attempt, kind)
+			if seen[name] {
+				t.Fatalf("duplicate ephemeral MCP server name %q", name)
+			}
+			seen[name] = true
+		}
+	}
+	if ephemeralMCPServerName("a/b", "writer", "task", 1, "jobs") == ephemeralMCPServerName("a-b", "writer", "task", 1, "jobs") {
+		t.Fatal("MCP server names must remain distinct when identifiers contain separators")
+	}
+}
+
 // TestNewMCPHandler_ProfilesProduceHandlers verifies that newMCPHandler returns
 // a non-nil handler for each known profile.
 func TestNewMCPHandler_ProfilesProduceHandlers(t *testing.T) {
@@ -73,7 +100,7 @@ func TestNewMCPHandler_ProfilesProduceHandlers(t *testing.T) {
 func TestRegisterReadTools_ToolList(t *testing.T) {
 	dir := t.TempDir()
 	lm := locks.NewManager(slog.Default())
-	s := server.NewMCPServer("code-mcp", "1.0.0", server.WithToolCapabilities(true))
+	s := server.NewMCPServer("opendev", "1.0.0", server.WithToolCapabilities(true))
 	registerReadTools(s, lm, dir, slog.Default())
 
 	// Use stateless mode so tests don't need to manage session negotiation.
@@ -103,7 +130,7 @@ func TestRegisterReadTools_ToolList(t *testing.T) {
 func TestRegisterWriteTools_ToolList(t *testing.T) {
 	dir := t.TempDir()
 	lm := locks.NewManager(slog.Default())
-	s := server.NewMCPServer("code-mcp", "1.0.0", server.WithToolCapabilities(true))
+	s := server.NewMCPServer("opendev", "1.0.0", server.WithToolCapabilities(true))
 	registerWriteTools(s, lm, dir, slog.Default())
 
 	h := server.NewStreamableHTTPServer(s, server.WithStateLess(true))
@@ -131,16 +158,11 @@ func TestRegisterWriteTools_ToolList(t *testing.T) {
 // to the correct handler and that unknown profiles or repos return 404.
 func TestMultiServerRouting(t *testing.T) {
 	reposDir := t.TempDir()
-	repoDir := filepath.Join(reposDir, "myrepo.git")
+	repoDir := filepath.Join(reposDir, "myrepo")
 	if err := os.MkdirAll(repoDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	initGitRepo(t, repoDir)
-	// Create a worktree directory for the main branch so Scan can discover it.
-	wtDir := filepath.Join(reposDir, "myrepo+main")
-	if err := os.MkdirAll(wtDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
 
 	gitOps := gitops.NewExec(slog.Default(), "")
 	mgr, err := manager.New(reposDir, gitOps, slog.Default())

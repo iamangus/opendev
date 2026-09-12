@@ -215,7 +215,7 @@ func registerWriteTools(s *server.MCPServer, lm *locks.Manager, worktreeRoot str
 
 func newMCPHandler(profile Profile, worktreeRoot string, logger *slog.Logger) *server.StreamableHTTPServer {
 	lm := locks.NewManager(logger)
-	s := server.NewMCPServer("code-mcp", "1.0.0", server.WithToolCapabilities(true))
+	s := server.NewMCPServer("opendev", "1.0.0", server.WithToolCapabilities(true))
 	switch profile {
 	case ProfileRead:
 		registerReadTools(s, lm, worktreeRoot, logger)

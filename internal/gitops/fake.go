@@ -17,6 +17,7 @@ type Fake struct {
 	Errors        map[string]error
 	StringReturns map[string]string
 	BoolReturns   map[string]bool
+	Worktrees     []Worktree
 }
 
 func NewFake() *Fake {
@@ -67,6 +68,16 @@ func (f *Fake) WorktreeRemove(_ context.Context, repoDir, wtDir string) error {
 	return f.err("WorktreeRemove")
 }
 
+func (f *Fake) WorktreeList(_ context.Context, repoDir string) ([]Worktree, error) {
+	f.record("WorktreeList", repoDir)
+	return f.Worktrees, f.err("WorktreeList")
+}
+
+func (f *Fake) EnsureLocalExcludes(_ context.Context, dir string, patterns []string) error {
+	f.record("EnsureLocalExcludes", append([]string{dir}, patterns...)...)
+	return f.err("EnsureLocalExcludes")
+}
+
 func (f *Fake) Merge(_ context.Context, dir, branch string) error {
 	f.record("Merge", dir, branch)
 	return f.err("Merge")
@@ -75,6 +86,26 @@ func (f *Fake) Merge(_ context.Context, dir, branch string) error {
 func (f *Fake) Push(_ context.Context, dir, branch string) error {
 	f.record("Push", dir, branch)
 	return f.err("Push")
+}
+
+func (f *Fake) Commit(_ context.Context, dir, message string) error {
+	f.record("Commit", dir, message)
+	return f.err("Commit")
+}
+
+func (f *Fake) HeadCommit(_ context.Context, dir string) (string, error) {
+	f.record("HeadCommit", dir)
+	return f.str("HeadCommit"), f.err("HeadCommit")
+}
+
+func (f *Fake) OriginURL(_ context.Context, dir string) (string, error) {
+	f.record("OriginURL", dir)
+	return f.str("OriginURL"), f.err("OriginURL")
+}
+
+func (f *Fake) CherryPick(_ context.Context, dir, commit string) error {
+	f.record("CherryPick", dir, commit)
+	return f.err("CherryPick")
 }
 
 func (f *Fake) Diff(_ context.Context, dir string) (string, error) {
@@ -115,6 +146,16 @@ func (f *Fake) CreateBranch(_ context.Context, dir, branch, startPoint string) e
 func (f *Fake) Status(_ context.Context, dir string) (string, error) {
 	f.record("Status", dir)
 	return f.str("Status"), f.err("Status")
+}
+
+func (f *Fake) ResolveRevision(_ context.Context, dir, revision string) (string, error) {
+	f.record("ResolveRevision", dir, revision)
+	return f.str("ResolveRevision"), f.err("ResolveRevision")
+}
+
+func (f *Fake) WorktreeAddDetached(_ context.Context, repoDir, wtDir, revision string) error {
+	f.record("WorktreeAddDetached", repoDir, wtDir, revision)
+	return f.err("WorktreeAddDetached")
 }
 
 func (f *Fake) HasCall(method string) bool {

@@ -407,7 +407,7 @@ Apply the same pattern to all 6 functions: add `ctx context.Context` as first pa
 
 - [ ] **Step 6: Update callers in register.go to pass context**
 
-In `cmd/code-mcp/register.go`, every tool handler closure receives a `ctx context.Context` from the MCP framework. Update all calls to tools functions to pass `ctx`:
+In `cmd/opendev/register.go`, every tool handler closure receives a `ctx context.Context` from the MCP framework. Update all calls to tools functions to pass `ctx`:
 
 ```go
 // Line ~37 (read_file handler): was tools.ReadFile(worktreeRoot, fp, lm)
@@ -456,7 +456,7 @@ Expected: All lock tests and tool tests PASS.
 - [ ] **Step 9: Commit**
 
 ```bash
-git add internal/locks/locks.go internal/locks/locks_test.go internal/tools/filesystem.go internal/tools/filesystem_test.go cmd/code-mcp/register.go cmd/code-mcp/main.go
+git add internal/locks/locks.go internal/locks/locks_test.go internal/tools/filesystem.go internal/tools/filesystem_test.go cmd/opendev/register.go cmd/opendev/main.go
 git commit -m "feat: context-aware LockManager with contention logging and ref-counted cleanup"
 ```
 
@@ -1274,7 +1274,7 @@ var _ Client = (*FakeClient)(nil)
 
 - [ ] **Step 6: Update callers in api.go and main.go**
 
-In `cmd/code-mcp/api.go`, change the `ghClient *githubpkg.Client` parameter to `ghClient githubpkg.Client` (interface type). Update call sites:
+In `cmd/opendev/api.go`, change the `ghClient *githubpkg.Client` parameter to `ghClient githubpkg.Client` (interface type). Update call sites:
 
 ```go
 // api.go line ~31: was func registerAPIRoutes(..., ghClient *githubpkg.Client, ...)
@@ -1298,7 +1298,7 @@ Update `UpdatePR` call — the `draft bool` parameter was removed from the inter
 err := ghClient.UpdatePR(ctx, repo, number, body)
 ```
 
-In `cmd/code-mcp/main.go`, update the `NewClient` call:
+In `cmd/opendev/main.go`, update the `NewClient` call:
 
 ```go
 // was: ghClient = githubpkg.NewClient(token, owner)
@@ -1309,13 +1309,13 @@ And change the type of `ghClient` variable from `*githubpkg.Client` to `githubpk
 
 - [ ] **Step 7: Run tests**
 
-Run: `cd /home/angoo/repos/opendev/opendev-coder && go test ./internal/github/ ./cmd/code-mcp/ -v -count=1`
+Run: `cd /home/angoo/repos/opendev/opendev-coder && go test ./internal/github/ ./cmd/opendev/ -v -count=1`
 Expected: All GitHub client tests and existing main_test.go tests PASS.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add internal/github/ cmd/code-mcp/api.go cmd/code-mcp/main.go
+git add internal/github/ cmd/opendev/api.go cmd/opendev/main.go
 git commit -m "feat: extract GitHub Client interface with httptest-based tests"
 ```
 
@@ -1814,7 +1814,7 @@ func (m *Manager) GetCommits(repo, branch string) ([]CommitInfo, error) {
 
 - [ ] **Step 5: Update callers in main.go and api.go**
 
-In `cmd/code-mcp/main.go`, update the `Manager` constructor:
+In `cmd/opendev/main.go`, update the `Manager` constructor:
 
 ```go
 // was: mgr, err := manager.New(reposDir, githubToken)
@@ -2098,7 +2098,7 @@ Expected: All packages compile and tests pass (excluding integration-tagged test
 - [ ] **Step 9: Commit**
 
 ```bash
-git add internal/manager/ internal/gitops/ cmd/code-mcp/
+git add internal/manager/ internal/gitops/ cmd/opendev/
 git commit -m "refactor: split manager.go into focused files, inject GitOps interface"
 ```
 
@@ -2109,9 +2109,9 @@ git commit -m "refactor: split manager.go into focused files, inject GitOps inte
 Replace all `log.Printf` calls with structured `slog` logging. Add `--log-format` and `--log-level` flags.
 
 **Files:**
-- Modify: `cmd/code-mcp/main.go`
-- Modify: `cmd/code-mcp/register.go`
-- Modify: `cmd/code-mcp/api.go`
+- Modify: `cmd/opendev/main.go`
+- Modify: `cmd/opendev/register.go`
+- Modify: `cmd/opendev/api.go`
 
 - [ ] **Step 1: Add logger initialization and CLI flags to main.go**
 
@@ -2250,7 +2250,7 @@ Expected: All tests pass. The test files may need minor updates to pass `slog.De
 - [ ] **Step 6: Commit**
 
 ```bash
-git add cmd/code-mcp/
+git add cmd/opendev/
 git commit -m "feat: replace log.Printf with structured slog logging, add --log-format and --log-level flags"
 ```
 
@@ -2261,8 +2261,8 @@ git commit -m "feat: replace log.Printf with structured slog logging, add --log-
 Connect all the pieces, run the full test suite, and verify the build.
 
 **Files:**
-- Modify: `cmd/code-mcp/main.go` (final wiring pass)
-- Modify: `cmd/code-mcp/main_test.go` (update for new constructors)
+- Modify: `cmd/opendev/main.go` (final wiring pass)
+- Modify: `cmd/opendev/main_test.go` (update for new constructors)
 
 - [ ] **Step 1: Update main_test.go for new constructor signatures**
 
@@ -2297,23 +2297,23 @@ Expected: All tests pass, no race conditions.
 
 - [ ] **Step 3: Verify the binary builds**
 
-Run: `cd /home/angoo/repos/opendev/opendev-coder && go build ./cmd/code-mcp/`
+Run: `cd /home/angoo/repos/opendev/opendev-coder && go build ./cmd/opendev/`
 Expected: Clean build, no warnings.
 
 - [ ] **Step 4: Verify the new flags work**
 
-Run: `cd /home/angoo/repos/opendev/opendev-coder && go run ./cmd/code-mcp/ --help`
+Run: `cd /home/angoo/repos/opendev/opendev-coder && go run ./cmd/opendev/ --help`
 Expected: Output includes `--log-format` and `--log-level` flags.
 
 - [ ] **Step 5: Run with JSON logging to verify output format**
 
-Run: `cd /home/angoo/repos/opendev/opendev-coder && timeout 2 go run ./cmd/code-mcp/ --dir /tmp/test-wt --mode http --addr :9999 --log-format json --log-level debug 2>&1 || true`
+Run: `cd /home/angoo/repos/opendev/opendev-coder && timeout 2 go run ./cmd/opendev/ --dir /tmp/test-wt --mode http --addr :9999 --log-format json --log-level debug 2>&1 || true`
 Expected: Log output is structured JSON to stderr.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add cmd/code-mcp/main_test.go
+git add cmd/opendev/main_test.go
 git commit -m "chore: update tests for new constructor signatures, verify full integration"
 ```
 
