@@ -106,7 +106,11 @@ func (d *Dispatcher) StartWriter(ctx context.Context, job *pipeline.Job, task *p
 	if task == nil {
 		return nil, fmt.Errorf("task is required")
 	}
-	return d.start(ctx, job, RoleWriter, task.Key, task.WriterAttempts+1, job.WriterAgentID, taskMessage("Implement", job, task))
+	action := "Implement"
+	if task.Kind == pipeline.TaskValidation {
+		action = "Validate"
+	}
+	return d.start(ctx, job, RoleWriter, task.Key, task.WriterAttempts+1, job.WriterAgentID, taskMessage(action, job, task))
 }
 
 func (d *Dispatcher) StartReviewer(ctx context.Context, job *pipeline.Job, task *pipeline.Task) (*DispatchRun, error) {

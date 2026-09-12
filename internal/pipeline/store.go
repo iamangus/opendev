@@ -34,6 +34,13 @@ const (
 
 type TaskStatus string
 
+type TaskKind string
+
+const (
+	TaskImplementation TaskKind = "implementation"
+	TaskValidation     TaskKind = "validation"
+)
+
 const (
 	TaskPlanned             TaskStatus = "planned"
 	TaskWorking             TaskStatus = "working"
@@ -73,6 +80,7 @@ type ValidationEvidence struct {
 
 type Task struct {
 	Key                string               `json:"key"`
+	Kind               TaskKind             `json:"kind,omitempty"`
 	Title              string               `json:"title"`
 	Description        string               `json:"description"`
 	AcceptanceCriteria []string             `json:"acceptance_criteria"`
@@ -340,6 +348,9 @@ func validatePlan(plan Plan) error {
 	}
 	keys := make(map[string]struct{}, len(plan.Tasks))
 	for _, task := range plan.Tasks {
+		if task.Kind != "" && task.Kind != TaskImplementation && task.Kind != TaskValidation {
+			return fmt.Errorf("%w: task %q has invalid kind %q", ErrInvalidPlan, task.Key, task.Kind)
+		}
 		if task.Key == "" || task.Title == "" || task.Description == "" || len(task.AcceptanceCriteria) == 0 {
 			return fmt.Errorf("%w: each task needs key, title, description, and acceptance criteria", ErrInvalidPlan)
 		}

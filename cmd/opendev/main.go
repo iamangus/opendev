@@ -30,6 +30,7 @@ import (
 	"github.com/iamangus/code-mcp/internal/repositories"
 	"github.com/iamangus/code-mcp/internal/repositorycatalog"
 	"github.com/iamangus/code-mcp/internal/repositoryindex"
+	"github.com/iamangus/code-mcp/internal/validation"
 	"github.com/mark3labs/mcp-go/server"
 )
 
@@ -235,6 +236,7 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 		GitHub:       ghClient,
 		Repositories: repositoryService,
 		References:   referenceService,
+		Validation:   validationRunner{},
 		AllowNoChecks: strings.EqualFold(
 			strings.TrimSpace(os.Getenv("OPENDEV_ALLOW_EMPTY_PR_CHECKS")), "true",
 		),
@@ -419,6 +421,12 @@ type worktreeRegistrar struct {
 	reference func(jobID, repository, directory string)
 }
 
+type validationRunner struct{}
+
+func (validationRunner) Run(ctx context.Context, worktreePath, name string) (validation.Result, error) {
+	return validation.Run(ctx, worktreePath, name)
+}
+
 func (r worktreeRegistrar) RegisterWorktree(repository, branch, directory string) {
 	r.worktree(repository, branch, directory)
 }
@@ -451,7 +459,7 @@ func (d *lazyDispatcher) StartPlanner(ctx context.Context, job *pipeline.Job) (*
 }
 
 func (d *lazyDispatcher) StartWriter(ctx context.Context, job *pipeline.Job, task *pipeline.Task) (*dispatcher.DispatchRun, error) {
-	inner, err := d.withRoleServers(ctx, job, dispatcher.RoleWriter, task.Key, task.WriterAttempts+1, task.Branch, true)
+	inner, err := d.withRoleServers(ctx, job, dispatcher.RoleWriter, task.Key, task.WriterAttempts+1, task.Branch, task.Kind != pipeline.TaskValidation)
 	if err != nil {
 		return nil, err
 	}

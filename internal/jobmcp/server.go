@@ -14,6 +14,7 @@ import (
 	"github.com/iamangus/code-mcp/internal/pipeline"
 	"github.com/iamangus/code-mcp/internal/references"
 	"github.com/iamangus/code-mcp/internal/repositories"
+	"github.com/iamangus/code-mcp/internal/validation"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -48,8 +49,13 @@ type Config struct {
 	GitHub        githubpkg.Client
 	Repositories  *repositories.Service
 	References    *references.Service
+	Validation    ValidationRunner
 	AllowNoChecks bool
 	Logger        *slog.Logger
+}
+
+type ValidationRunner interface {
+	Run(context.Context, string, string) (validation.Result, error)
 }
 
 // Role limits a pipeline agent to its state-transition tools.
@@ -196,6 +202,45 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 				return toolError(err), nil
 			}
 			return toolJSON(job), nil
+		})
+	}
+
+	if allowed(RoleWriter, RoleReviewer) {
+		s.AddTool(mcp.NewTool("run_validation",
+			mcp.WithDescription("Run one named validation declared in this task's repository .opendev/validations.yml. Arbitrary commands are not allowed."),
+			mcp.WithString("job_id", mcp.Required()),
+			mcp.WithString("task_key", mcp.Required()),
+			mcp.WithString("validation_name", mcp.Required()),
+		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if config.Validation == nil {
+				return toolError(fmt.Errorf("validation runner is not configured")), nil
+			}
+			_, task, err := jobTask(config.Store, req)
+			if err != nil {
+				return toolError(err), nil
+			}
+			name, err := req.RequireString("validation_name")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			isAssigned := false
+			for _, declared := range task.Validation {
+				if declared == name {
+					isAssigned = true
+					break
+				}
+			}
+			if !isAssigned {
+				return toolError(fmt.Errorf("validation %q is not assigned to task %q", name, task.Key)), nil
+			}
+			if task.WorktreePath == "" {
+				return toolError(fmt.Errorf("task worktree is not ready")), nil
+			}
+			result, err := config.Validation.Run(ctx, task.WorktreePath, name)
+			if err != nil {
+				return toolError(fmt.Errorf("validation failed: %w\n%s", err, result.Output)), nil
+			}
+			return toolJSON(result), nil
 		})
 	}
 
