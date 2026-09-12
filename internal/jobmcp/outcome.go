@@ -173,6 +173,7 @@ type reviewResponse struct {
 		Evidence  string `json:"evidence"`
 	} `json:"acceptance_criteria"`
 	Reason string `json:"reason"`
+	PullRequest *pipeline.PullRequestContent `json:"pull_request,omitempty"`
 }
 
 func applyReview(ctx context.Context, run dispatcher.DispatchRun, config Config) error {
@@ -224,7 +225,11 @@ func applyHolistic(ctx context.Context, run dispatcher.DispatchRun, config Confi
 	if err != nil {
 		return err
 	}
-	updated, err := config.Controller.RecordHolisticReview(job.ID, run.RunID, job.IntegrationSHA, verdict)
+	content := pipeline.PullRequestContent{}
+	if response.PullRequest != nil {
+		content = *response.PullRequest
+	}
+	updated, err := config.Controller.RecordHolisticReview(job.ID, run.RunID, job.IntegrationSHA, verdict, content)
 	if err != nil {
 		return err
 	}

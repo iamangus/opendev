@@ -15,7 +15,7 @@ type Client interface {
 	CreateRepository(ctx context.Context, name, description string, private bool) (*Repository, error)
 	ForkPublicRepository(ctx context.Context, upstreamOwner, upstreamRepo, name string, private bool) (*Repository, error)
 	CreatePR(ctx context.Context, opts CreatePROptions) (*PR, error)
-	UpdatePR(ctx context.Context, repo string, number int, body string) error
+	UpdatePR(ctx context.Context, repo string, number int, title, body string) error
 	PromotePR(ctx context.Context, repo string, number int) error
 	GetPR(ctx context.Context, repo string, number int) (*PR, error)
 	GetPRChecks(ctx context.Context, repo, ref string) (*PRChecks, error)

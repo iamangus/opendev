@@ -56,8 +56,8 @@ func (c *Controller) RecordIntegration(jobID, taskKey, integrationSHA string) (*
 	return c.store.recordIntegration(jobID, taskKey, integrationSHA)
 }
 
-func (c *Controller) RecordHolisticReview(jobID, runID, integrationSHA string, verdict ReviewVerdict) (*Job, error) {
-	return c.store.recordHolisticReview(jobID, runID, integrationSHA, verdict)
+func (c *Controller) RecordHolisticReview(jobID, runID, integrationSHA string, verdict ReviewVerdict, content PullRequestContent) (*Job, error) {
+	return c.store.recordHolisticReview(jobID, runID, integrationSHA, verdict, content)
 }
 
 // StartHolisticReviewer records the exact reviewer run and reviewed SHA.
@@ -235,7 +235,7 @@ func (s *Store) recordIntegration(jobID, taskKey, integrationSHA string) (*Job, 
 	})
 }
 
-func (s *Store) recordHolisticReview(jobID, runID, integrationSHA string, verdict ReviewVerdict) (*Job, error) {
+func (s *Store) recordHolisticReview(jobID, runID, integrationSHA string, verdict ReviewVerdict, content PullRequestContent) (*Job, error) {
 	if strings.TrimSpace(runID) == "" || strings.TrimSpace(integrationSHA) == "" || (verdict != ReviewApproved && verdict != ReviewChangesRequested && verdict != ReviewBlocked) {
 		return nil, fmt.Errorf("%w: valid holistic review is required", ErrInvalidTransition)
 	}
@@ -260,6 +260,10 @@ func (s *Store) recordHolisticReview(jobID, runID, integrationSHA string, verdic
 	}
 	job.HolisticReviewVerdict = verdict
 	if verdict == ReviewApproved {
+		if strings.TrimSpace(content.Title) == "" || strings.TrimSpace(content.Body) == "" {
+			return nil, fmt.Errorf("%w: approved holistic review requires pull request title and body", ErrInvalidTransition)
+		}
+		job.PullRequestTitle, job.PullRequestBody = strings.TrimSpace(content.Title), strings.TrimSpace(content.Body)
 		job.Status = JobReadyToPublish
 	}
 	return s.saveAndCloneLocked(job)

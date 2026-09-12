@@ -80,7 +80,7 @@ func (f *fakeGitHub) ForkPublicRepository(_ context.Context, owner, upstream, na
 func (f *fakeGitHub) CreatePR(context.Context, github.CreatePROptions) (*github.PR, error) {
 	return nil, errors.New("not implemented")
 }
-func (f *fakeGitHub) UpdatePR(context.Context, string, int, string) error {
+func (f *fakeGitHub) UpdatePR(context.Context, string, int, string, string) error {
 	return errors.New("not implemented")
 }
 func (f *fakeGitHub) PromotePR(context.Context, string, int) error {

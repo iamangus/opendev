@@ -137,10 +137,10 @@ func (c *HTTPClient) CreatePR(ctx context.Context, opts CreatePROptions) (*PR, e
 	return &pr, nil
 }
 
-func (c *HTTPClient) UpdatePR(ctx context.Context, repo string, number int, body string) error {
+func (c *HTTPClient) UpdatePR(ctx context.Context, repo string, number int, title, body string) error {
 	start := time.Now()
 	path := fmt.Sprintf("/repos/%s/%s/pulls/%d", c.owner, repo, number)
-	payload := map[string]any{"body": body}
+	payload := map[string]any{"title": title, "body": body}
 
 	if err := c.do(ctx, http.MethodPatch, path, payload, nil); err != nil {
 		c.logger.Error("github: UpdatePR failed", "repo", repo, "number", number, "error", err, "duration_ms", time.Since(start).Milliseconds())

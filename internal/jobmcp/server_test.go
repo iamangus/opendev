@@ -340,6 +340,10 @@ func TestPublishApprovedJobCreatesAndMergesAfterSuccessfulChecks(t *testing.T) {
 	if got := fakeMethods(github); fmt.Sprint(got) != "[CreatePR GetPR GetPRChecks MergePR]" {
 		t.Fatalf("unexpected GitHub calls: %v", got)
 	}
+	create := github.Calls[0].Args[0].(githubpkg.CreatePROptions)
+	if create.Title != "Test change" || create.Body != "## Summary\nTest" {
+		t.Fatalf("pull request presentation = %#v", create)
+	}
 	if _, err := publishApprovedJob(context.Background(), job.ID, Config{Store: store, Controller: controller, GitHub: github}); err != nil {
 		t.Fatal(err)
 	}
@@ -449,7 +453,7 @@ func approvedJob(t *testing.T) (*pipeline.Store, *pipeline.Controller, *pipeline
 	if err != nil {
 		t.Fatal(err)
 	}
-	job, err = controller.RecordHolisticReview(job.ID, "holistic", "integration", pipeline.ReviewApproved)
+	job, err = controller.RecordHolisticReview(job.ID, "holistic", "integration", pipeline.ReviewApproved, pipeline.PullRequestContent{Title: "Test change", Body: "## Summary\nTest"})
 	if err != nil {
 		t.Fatal(err)
 	}

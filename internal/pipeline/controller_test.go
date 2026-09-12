@@ -142,10 +142,11 @@ func TestControllerHolisticApprovalIsBoundToIntegrationSHA(t *testing.T) {
 	if job.Status != JobHolisticReviewing || job.IntegrationSHA != "integration" {
 		t.Fatalf("not ready for holistic review: %+v", job)
 	}
-	if _, err := controller.RecordHolisticReview(job.ID, "holistic", "other", ReviewApproved); !errors.Is(err, ErrInvalidTransition) {
+	content := PullRequestContent{Title: "Test change", Body: "## Summary\nTest"}
+	if _, err := controller.RecordHolisticReview(job.ID, "holistic", "other", ReviewApproved, content); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("expected SHA rejection, got %v", err)
 	}
-	job, err = controller.RecordHolisticReview(job.ID, "holistic", "integration", ReviewApproved)
+	job, err = controller.RecordHolisticReview(job.ID, "holistic", "integration", ReviewApproved, content)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +200,7 @@ func TestControllerStartsHolisticRereviewForRecordedPR(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := controller.RecordHolisticReview(job.ID, "review-1", "integration", ReviewApproved); err != nil {
+	if _, err := controller.RecordHolisticReview(job.ID, "review-1", "integration", ReviewApproved, PullRequestContent{Title: "Test change", Body: "## Summary\nTest"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := controller.RecordPullRequest(job.ID, 12, "https://example.test/pr/12"); err != nil {

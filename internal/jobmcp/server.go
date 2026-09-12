@@ -352,11 +352,13 @@ func publishApprovedJob(ctx context.Context, jobID string, config Config) (*pipe
 		return nil, fmt.Errorf("job %s is not approved for publication", job.ID)
 	}
 
-	body := fmt.Sprintf("Automated OpenDev coding job %s.\n\n%s", job.ID, job.Directive)
+	if job.PullRequestTitle == "" || job.PullRequestBody == "" {
+		return nil, fmt.Errorf("job %s has no generated pull request presentation", job.ID)
+	}
 	if job.PullRequestNumber == 0 {
 		pr, err := config.GitHub.CreatePR(ctx, githubpkg.CreatePROptions{
-			Repo: job.Repository, Title: "OpenDev: " + job.Directive, Head: job.IntegrationBranch,
-			Base: job.TargetBranch, Body: body, Draft: false,
+			Repo: job.Repository, Title: job.PullRequestTitle, Head: job.IntegrationBranch,
+			Base: job.TargetBranch, Body: job.PullRequestBody, Draft: false,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("create pull request: %w", err)
@@ -365,7 +367,7 @@ func publishApprovedJob(ctx context.Context, jobID string, config Config) (*pipe
 		if err != nil {
 			return nil, fmt.Errorf("record pull request: %w", err)
 		}
-	} else if err := config.GitHub.UpdatePR(ctx, job.Repository, job.PullRequestNumber, body); err != nil {
+	} else if err := config.GitHub.UpdatePR(ctx, job.Repository, job.PullRequestNumber, job.PullRequestTitle, job.PullRequestBody); err != nil {
 		return nil, fmt.Errorf("update pull request: %w", err)
 	}
 

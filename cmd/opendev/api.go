@@ -300,7 +300,7 @@ func registerAPIRoutes(mux *http.ServeMux, mgr *manager.Manager, ghClient github
 		writeJSON(w, http.StatusCreated, map[string]any{"pr_number": pr.Number, "pr_url": pr.HTMLURL}, logger)
 	})
 
-	// PATCH /api/repos/{repo}/pulls/{number}  {"body":"...", "draft":false}
+	// PATCH /api/repos/{repo}/pulls/{number}  {"title":"...", "body":"...", "draft":false}
 	mux.HandleFunc("PATCH /api/repos/{repo}/pulls/{number}", func(w http.ResponseWriter, r *http.Request) {
 		repo := r.PathValue("repo")
 		if ghClient == nil {
@@ -313,6 +313,7 @@ func registerAPIRoutes(mux *http.ServeMux, mgr *manager.Manager, ghClient github
 			return
 		}
 		var body struct {
+			Title string `json:"title"`
 			Body  string `json:"body"`
 			Draft bool   `json:"draft"`
 		}
@@ -320,7 +321,7 @@ func registerAPIRoutes(mux *http.ServeMux, mgr *manager.Manager, ghClient github
 			apiError(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest, logger)
 			return
 		}
-		if err := ghClient.UpdatePR(r.Context(), repo, prNumber, body.Body); err != nil {
+		if err := ghClient.UpdatePR(r.Context(), repo, prNumber, body.Title, body.Body); err != nil {
 			apiError(w, "updating PR: "+err.Error(), http.StatusBadGateway, logger)
 			return
 		}

@@ -82,10 +82,10 @@ func (f *FakeClient) CreatePR(_ context.Context, opts CreatePROptions) (*PR, err
 	return f.CreatePRResult, f.CreatePRError
 }
 
-func (f *FakeClient) UpdatePR(_ context.Context, repo string, number int, body string) error {
+func (f *FakeClient) UpdatePR(_ context.Context, repo string, number int, title, body string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.Calls = append(f.Calls, FakeCall{Method: "UpdatePR", Args: []any{repo, number, body}})
+	f.Calls = append(f.Calls, FakeCall{Method: "UpdatePR", Args: []any{repo, number, title, body}})
 	return f.UpdatePRError
 }
 

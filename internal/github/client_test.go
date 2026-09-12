@@ -259,13 +259,16 @@ func TestHTTPClient_UpdatePR(t *testing.T) {
 		if body["body"] != "new body" {
 			t.Errorf("unexpected body: %v", body["body"])
 		}
+		if body["title"] != "new title" {
+			t.Errorf("unexpected title: %v", body["title"])
+		}
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{}`))
 	}))
 	defer srv.Close()
 
 	c := NewHTTPClient("test-token", "owner", slog.Default(), WithBaseURL(srv.URL))
-	if err := c.UpdatePR(context.Background(), "myrepo", 42, "new body"); err != nil {
+	if err := c.UpdatePR(context.Background(), "myrepo", 42, "new title", "new body"); err != nil {
 		t.Fatalf("UpdatePR: %v", err)
 	}
 }
