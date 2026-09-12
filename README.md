@@ -128,5 +128,7 @@ curl -X POST http://localhost:8080/api/repos \
 | `OPENDEV_TOKEN` | yes | | Bearer token required for MCP endpoints |
 | `OPENDEV_URL` | no | derived from `MCP_ADDR` | Public MCP URL used in dispatched job callbacks |
 | `OPENDEV_ALLOW_EMPTY_PR_CHECKS` | no | `false` | Allow pull requests with no configured checks |
+| `EVE_URL` | no | | Eve authenticated notification webhook URL. When unset, events remain durably queued in `/data/notification-outbox.json`. |
+| `EVE_WEBHOOK_TOKEN` | no | | Bearer token sent to `EVE_URL`; required with `EVE_URL` to enable delivery. |
 
 > **Private repositories** — set `GIT_TOKEN` on the clone request body or embed it in the URL (`https://TOKEN@host/…`).

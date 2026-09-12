@@ -25,6 +25,7 @@ import (
 	"github.com/iamangus/code-mcp/internal/jobmcp"
 	"github.com/iamangus/code-mcp/internal/locks"
 	"github.com/iamangus/code-mcp/internal/manager"
+	"github.com/iamangus/code-mcp/internal/outbox"
 	"github.com/iamangus/code-mcp/internal/pipeline"
 	"github.com/iamangus/code-mcp/internal/references"
 	"github.com/iamangus/code-mcp/internal/repositories"
@@ -208,6 +209,20 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 		logger.Error("pipeline state initialization failed", "error", err)
 		return
 	}
+	notificationOutbox, err := outbox.New(stateDir)
+	if err != nil {
+		logger.Error("notification outbox initialization failed", "error", err)
+		return
+	}
+	if err := notificationOutbox.Reconcile(jobStore.List()); err != nil {
+		logger.Warn("notification outbox reconciliation failed", "error", err)
+	}
+	eventURL, eventToken := strings.TrimSpace(os.Getenv("EVE_URL")), strings.TrimSpace(os.Getenv("EVE_WEBHOOK_TOKEN"))
+	if eventURL == "" || eventToken == "" {
+		logger.Info("Eve notifications disabled; set EVE_URL and EVE_WEBHOOK_TOKEN to enable delivery")
+	} else {
+		outbox.NewDeliverer(notificationOutbox, eventURL, eventToken, logger).Start(context.Background())
+	}
 	runStore, err := dispatchstore.New(stateDir)
 	if err != nil {
 		logger.Error("dispatch state initialization failed", "error", err)
@@ -241,6 +256,7 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 			strings.TrimSpace(os.Getenv("OPENDEV_ALLOW_EMPTY_PR_CHECKS")), "true",
 		),
 		Logger: logger,
+		Outbox: notificationOutbox,
 	}
 	// Agent outcomes are applied only by the dispatcher after its terminal
 	// response has been durably stored; role MCP endpoints are inspection-only.

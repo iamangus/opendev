@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/iamangus/code-mcp/internal/dispatcher"
+	"github.com/iamangus/code-mcp/internal/outbox"
 	"github.com/iamangus/code-mcp/internal/pipeline"
 )
 
@@ -92,7 +93,8 @@ func applyWriter(ctx context.Context, run dispatcher.DispatchRun, config Config)
 		return fmt.Errorf("writer response omitted validation_evidence")
 	}
 	if response.Status == "blocked" {
-		_, err := config.Controller.BlockTask(run.JobID, run.TaskKey, response.Reason)
+		job, err := config.Controller.BlockTask(run.JobID, run.TaskKey, response.Reason)
+		notify(config, job, outbox.EventBlocked+":"+run.TaskKey, response.Summary, response.Reason)
 		return err
 	}
 	job, err := config.Store.Get(run.JobID)
@@ -172,7 +174,7 @@ type reviewResponse struct {
 		Satisfied bool   `json:"satisfied"`
 		Evidence  string `json:"evidence"`
 	} `json:"acceptance_criteria"`
-	Reason string `json:"reason"`
+	Reason      string                       `json:"reason"`
 	PullRequest *pipeline.PullRequestContent `json:"pull_request,omitempty"`
 }
 
@@ -201,7 +203,9 @@ func applyReview(ctx context.Context, run dispatcher.DispatchRun, config Config)
 		return err
 	}
 	if verdict == pipeline.ReviewBlocked {
-		_, err = config.Controller.BlockTask(run.JobID, run.TaskKey, response.Reason)
+		job, blockErr := config.Controller.BlockTask(run.JobID, run.TaskKey, response.Reason)
+		notify(config, job, outbox.EventBlocked+":"+run.TaskKey, response.Summary, response.Reason)
+		err = blockErr
 		return err
 	}
 	if verdict == pipeline.ReviewChangesRequested {
@@ -234,7 +238,9 @@ func applyHolistic(ctx context.Context, run dispatcher.DispatchRun, config Confi
 		return err
 	}
 	if verdict == pipeline.ReviewBlocked {
-		_, err = config.Controller.FailJob(job.ID, response.Reason)
+		failed, failErr := config.Controller.FailJob(job.ID, response.Reason)
+		notify(config, failed, outbox.EventFailed, response.Summary, response.Reason)
+		err = failErr
 		return err
 	}
 	if verdict == pipeline.ReviewApproved {
@@ -249,10 +255,20 @@ func recordTerminalFailure(run dispatcher.DispatchRun, config Config) error {
 		reason = "AgentFoundry run ended with status " + run.Status
 	}
 	if run.Role == dispatcher.RolePlanner || run.Role == dispatcher.RoleHolistic {
-		_, err := config.Controller.FailJob(run.JobID, reason)
+		job, err := config.Controller.FailJob(run.JobID, reason)
+		eventType := outbox.EventFailed
+		if run.Status == "canceled" || run.Status == "cancelled" {
+			eventType = outbox.EventCancelled
+		}
+		notify(config, job, eventType, "", reason)
 		return err
 	}
-	_, err := config.Controller.BlockTask(run.JobID, run.TaskKey, reason)
+	job, err := config.Controller.BlockTask(run.JobID, run.TaskKey, reason)
+	eventType := outbox.EventBlocked + ":" + run.TaskKey
+	if run.Status == "canceled" || run.Status == "cancelled" {
+		eventType = outbox.EventCancelled + ":" + run.TaskKey
+	}
+	notify(config, job, eventType, "", reason)
 	return err
 }
 

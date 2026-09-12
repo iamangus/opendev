@@ -11,6 +11,7 @@ import (
 
 	"github.com/iamangus/code-mcp/internal/dispatcher"
 	githubpkg "github.com/iamangus/code-mcp/internal/github"
+	"github.com/iamangus/code-mcp/internal/outbox"
 	"github.com/iamangus/code-mcp/internal/pipeline"
 	"github.com/iamangus/code-mcp/internal/references"
 	"github.com/iamangus/code-mcp/internal/repositories"
@@ -52,6 +53,7 @@ type Config struct {
 	Validation    ValidationRunner
 	AllowNoChecks bool
 	Logger        *slog.Logger
+	Outbox        *outbox.Store
 }
 
 type ValidationRunner interface {
@@ -272,6 +274,7 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 			if err != nil {
 				return toolError(err), nil
 			}
+			notify(config, job, outbox.EventStarted, "", "")
 			run, err := config.Dispatcher.StartPlanner(ctx, job)
 			if err != nil {
 				return toolError(err), nil
@@ -367,6 +370,7 @@ func publishApprovedJob(ctx context.Context, jobID string, config Config) (*pipe
 		if err != nil {
 			return nil, fmt.Errorf("record pull request: %w", err)
 		}
+		notify(config, job, outbox.EventPROpened, "", "")
 	} else if job.PullRequestTitle != "" && job.PullRequestBody != "" {
 		if err := config.GitHub.UpdatePR(ctx, job.Repository, job.PullRequestNumber, job.PullRequestTitle, job.PullRequestBody); err != nil {
 			return nil, fmt.Errorf("update pull request: %w", err)
@@ -381,7 +385,9 @@ func publishApprovedJob(ctx context.Context, jobID string, config Config) (*pipe
 		return nil, fmt.Errorf("get pull request: %w", err)
 	}
 	if pr.Merged {
-		return config.Controller.RecordMerge(job.ID)
+		merged, err := config.Controller.RecordMerge(job.ID)
+		notify(config, merged, outbox.EventMerged, "", "")
+		return merged, err
 	}
 	if !strings.EqualFold(pr.State, "open") || pr.Draft {
 		return nil, fmt.Errorf("pull request #%d must be open and ready for review before merge", pr.Number)
@@ -399,7 +405,9 @@ func publishApprovedJob(ctx context.Context, jobID string, config Config) (*pipe
 	if err := config.GitHub.MergePR(ctx, job.Repository, pr.Number); err != nil {
 		return nil, fmt.Errorf("merge pull request #%d: %w", pr.Number, err)
 	}
-	return config.Controller.RecordMerge(job.ID)
+	merged, err := config.Controller.RecordMerge(job.ID)
+	notify(config, merged, outbox.EventMerged, "", "")
+	return merged, err
 }
 
 func successfulChecks(checks *githubpkg.PRChecks, allowNone bool) error {
@@ -581,3 +589,7 @@ func toolJSON(value any) *mcp.CallToolResult {
 }
 
 func toolError(err error) *mcp.CallToolResult { return mcp.NewToolResultError(err.Error()) }
+
+func notify(config Config, job *pipeline.Job, eventType, summary, eventError string) {
+	outbox.Notify(config.Outbox, job, eventType, summary, eventError, config.Logger)
+}
