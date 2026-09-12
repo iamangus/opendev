@@ -78,7 +78,14 @@ func (i *Indexer) Index(ctx context.Context, snapshot Snapshot) (*State, error) 
 	if previous != nil && previous.Status == StatusComplete && previous.IndexedSHA == snapshot.SHA && previous.ContentDigest == digest {
 		return previous, nil
 	}
-	if err := i.client.AddMessages(ctx, []graphiti.Message{{Content: buildEvidence(snapshot), RoleType: "user"}}); err != nil {
+	message := graphiti.Message{
+		Content:           buildEvidence(snapshot),
+		RoleType:          "user",
+		Name:              "opendev-repository-indexer",
+		SourceDescription: fmt.Sprintf("repository %s at commit %s", snapshot.Name, snapshot.SHA),
+		Timestamp:         time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if err := i.client.AddMessages(ctx, []graphiti.Message{message}); err != nil {
 		failed, saveErr := i.store.Save(State{Repository: snapshot.Name, IndexedSHA: snapshot.SHA, ContentDigest: digest, Status: StatusFailed, Error: err.Error()})
 		if saveErr != nil {
 			return failed, fmt.Errorf("ingest repository evidence: %w; record failure: %v", err, saveErr)

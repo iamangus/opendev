@@ -61,6 +61,10 @@ func TestIndexerCompletesAndSkipsIdenticalSuccessfulSnapshot(t *testing.T) {
 		t.Fatalf("Index = %+v; calls = %d", state, len(client.messages))
 	}
 	evidence := client.messages[0][0].Content
+	message := client.messages[0][0]
+	if message.RoleType != "user" || message.Name != "opendev-repository-indexer" || message.SourceDescription != "repository owner/repo at commit abc123" || message.Timestamp == "" {
+		t.Fatalf("unexpected Graphiti message metadata: %+v", message)
+	}
 	for _, want := range []string{"Repository: owner/repo", "Path: /repos/repo", "Commit SHA: abc123", "docs/design.md", "go.mod"} {
 		if !strings.Contains(evidence, want) {
 			t.Errorf("evidence does not contain %q: %s", want, evidence)

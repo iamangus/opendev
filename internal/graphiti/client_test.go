@@ -20,6 +20,10 @@ func TestClientPostsMessagesAndSearchesConfiguredGroup(t *testing.T) {
 			if r.Method != http.MethodPost || string(payload["group_id"]) != `"opendev-repositories"` {
 				t.Fatalf("unexpected message request: %s %s", r.Method, payload["group_id"])
 			}
+			var messages []Message
+			if err := json.Unmarshal(payload["messages"], &messages); err != nil || len(messages) != 1 || messages[0].RoleType != "user" || messages[0].Name != "test-indexer" || messages[0].SourceDescription != "unit test" || messages[0].Timestamp != "2026-09-12T00:00:00Z" {
+				t.Fatalf("unexpected messages: %s, %v", payload["messages"], err)
+			}
 			w.WriteHeader(http.StatusNoContent)
 		case "/search":
 			if got := string(payload["group_ids"]); got != `["opendev-repositories"]` {
@@ -36,7 +40,7 @@ func TestClientPostsMessagesAndSearchesConfiguredGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := client.AddMessages(context.Background(), []Message{{Content: "repository indexed", RoleType: "user"}}); err != nil {
+	if err := client.AddMessages(context.Background(), []Message{{Content: "repository indexed", RoleType: "user", Name: "test-indexer", SourceDescription: "unit test", Timestamp: "2026-09-12T00:00:00Z"}}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := client.Search(context.Background(), "what language?", SearchOptions{MaxResults: 3})

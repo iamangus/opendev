@@ -14,10 +14,11 @@ import (
 
 // Message is one item to add to a Graphiti group.
 type Message struct {
-	Content   string `json:"content"`
-	RoleType  string `json:"role_type,omitempty"`
-	Role      string `json:"role,omitempty"`
-	Timestamp string `json:"timestamp,omitempty"`
+	Content           string `json:"content"`
+	RoleType          string `json:"role_type"`
+	Name              string `json:"name"`
+	SourceDescription string `json:"source_description"`
+	Timestamp         string `json:"timestamp"`
 }
 
 // SearchOptions controls an optional Graphiti search limit.
@@ -64,6 +65,9 @@ func (c *Client) AddMessages(ctx context.Context, messages []Message) error {
 	for i, message := range messages {
 		if strings.TrimSpace(message.Content) == "" {
 			return fmt.Errorf("Graphiti message %d content is required", i)
+		}
+		if strings.TrimSpace(message.RoleType) == "" || strings.TrimSpace(message.Name) == "" || strings.TrimSpace(message.SourceDescription) == "" || strings.TrimSpace(message.Timestamp) == "" {
+			return fmt.Errorf("Graphiti message %d role type, name, source description, and timestamp are required", i)
 		}
 	}
 	return c.doJSON(ctx, "/messages", map[string]any{"group_id": c.groupID, "messages": messages}, nil)
