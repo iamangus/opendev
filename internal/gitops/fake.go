@@ -58,6 +58,11 @@ func (f *Fake) Fetch(_ context.Context, dir string) error {
 	return f.err("Fetch")
 }
 
+func (f *Fake) FastForward(_ context.Context, dir, branch string) error {
+	f.record("FastForward", dir, branch)
+	return f.err("FastForward")
+}
+
 func (f *Fake) WorktreeAdd(_ context.Context, repoDir, wtDir, branch string) error {
 	f.record("WorktreeAdd", repoDir, wtDir, branch)
 	return f.err("WorktreeAdd")

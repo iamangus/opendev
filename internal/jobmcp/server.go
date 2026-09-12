@@ -250,12 +250,25 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
+			job, err := config.Store.Get(id)
+			if err != nil {
+				return toolError(err), nil
+			}
+			if config.Repositories != nil {
+				repo, err := config.Repositories.Lookup(ctx, job.Repository)
+				if err != nil {
+					return toolError(fmt.Errorf("refresh target repository before planning: %w", err)), nil
+				}
+				if repo == nil {
+					return toolError(fmt.Errorf("target repository %q is no longer available", job.Repository)), nil
+				}
+			}
 			if config.DispatchReady != nil {
 				if err := config.DispatchReady(ctx); err != nil {
 					return toolError(err), nil
 				}
 			}
-			job, err := config.Store.StartPlanning(id)
+			job, err = config.Store.StartPlanning(id)
 			if err != nil {
 				return toolError(err), nil
 			}

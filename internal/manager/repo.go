@@ -14,7 +14,8 @@ var runtimeExcludePatterns = []string{
 	".opendev/references",
 }
 
-// SyncRepo clones the repo if it doesn't exist, or fetches if it does.
+// SyncRepo clones the repo if it doesn't exist. Existing primary mirrors are
+// fetched and fast-forwarded only, leaving active task worktrees untouched.
 func (m *Manager) SyncRepo(repoURL, name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -25,7 +26,21 @@ func (m *Manager) SyncRepo(repoURL, name string) error {
 	if isGitClone(repoDir) {
 		m.logger.Info("repo sync: fetching", "repo", name)
 		if err := m.git.Fetch(ctx, repoDir); err != nil {
-			m.logger.Warn("repo sync: fetch failed (non-fatal)", "repo", name, "error", err)
+			return fmt.Errorf("fetch repository %q: %w", name, err)
+		}
+		status, err := m.git.Status(ctx, repoDir)
+		if err != nil {
+			return fmt.Errorf("check primary mirror status for %q: %w", name, err)
+		}
+		if strings.TrimSpace(status) != "" {
+			return fmt.Errorf("primary mirror for %q is dirty; refusing to fast-forward", name)
+		}
+		branch, err := m.git.DefaultBranch(ctx, repoDir)
+		if err != nil {
+			return fmt.Errorf("determine primary mirror branch for %q: %w", name, err)
+		}
+		if err := m.git.FastForward(ctx, repoDir, branch); err != nil {
+			return fmt.Errorf("fast-forward primary mirror for %q: %w", name, err)
 		}
 		return m.ensureRuntimeExcludes(ctx, repoDir)
 	}

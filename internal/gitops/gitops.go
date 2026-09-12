@@ -12,6 +12,7 @@ type Worktree struct {
 type GitOps interface {
 	Clone(ctx context.Context, url, dir string) error
 	Fetch(ctx context.Context, dir string) error
+	FastForward(ctx context.Context, dir, branch string) error
 	WorktreeAdd(ctx context.Context, repoDir, wtDir, branch string) error
 	WorktreeRemove(ctx context.Context, repoDir, wtDir string) error
 	WorktreeList(ctx context.Context, repoDir string) ([]Worktree, error)

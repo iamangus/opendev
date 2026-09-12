@@ -30,6 +30,13 @@ func (e *Exec) Fetch(ctx context.Context, dir string) error {
 	return err
 }
 
+// FastForward advances the checked-out branch only when origin has a direct
+// descendant. It never rewrites local history or touches other worktrees.
+func (e *Exec) FastForward(ctx context.Context, dir, branch string) error {
+	_, err := e.run(ctx, dir, "git", "merge", "--ff-only", "origin/"+branch)
+	return err
+}
+
 func (e *Exec) WorktreeAdd(ctx context.Context, repoDir, wtDir, branch string) error {
 	_, err := e.run(ctx, repoDir, "git", "worktree", "add", wtDir, branch)
 	return err

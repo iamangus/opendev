@@ -159,14 +159,30 @@ func TestSyncRepo_Clone(t *testing.T) {
 func TestSyncRepo_FetchExisting(t *testing.T) {
 	mgr, fake := newTestManager(t)
 	createFakeRepo(t, mgr, "repo")
+	fake.StringReturns["DefaultBranch"] = "main"
 	if err := mgr.SyncRepo("https://github.com/test/repo.git", "repo"); err != nil {
 		t.Fatalf("SyncRepo: %v", err)
 	}
 	if !fake.HasCall("Fetch") {
 		t.Error("expected Fetch to be called")
 	}
+	if !fake.HasCall("FastForward") {
+		t.Error("expected existing repository to fast-forward")
+	}
 	if fake.HasCall("Clone") {
 		t.Error("should not Clone existing repo")
+	}
+}
+
+func TestSyncRepo_RefusesDirtyPrimaryMirror(t *testing.T) {
+	mgr, fake := newTestManager(t)
+	createFakeRepo(t, mgr, "repo")
+	fake.StringReturns["Status"] = " M changed.txt"
+	if err := mgr.SyncRepo("https://github.com/test/repo.git", "repo"); err == nil {
+		t.Fatal("SyncRepo succeeded for a dirty primary mirror")
+	}
+	if fake.HasCall("FastForward") {
+		t.Fatal("dirty primary mirror was fast-forwarded")
 	}
 }
 
