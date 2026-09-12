@@ -85,7 +85,7 @@ func applyWriter(ctx context.Context, run dispatcher.DispatchRun, config Config)
 	if err := decodeResponse(run.Response, &response); err != nil {
 		return fmt.Errorf("invalid writer response: %w", err)
 	}
-	if response.Status != "completed" && response.Status != "blocked" {
+	if response.Status != "completed" && response.Status != "no_changes" && response.Status != "blocked" {
 		return fmt.Errorf("invalid writer status %q", response.Status)
 	}
 	if response.ValidationEvidence == nil {
@@ -117,6 +117,34 @@ func applyWriter(ctx context.Context, run dispatcher.DispatchRun, config Config)
 	if task.Status != pipeline.TaskWorking {
 		// A previous application already advanced this writer's owned task.
 		return nil
+	}
+	hasChanges, err := config.Worktrees.HasChanges(task.WorktreePath)
+	if err != nil {
+		return err
+	}
+	if response.Status == "no_changes" && hasChanges {
+		return fmt.Errorf("writer reported no_changes but the task worktree is dirty")
+	}
+	if !hasChanges {
+		if len(response.ChangedFiles) > 0 {
+			return fmt.Errorf("writer reported changed_files but the task worktree is clean")
+		}
+		reason := strings.TrimSpace(response.Reason)
+		if reason == "" {
+			reason = strings.TrimSpace(response.Summary)
+		}
+		if reason == "" {
+			return fmt.Errorf("writer no-change result omitted summary and reason")
+		}
+		job, err = config.Controller.RecordNoChanges(job.ID, task.Key, run.RunID, reason, *response.ValidationEvidence)
+		if err != nil {
+			return err
+		}
+		_, _, err = integrateEligible(job.ID, config, ctx)
+		return err
+	}
+	if response.Status == "no_changes" {
+		return fmt.Errorf("writer reported no_changes but the task worktree is dirty")
 	}
 	sha, err := config.Worktrees.Commit(task.WorktreePath)
 	if err != nil {

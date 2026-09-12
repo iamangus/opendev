@@ -203,6 +203,15 @@ func (m *Manager) Commit(worktreePath string) (string, error) {
 	return sha, nil
 }
 
+// HasChanges reports whether a task worktree contains changes to commit.
+func (m *Manager) HasChanges(worktreePath string) (bool, error) {
+	status, err := m.git.Status(context.Background(), worktreePath)
+	if err != nil {
+		return false, fmt.Errorf("read task worktree status: %w", err)
+	}
+	return strings.TrimSpace(status) != "", nil
+}
+
 // MergeTask merges an approved task branch and returns the integration HEAD SHA.
 func (m *Manager) MergeTask(repository, sourceBranch, targetBranch string) (string, error) {
 	if err := m.MergeBranch(repository, sourceBranch, targetBranch); err != nil {

@@ -110,13 +110,17 @@ func (f *fakeDispatcher) StartHolistic(context.Context, *pipeline.Job) (*dispatc
 	return &dispatcher.DispatchRun{RunID: "holistic"}, nil
 }
 
-type fakeWorktrees struct{ created []string }
+type fakeWorktrees struct {
+	created    []string
+	hasChanges bool
+}
 
 func (f *fakeWorktrees) CreateWorktree(_, branch, _ string) (string, error) {
 	f.created = append(f.created, branch)
 	return "/work/" + branch, nil
 }
-func (*fakeWorktrees) Commit(string) (string, error) { return "commit-sha", nil }
+func (*fakeWorktrees) Commit(string) (string, error)     { return "commit-sha", nil }
+func (f *fakeWorktrees) HasChanges(string) (bool, error) { return f.hasChanges, nil }
 func (*fakeWorktrees) MergeTask(string, string, string) (string, error) {
 	return "integration-sha", nil
 }
@@ -204,6 +208,69 @@ func TestPlannerOutcomeStartsWritersAndInvalidResponseDoesNotApply(t *testing.T)
 	}
 }
 
+func TestWriterNoChangesSkipsCommitAndReview(t *testing.T) {
+	store, err := pipeline.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.Create("repo", "directive", "main", "", "planner", "writer", "reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartPlanning(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	job, err = store.SubmitPlan(job.ID, pipeline.Plan{Summary: "plan", Tasks: []pipeline.Task{{Key: "one", Title: "One", Description: "Inspect", AcceptanceCriteria: []string{"checked"}}}, IntegrationOrder: []string{"one"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch := &fakeDispatcher{}
+	config := Config{Store: store, Controller: pipeline.NewController(store), Dispatcher: dispatch, Worktrees: &fakeWorktrees{}, Registrar: &fakeRegistrar{}}
+	if _, err := startReadyWriters(context.Background(), job, config); err != nil {
+		t.Fatal(err)
+	}
+	handler := OutcomeHandler(config)
+	run := dispatcher.DispatchRun{JobID: job.ID, Role: dispatcher.RoleWriter, TaskKey: "one", RunID: "writer-one", Status: "completed", Response: `{"status":"no_changes","reason":"the existing implementation already satisfies the task","validation_evidence":[]}`}
+	if err := handler(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := store.Get(job.ID)
+	task := findTask(current, "one")
+	if task.Status != pipeline.TaskNoChanges || current.Status != pipeline.JobNoChanges || len(dispatch.reviewerTasks) != 0 {
+		t.Fatalf("no-change writer outcome advanced incorrectly: job=%+v task=%+v", current, task)
+	}
+}
+
+func TestWriterCompletedWithoutChangesIsRecordedWithoutCommit(t *testing.T) {
+	store, err := pipeline.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.Create("repo", "directive", "main", "", "planner", "writer", "reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartPlanning(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	job, err = store.SubmitPlan(job.ID, pipeline.Plan{Summary: "plan", Tasks: []pipeline.Task{{Key: "one", Title: "One", Description: "Implement", AcceptanceCriteria: []string{"works"}}}, IntegrationOrder: []string{"one"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := Config{Store: store, Controller: pipeline.NewController(store), Dispatcher: &fakeDispatcher{}, Worktrees: &fakeWorktrees{}, Registrar: &fakeRegistrar{}}
+	if _, err := startReadyWriters(context.Background(), job, config); err != nil {
+		t.Fatal(err)
+	}
+	err = OutcomeHandler(config)(context.Background(), dispatcher.DispatchRun{JobID: job.ID, Role: dispatcher.RoleWriter, TaskKey: "one", RunID: "writer-one", Status: "completed", Response: `{"status":"completed","summary":"existing code already satisfies the task","changed_files":[],"validation_evidence":[]}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, _ := store.Get(job.ID)
+	if task := findTask(current, "one"); task.Status != pipeline.TaskNoChanges || current.Status != pipeline.JobNoChanges {
+		t.Fatalf("completed clean worktree was not recorded as no changes: job=%+v task=%+v", current, task)
+	}
+}
+
 func TestWriterAndReviewerOutcomesAdvanceStages(t *testing.T) {
 	store, err := pipeline.NewStore(t.TempDir())
 	if err != nil {
@@ -221,7 +288,7 @@ func TestWriterAndReviewerOutcomesAdvanceStages(t *testing.T) {
 		t.Fatal(err)
 	}
 	dispatch := &fakeDispatcher{}
-	config := Config{Store: store, Controller: pipeline.NewController(store), Dispatcher: dispatch, Worktrees: &fakeWorktrees{}, Registrar: &fakeRegistrar{}}
+	config := Config{Store: store, Controller: pipeline.NewController(store), Dispatcher: dispatch, Worktrees: &fakeWorktrees{hasChanges: true}, Registrar: &fakeRegistrar{}}
 	if _, err := startReadyWriters(context.Background(), job, config); err != nil {
 		t.Fatal(err)
 	}

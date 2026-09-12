@@ -35,6 +35,10 @@ func (c *Controller) RecordWriterCompletion(jobID, taskKey, runID, commitSHA str
 	return c.store.recordWriterCompletion(jobID, taskKey, runID, commitSHA, evidence)
 }
 
+func (c *Controller) RecordNoChanges(jobID, taskKey, runID, reason string, evidence []ValidationEvidence) (*Job, error) {
+	return c.store.recordNoChanges(jobID, taskKey, runID, reason, evidence)
+}
+
 func (c *Controller) RecordReview(jobID, taskKey, runID string, verdict ReviewVerdict) (*Job, error) {
 	return c.store.recordReview(jobID, taskKey, runID, verdict)
 }
@@ -122,6 +126,31 @@ func (s *Store) recordWriterCompletion(jobID, taskKey, runID, commitSHA string, 
 	})
 }
 
+func (s *Store) recordNoChanges(jobID, taskKey, runID, reason string, evidence []ValidationEvidence) (*Job, error) {
+	if strings.TrimSpace(runID) == "" || strings.TrimSpace(reason) == "" {
+		return nil, fmt.Errorf("%w: writer run ID and no-change reason are required", ErrInvalidTransition)
+	}
+	return s.updateTask(jobID, taskKey, func(job *Job, task *Task) error {
+		if task.Status == TaskNoChanges && task.WriterRunID == runID {
+			return nil
+		}
+		if task.Status != TaskWorking || task.WriterRunID != runID {
+			return transition(task.Status, "record no-change writer completion")
+		}
+		task.Status = TaskNoChanges
+		task.NoChangeReason = reason
+		task.ValidationEvidence = append([]ValidationEvidence(nil), evidence...)
+		if allTasksIntegrated(job.Plan) {
+			if hasIntegratedTask(job.Plan) {
+				job.Status = JobHolisticReviewing
+			} else {
+				job.Status = JobNoChanges
+			}
+		}
+		return nil
+	})
+}
+
 func (s *Store) recordReview(jobID, taskKey, runID string, verdict ReviewVerdict) (*Job, error) {
 	if strings.TrimSpace(runID) == "" || (verdict != ReviewApproved && verdict != ReviewChangesRequested && verdict != ReviewBlocked) {
 		return nil, fmt.Errorf("%w: valid reviewer run ID and verdict are required", ErrInvalidTransition)
@@ -198,8 +227,9 @@ func (s *Store) recordIntegration(jobID, taskKey, integrationSHA string) (*Job, 
 				candidate.Status = TaskIntegrationEligible
 			}
 		}
+		job.IntegrationSHA = integrationSHA
 		if allTasksIntegrated(job.Plan) {
-			job.IntegrationSHA, job.Status = integrationSHA, JobHolisticReviewing
+			job.Status = JobHolisticReviewing
 		}
 		return nil
 	})
@@ -360,7 +390,7 @@ func integrationPrerequisitesMet(plan *Plan, task *Task) bool {
 	}
 	for _, key := range plan.IntegrationOrder[:position] {
 		for i := range plan.Tasks {
-			if plan.Tasks[i].Key == key && plan.Tasks[i].Status != TaskIntegrated {
+			if plan.Tasks[i].Key == key && plan.Tasks[i].Status != TaskIntegrated && plan.Tasks[i].Status != TaskNoChanges {
 				return false
 			}
 		}
@@ -370,10 +400,19 @@ func integrationPrerequisitesMet(plan *Plan, task *Task) bool {
 func allTasksIntegrated(plan *Plan) bool {
 	return plan != nil && len(plan.Tasks) > 0 && func() bool {
 		for i := range plan.Tasks {
-			if plan.Tasks[i].Status != TaskIntegrated {
+			if plan.Tasks[i].Status != TaskIntegrated && plan.Tasks[i].Status != TaskNoChanges {
 				return false
 			}
 		}
 		return true
 	}()
+}
+
+func hasIntegratedTask(plan *Plan) bool {
+	for i := range plan.Tasks {
+		if plan.Tasks[i].Status == TaskIntegrated {
+			return true
+		}
+	}
+	return false
 }

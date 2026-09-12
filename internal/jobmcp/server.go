@@ -28,6 +28,7 @@ type Dispatcher interface {
 type Worktrees interface {
 	CreateWorktree(repository, branch, base string) (string, error)
 	Commit(worktreePath string) (string, error)
+	HasChanges(worktreePath string) (bool, error)
 	MergeTask(repository, sourceBranch, targetBranch string) (string, error)
 }
 
@@ -447,7 +448,7 @@ func integrateEligible(jobID string, config Config, ctx context.Context) (*pipel
 func taskDependenciesIntegrated(job *pipeline.Job, task *pipeline.Task) bool {
 	for _, dependency := range task.DependsOn {
 		prerequisite := findTask(job, dependency)
-		if prerequisite == nil || prerequisite.Status != pipeline.TaskIntegrated {
+		if prerequisite == nil || (prerequisite.Status != pipeline.TaskIntegrated && prerequisite.Status != pipeline.TaskNoChanges) {
 			return false
 		}
 	}

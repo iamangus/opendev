@@ -28,6 +28,7 @@ const (
 	JobHolisticReviewing JobStatus = "holistic_reviewing"
 	JobReadyToPublish    JobStatus = "ready_to_publish"
 	JobPublished         JobStatus = "published"
+	JobNoChanges         JobStatus = "no_changes"
 	JobFailed            JobStatus = "failed"
 )
 
@@ -42,6 +43,7 @@ const (
 	TaskIntegrationEligible TaskStatus = "integration_eligible"
 	TaskIntegrating         TaskStatus = "integrating"
 	TaskIntegrated          TaskStatus = "integrated"
+	TaskNoChanges           TaskStatus = "no_changes"
 	TaskBlocked             TaskStatus = "blocked"
 )
 
@@ -87,6 +89,7 @@ type Task struct {
 	IntegrationSHA     string               `json:"integration_sha,omitempty"`
 	ReviewVerdict      ReviewVerdict        `json:"review_verdict"`
 	ValidationEvidence []ValidationEvidence `json:"validation_evidence,omitempty"`
+	NoChangeReason     string               `json:"no_change_reason,omitempty"`
 	BlockReason        string               `json:"block_reason,omitempty"`
 }
 
