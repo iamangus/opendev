@@ -76,6 +76,13 @@ func TestIndexerCompletesAndSkipsIdenticalSuccessfulSnapshot(t *testing.T) {
 	if len(client.messages) != 1 {
 		t.Fatalf("duplicate snapshot calls = %d, want 1", len(client.messages))
 	}
+	snapshot.Epoch = "graphiti-worker-v1"
+	if _, err := indexer.Index(context.Background(), snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.messages) != 2 {
+		t.Fatalf("epoch-changed snapshot calls = %d, want 2", len(client.messages))
+	}
 }
 
 func TestIndexerRecordsFailureAndBoundsEvidence(t *testing.T) {

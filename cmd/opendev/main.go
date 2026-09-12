@@ -385,7 +385,7 @@ func repositorySnapshot(record repositorycatalog.Record) (repositoryindex.Snapsh
 			docs[name] = content
 		}
 	}
-	return repositoryindex.Snapshot{Name: record.Name, Path: record.Path, SHA: record.HeadSHA, OriginURL: record.OriginURL, DefaultBranch: record.DefaultBranch, README: read("README.md"), Docs: docs, Manifests: manifests}, nil
+	return repositoryindex.Snapshot{Name: record.Name, Path: record.Path, SHA: record.HeadSHA, OriginURL: record.OriginURL, DefaultBranch: record.DefaultBranch, Epoch: strings.TrimSpace(os.Getenv("GRAPHITI_INDEX_EPOCH")), README: read("README.md"), Docs: docs, Manifests: manifests}, nil
 }
 
 func readEvidenceFile(path string) string {

@@ -31,9 +31,11 @@ type Snapshot struct {
 	SHA           string
 	OriginURL     string
 	DefaultBranch string
-	README        string
-	Docs          map[string]string
-	Manifests     map[string]string
+	// Epoch permits an intentional reingestion after a graph service migration.
+	Epoch     string
+	README    string
+	Docs      map[string]string
+	Manifests map[string]string
 }
 
 // StateStore is the durable state needed to avoid duplicate successful ingestions.
@@ -120,6 +122,7 @@ func snapshotDigest(snapshot Snapshot) string {
 	writeDigestField(hash, "sha", snapshot.SHA)
 	writeDigestField(hash, "origin", snapshot.OriginURL)
 	writeDigestField(hash, "default_branch", snapshot.DefaultBranch)
+	writeDigestField(hash, "epoch", snapshot.Epoch)
 	writeDigestField(hash, "README.md", snapshot.README)
 	writeDigestFiles(hash, "docs", snapshot.Docs)
 	writeDigestFiles(hash, "manifests", snapshot.Manifests)
