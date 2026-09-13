@@ -174,6 +174,19 @@ func TestSyncRepo_FetchExisting(t *testing.T) {
 	}
 }
 
+func TestSyncRepo_UsesGitHubDefaultBranch(t *testing.T) {
+	mgr, fake := newTestManager(t)
+	createFakeRepo(t, mgr, "repo")
+	fake.BoolReturns["RemoteBranchExists"] = true
+	fake.BoolReturns["BranchExists"] = true
+	if err := mgr.SyncRepo("https://github.com/test/repo.git", "repo", "trunk"); err != nil {
+		t.Fatalf("SyncRepo: %v", err)
+	}
+	if !fake.HasCall("Checkout") || !fake.HasCall("FastForward") {
+		t.Fatal("expected authoritative default branch checkout and fast-forward")
+	}
+}
+
 func TestSyncRepo_RefusesDirtyPrimaryMirror(t *testing.T) {
 	mgr, fake := newTestManager(t)
 	createFakeRepo(t, mgr, "repo")

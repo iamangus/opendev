@@ -37,6 +37,11 @@ func (e *Exec) FastForward(ctx context.Context, dir, branch string) error {
 	return err
 }
 
+func (e *Exec) Checkout(ctx context.Context, dir, branch string) error {
+	_, err := e.run(ctx, dir, "git", "checkout", branch)
+	return err
+}
+
 func (e *Exec) WorktreeAdd(ctx context.Context, repoDir, wtDir, branch string) error {
 	_, err := e.run(ctx, repoDir, "git", "worktree", "add", wtDir, branch)
 	return err
@@ -153,7 +158,7 @@ func (e *Exec) DefaultBranch(ctx context.Context, dir string) (string, error) {
 }
 
 func (e *Exec) BranchExists(ctx context.Context, dir, branch string) (bool, error) {
-	_, err := e.run(ctx, dir, "git", "rev-parse", "--verify", branch)
+	_, err := e.runProbe(ctx, dir, "git", "rev-parse", "--verify", branch)
 	if err != nil {
 		return false, nil
 	}
@@ -161,7 +166,7 @@ func (e *Exec) BranchExists(ctx context.Context, dir, branch string) (bool, erro
 }
 
 func (e *Exec) RemoteBranchExists(ctx context.Context, dir, branch string) (bool, error) {
-	_, err := e.run(ctx, dir, "git", "rev-parse", "--verify", "origin/"+branch)
+	_, err := e.runProbe(ctx, dir, "git", "rev-parse", "--verify", "origin/"+branch)
 	if err != nil {
 		return false, nil
 	}
@@ -225,6 +230,22 @@ func (e *Exec) run(ctx context.Context, dir, name string, args ...string) (strin
 		"dir", dir,
 		"duration_ms", elapsed.Milliseconds(),
 	)
+	return result, nil
+}
+
+// runProbe is for expected existence checks where a non-zero status is data,
+// not an operational failure worth emitting at error level.
+func (e *Exec) runProbe(ctx context.Context, dir, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.CombinedOutput()
+	result := strings.TrimSpace(string(out))
+	if err != nil {
+		e.logger.Debug("git probe did not match", "cmd", name, "args", args, "dir", dir)
+		return result, err
+	}
 	return result, nil
 }
 

@@ -321,7 +321,7 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 // mirrors. Failures are logged per repository so one inaccessible repository
 // never prevents already-synced jobs from running.
 type repositorySyncer interface {
-	SyncRepo(repoURL, name string) error
+	SyncRepo(repoURL, name string, expectedDefaultBranch ...string) error
 }
 
 func syncOwnedRepositories(ctx context.Context, ghClient githubpkg.Client, syncer repositorySyncer, logger *slog.Logger) {
@@ -335,7 +335,7 @@ func syncOwnedRepositories(ctx context.Context, ghClient githubpkg.Client, synce
 			logger.Warn("owned repository bootstrap skipped incomplete repository metadata", "repository", repo.FullName)
 			continue
 		}
-		if err := syncer.SyncRepo(repo.CloneURL, repo.Name); err != nil {
+		if err := syncer.SyncRepo(repo.CloneURL, repo.Name, repo.DefaultBranch); err != nil {
 			logger.Warn("owned repository sync failed", "repository", repo.Name, "error", err)
 		}
 	}
@@ -496,6 +496,14 @@ func (d *lazyDispatcher) StartHolistic(ctx context.Context, job *pipeline.Job) (
 		return nil, err
 	}
 	return inner.StartHolistic(ctx, job)
+}
+
+func (d *lazyDispatcher) Supersede(ctx context.Context, taskID, reason string) error {
+	inner, err := d.get(ctx)
+	if err != nil {
+		return err
+	}
+	return inner.Supersede(ctx, taskID, reason)
 }
 
 func (d *lazyDispatcher) get(ctx context.Context) (*dispatcher.Dispatcher, error) {

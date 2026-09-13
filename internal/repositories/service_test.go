@@ -17,7 +17,7 @@ type fakeManager struct {
 	err       error
 }
 
-func (m *fakeManager) SyncRepo(url, name string) error {
+func (m *fakeManager) SyncRepo(url, name string, _ ...string) error {
 	m.syncURLs = append(m.syncURLs, url)
 	m.syncNames = append(m.syncNames, name)
 	return m.err

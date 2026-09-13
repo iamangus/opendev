@@ -13,7 +13,7 @@ import (
 )
 
 type repositoryManager interface {
-	SyncRepo(repoURL, name string) error
+	SyncRepo(repoURL, name string, expectedDefaultBranch ...string) error
 	RepoDir(repo string) string
 }
 
@@ -115,7 +115,7 @@ func (s *Service) syncAndRefresh(ctx context.Context, name string, repo *github.
 	if repo == nil || strings.TrimSpace(repo.CloneURL) == "" {
 		return nil, fmt.Errorf("GitHub repository %q has no clone URL", name)
 	}
-	if err := s.manager.SyncRepo(repo.CloneURL, name); err != nil {
+	if err := s.manager.SyncRepo(repo.CloneURL, name, repo.DefaultBranch); err != nil {
 		return nil, fmt.Errorf("sync repository %q: %w", name, err)
 	}
 	record, err := s.catalog.Refresh(ctx, manager.RepoInfo{

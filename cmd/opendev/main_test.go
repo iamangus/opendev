@@ -26,7 +26,7 @@ type fakeRepositorySyncer struct {
 	err   error
 }
 
-func (s *fakeRepositorySyncer) SyncRepo(url, name string) error {
+func (s *fakeRepositorySyncer) SyncRepo(url, name string, _ ...string) error {
 	s.calls = append(s.calls, [2]string{url, name})
 	return s.err
 }

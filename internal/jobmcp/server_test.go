@@ -25,7 +25,7 @@ func TestRoleEndpointsExposeOnlyAssignedTools(t *testing.T) {
 		{RoleWriter, []string{"get_code_job", "run_validation"}},
 		{RoleReviewer, []string{"get_code_job", "run_validation"}},
 		{RoleHolistic, []string{"get_code_job"}},
-		{RoleAdmin, []string{"create_code_job", "fork_public_repository", "get_code_job", "lookup_repository", "provision_repository", "publish_approved_code_job", "run_validation", "start_holistic_rereview", "start_planning"}},
+		{RoleAdmin, []string{"create_code_job", "fork_public_repository", "get_code_job", "lookup_repository", "provision_repository", "publish_approved_code_job", "retry_code_task", "run_validation", "start_holistic_rereview", "start_planning"}},
 	} {
 		t.Run(string(tc.role), func(t *testing.T) {
 			ts := httptest.NewServer(NewRole(Config{}, tc.role))
@@ -109,6 +109,7 @@ func (f *fakeDispatcher) StartReviewer(_ context.Context, _ *pipeline.Job, task 
 func (f *fakeDispatcher) StartHolistic(context.Context, *pipeline.Job) (*dispatcher.DispatchRun, error) {
 	return &dispatcher.DispatchRun{RunID: "holistic"}, nil
 }
+func (*fakeDispatcher) Supersede(context.Context, string, string) error { return nil }
 
 type fakeWorktrees struct {
 	created    []string

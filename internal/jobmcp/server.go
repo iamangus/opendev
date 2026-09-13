@@ -25,6 +25,7 @@ type Dispatcher interface {
 	StartWriter(context.Context, *pipeline.Job, *pipeline.Task) (*dispatcher.DispatchRun, error)
 	StartReviewer(context.Context, *pipeline.Job, *pipeline.Task) (*dispatcher.DispatchRun, error)
 	StartHolistic(context.Context, *pipeline.Job) (*dispatcher.DispatchRun, error)
+	Supersede(context.Context, string, string) error
 }
 
 type Worktrees interface {
@@ -98,6 +99,30 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 		return false
 	}
 	if allowed() {
+		s.AddTool(mcp.NewTool("retry_code_task",
+			mcp.WithDescription("Retry a Writer task whose terminal result could not be applied. The rejected result is retained as superseded history."),
+			mcp.WithString("job_id", mcp.Required()),
+			mcp.WithString("task_key", mcp.Required()),
+			mcp.WithString("reason", mcp.Required()),
+		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			jobID, err := req.RequireString("job_id")
+			if err != nil { return mcp.NewToolResultError(err.Error()), nil }
+			taskKey, err := req.RequireString("task_key")
+			if err != nil { return mcp.NewToolResultError(err.Error()), nil }
+			reason, err := req.RequireString("reason")
+			if err != nil { return mcp.NewToolResultError(err.Error()), nil }
+			job, err := config.Store.Get(jobID)
+			if err != nil { return toolError(err), nil }
+			task := findTask(job, taskKey)
+			if task == nil { return mcp.NewToolResultError("task not found"), nil }
+			if task.Status != pipeline.TaskWorking || task.WriterRunID == "" { return mcp.NewToolResultError("only an unapplied Writer task can be retried"), nil }
+			if err := config.Dispatcher.Supersede(ctx, dispatcher.TaskID(job.ID, dispatcher.RoleWriter, task.Key, task.WriterAttempts), reason); err != nil { return toolError(err), nil }
+			job, err = config.Controller.RetryWriter(job.ID, task.Key, task.WriterRunID)
+			if err != nil { return toolError(err), nil }
+			run, err := startWriter(ctx, job, findTask(job, taskKey), config)
+			if err != nil { return toolError(err), nil }
+			return toolJSON(map[string]any{"job_id": job.ID, "task_key": taskKey, "run_id": run.RunID}), nil
+		})
 		s.AddTool(mcp.NewTool("lookup_repository",
 			mcp.WithDescription("Reconcile one owned repository with the durable catalog and local clone. This creates nothing."),
 			mcp.WithString("repository", mcp.Required(), mcp.Description("Owned GitHub repository name.")),

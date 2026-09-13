@@ -28,6 +28,20 @@ type RunStore interface {
 	ListUnapplied(ctx context.Context) ([]DispatchRun, error)
 }
 
+// Supersede marks a terminal dispatch as deliberately replaced by an operator retry.
+func (d *Dispatcher) Supersede(ctx context.Context, taskID, reason string) error {
+	run, err := d.store.Get(ctx, taskID)
+	if err != nil {
+		return fmt.Errorf("load dispatch run: %w", err)
+	}
+	if run == nil || !terminal(run.Status) || run.OutcomeApplied {
+		return fmt.Errorf("dispatch run %q is not an unapplied terminal result", taskID)
+	}
+	run.OutcomeApplied = true
+	run.Error = strings.TrimSpace(run.Error + "; superseded: " + reason)
+	return d.store.Save(ctx, *run)
+}
+
 // DispatchRun is the persisted dispatch intent and remote run identifier.
 type DispatchRun struct {
 	TaskID         string

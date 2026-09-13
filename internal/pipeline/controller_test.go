@@ -75,6 +75,20 @@ func TestControllerTaskTransitionsAndRetries(t *testing.T) {
 	}
 }
 
+func TestControllerRetriesUnappliedWriter(t *testing.T) {
+	_, controller, job := plannedController(t, t.TempDir(), []Task{task("one")}, []string{"one"})
+	if _, err := controller.StartTaskWork(job.ID, "one", "branch", "/work", "writer-1"); err != nil {
+		t.Fatal(err)
+	}
+	job, err := controller.RetryWriter(job.ID, "one", "writer-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := job.Plan.Tasks[0]; got.Status != TaskPlanned || got.WriterRunID != "" || got.WriterAttempts != 1 {
+		t.Fatalf("writer retry did not release task: %+v", got)
+	}
+}
+
 func TestControllerDependencyGateAndIntegrationOrder(t *testing.T) {
 	_, controller, job := plannedController(t, t.TempDir(), []Task{task("base"), task("dependent", "base")}, []string{"base", "dependent"})
 	for _, key := range []string{"base", "dependent"} {

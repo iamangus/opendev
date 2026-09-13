@@ -79,6 +79,19 @@ func (c *Controller) BlockTask(jobID, taskKey, reason string) (*Job, error) {
 	return c.store.BlockTask(jobID, taskKey, reason)
 }
 
+// RetryWriter releases a task whose Writer result could not be applied.
+func (c *Controller) RetryWriter(jobID, taskKey, runID string) (*Job, error) {
+	return c.store.updateTask(jobID, taskKey, func(job *Job, task *Task) error {
+		if task.Status != TaskWorking || task.WriterRunID != runID {
+			return transition(task.Status, "retry writer")
+		}
+		task.WriterRunID = ""
+		task.Status = TaskPlanned
+		job.Status = JobPlanned
+		return nil
+	})
+}
+
 func (c *Controller) FailJob(jobID, reason string) (*Job, error) {
 	return c.store.FailJob(jobID, reason)
 }
