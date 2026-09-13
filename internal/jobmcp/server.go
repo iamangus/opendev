@@ -300,11 +300,9 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 			mcp.WithString("repository", mcp.Required(), mcp.Description("Configured repository name.")),
 			mcp.WithString("directive", mcp.Required(), mcp.Description("High-level outcome to achieve.")),
 			mcp.WithString("target_branch", mcp.Description("Target branch. Defaults to main.")),
-			mcp.WithString("orchestrator_agent_id", mcp.Description("AgentFoundry ID of the orchestrator.")),
 			mcp.WithString("planner_agent_id", mcp.Description("AgentFoundry ID of the planner.")),
 			mcp.WithString("writer_agent_id", mcp.Description("AgentFoundry ID of the writer.")),
 			mcp.WithString("reviewer_agent_id", mcp.Description("AgentFoundry ID of the reviewer.")),
-			mcp.WithString("holistic_agent_id", mcp.Description("AgentFoundry ID of the holistic reviewer.")),
 		), func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			repository, err := req.RequireString("repository")
 			if err != nil {
@@ -314,7 +312,7 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-			job, err := config.Store.Create(repository, directive, req.GetString("target_branch", "main"), req.GetString("orchestrator_agent_id", ""), req.GetString("planner_agent_id", ""), req.GetString("writer_agent_id", ""), req.GetString("reviewer_agent_id", ""), req.GetString("holistic_agent_id", ""))
+			job, err := config.Store.Create(repository, directive, req.GetString("target_branch", "main"), "", req.GetString("planner_agent_id", ""), req.GetString("writer_agent_id", ""), req.GetString("reviewer_agent_id", ""))
 			if err != nil {
 				return toolError(err), nil
 			}
