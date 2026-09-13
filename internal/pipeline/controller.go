@@ -161,6 +161,12 @@ func (s *Store) recordReview(jobID, taskKey, runID string, verdict ReviewVerdict
 		if task.ReviewerRunID == runID && task.ReviewVerdict == verdict && task.Status != TaskReviewing {
 			return nil
 		}
+		// Recover jobs written before revision work cleared the superseded reviewer.
+		// A later writer attempt proves this terminal reviewer belongs to the next review.
+		if task.Status == TaskReviewing && task.ReviewerRunID != runID && task.ReviewerAttempts < task.WriterAttempts {
+			task.ReviewerRunID = runID
+			task.ReviewerAttempts++
+		}
 		if task.Status != TaskReviewing || (task.ReviewerRunID != "" && task.ReviewerRunID != runID) {
 			return transition(task.Status, "record review")
 		}

@@ -114,6 +114,39 @@ func TestControllerDependencyGateAndIntegrationOrder(t *testing.T) {
 	}
 }
 
+func TestControllerRecoversStaleReviewerOwnershipAfterRevision(t *testing.T) {
+	store, controller, job := plannedController(t, t.TempDir(), []Task{task("one")}, []string{"one"})
+	if _, err := controller.StartTaskWork(job.ID, "one", "branch", "/work", "writer-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.RecordWriterCompletion(job.ID, "one", "writer-1", "commit-1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.RecordReview(job.ID, "one", "reviewer-1", ReviewChangesRequested); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.StartTaskWork(job.ID, "one", "branch", "/work", "writer-2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.RecordWriterCompletion(job.ID, "one", "writer-2", "commit-2", nil); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the stale ownership written by the pre-fix controller.
+	if _, err := store.updateTask(job.ID, "one", func(_ *Job, task *Task) error {
+		task.ReviewerRunID = "reviewer-1"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := controller.RecordReview(job.ID, "one", "reviewer-2", ReviewApproved)
+	if err != nil {
+		t.Fatalf("stale reviewer ownership should recover: %v", err)
+	}
+	if got := job.Plan.Tasks[0]; got.ReviewerRunID != "reviewer-2" || got.ReviewerAttempts != 2 || got.Status != TaskIntegrationEligible {
+		t.Fatalf("stale reviewer recovery not recorded: %+v", got)
+	}
+}
+
 func TestControllerRecordsBlockedReview(t *testing.T) {
 	_, controller, job := plannedController(t, t.TempDir(), []Task{task("one")}, []string{"one"})
 	if _, err := controller.StartTaskWork(job.ID, "one", "branch", "/work", "writer"); err != nil {
