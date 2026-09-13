@@ -46,14 +46,16 @@ func (s *memoryRunStore) ListUnapplied(_ context.Context) ([]DispatchRun, error)
 type fakeRunner struct {
 	mu        sync.Mutex
 	starts    int
+	agentID   string
 	options   agentfoundry.RunOptions
 	getStatus string
 }
 
-func (f *fakeRunner) StartRun(_ context.Context, _ string, options agentfoundry.RunOptions) (string, error) {
+func (f *fakeRunner) StartRun(_ context.Context, agentID string, options agentfoundry.RunOptions) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.starts++
+	f.agentID = agentID
 	f.options = options
 	return "run-1", nil
 }
@@ -127,6 +129,33 @@ func TestReconcileRetriesPersistedStartIntent(t *testing.T) {
 	persisted, _ := store.Get(context.Background(), "opendev:job-1:planner:job:1")
 	if persisted.RunID != "run-1" || persisted.Status != "running" {
 		t.Fatalf("reconciliation did not persist run ID: %+v", persisted)
+	}
+}
+
+func TestStartHolisticRefreshesUnacceptedIntent(t *testing.T) {
+	job := &pipeline.Job{ID: "job-1", ReviewerAgentID: "reviewer", IntegrationSHA: "integrated"}
+	taskID := TaskID(job.ID, RoleHolistic, "job", 1)
+	store := &memoryRunStore{runs: map[string]DispatchRun{
+		taskID: {TaskID: taskID, JobID: job.ID, Role: RoleHolistic, TaskKey: "job", Attempt: 1, AgentID: "TODO", Message: "stale", Status: "starting"},
+	}}
+	runner := &fakeRunner{getStatus: "running"}
+	d, err := New(runner, store, Config{PollInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	if _, err := d.StartHolistic(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	persisted, _ := store.Get(context.Background(), taskID)
+	if persisted.AgentID != "reviewer" || persisted.RunID != "run-1" {
+		t.Fatalf("unaccepted intent was not refreshed: %+v", persisted)
+	}
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	if runner.agentID != "reviewer" {
+		t.Fatalf("started agent = %q, want reviewer", runner.agentID)
 	}
 }
 

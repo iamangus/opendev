@@ -214,6 +214,16 @@ func (d *Dispatcher) start(ctx context.Context, job *pipeline.Job, role, taskKey
 	}
 	if existing != nil {
 		if existing.RunID == "" {
+			// A launch that never received a run ID was never accepted by
+			// AgentFoundry. Refresh its dispatch input before retrying so a
+			// corrected controller selection can recover the durable intent.
+			existing.AgentID = agentID
+			existing.Message = message
+			existing.Status = "starting"
+			existing.Error = ""
+			if err := d.store.Save(ctx, *existing); err != nil {
+				return nil, fmt.Errorf("refresh dispatch intent: %w", err)
+			}
 			if err := d.launch(ctx, existing); err != nil {
 				return nil, err
 			}
