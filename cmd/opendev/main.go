@@ -234,9 +234,10 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 		mcpToken: mcpToken,
 		logger:   logger,
 	}
+	jobController := pipeline.NewController(jobStore)
 	jobMCPConfig := jobmcp.Config{
 		Store:      jobStore,
-		Controller: pipeline.NewController(jobStore),
+		Controller: jobController,
 		Dispatcher: jobDispatcher,
 		DispatchReady: func(ctx context.Context) error {
 			_, err := jobDispatcher.get(ctx)
@@ -314,7 +315,27 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 	if _, err := jobDispatcher.get(context.Background()); err != nil {
 		logger.Error("startup dispatch reconciliation failed", "error", err)
 	}
+	resumePendingHolisticReviews(context.Background(), jobStore, jobController, jobDispatcher, logger)
 	select {}
+}
+
+// resumePendingHolisticReviews repairs the crash window after a holistic
+// dispatch is accepted but before its run ID is written to the job. StartHolistic
+// adopts an existing accepted run and refreshes only an unaccepted intent.
+func resumePendingHolisticReviews(ctx context.Context, store *pipeline.Store, controller *pipeline.Controller, runs jobmcp.Dispatcher, logger *slog.Logger) {
+	for _, job := range store.List() {
+		if job.Status != pipeline.JobHolisticReviewing || job.HolisticReviewRunID != "" || job.IntegrationSHA == "" {
+			continue
+		}
+		run, err := runs.StartHolistic(ctx, job)
+		if err != nil {
+			logger.Error("resume pending holistic review", "job_id", job.ID, "error", err)
+			continue
+		}
+		if _, err := controller.StartHolisticReviewer(job.ID, run.RunID, job.IntegrationSHA); err != nil {
+			logger.Error("record resumed holistic review", "job_id", job.ID, "run_id", run.RunID, "error", err)
+		}
+	}
 }
 
 // syncOwnedRepositories gives a standalone OpenDev installation its own local
