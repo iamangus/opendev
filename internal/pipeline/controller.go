@@ -102,6 +102,8 @@ func (s *Store) startTaskWork(jobID, taskKey, branch, worktreePath, runID string
 			branch = job.IntegrationBranch + "/" + task.Key
 		}
 		task.Status, task.Branch, task.WorktreePath, task.WriterRunID = TaskWorking, branch, worktreePath, runID
+		// A revision replaces the prior review decision and its run ownership.
+		task.ReviewerRunID, task.ReviewVerdict = "", ReviewPending
 		task.WriterAttempts++
 		job.Status = JobWorking
 		return nil

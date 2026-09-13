@@ -59,8 +59,19 @@ func TestControllerTaskTransitionsAndRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if job.Plan.Tasks[0].WriterAttempts != 2 || job.Plan.Tasks[0].WriterRunID != "writer-2" {
+	if job.Plan.Tasks[0].WriterAttempts != 2 || job.Plan.Tasks[0].WriterRunID != "writer-2" || job.Plan.Tasks[0].ReviewerRunID != "" || job.Plan.Tasks[0].ReviewVerdict != ReviewPending {
 		t.Fatalf("retry not recorded: %+v", job.Plan.Tasks[0])
+	}
+	job, err = controller.RecordWriterCompletion(job.ID, "one", "writer-2", "commit-2", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err = controller.StartReviewer(job.ID, "one", "review-2")
+	if err != nil {
+		t.Fatalf("retry review should replace its prior reviewer: %v", err)
+	}
+	if got := job.Plan.Tasks[0]; got.ReviewerRunID != "review-2" || got.ReviewerAttempts != 2 {
+		t.Fatalf("retry reviewer not recorded: %+v", got)
 	}
 }
 
