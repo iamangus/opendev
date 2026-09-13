@@ -1,9 +1,6 @@
 package tools
 
 import (
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -69,63 +66,6 @@ func TestExecuteTerminalCommand_Timeout(t *testing.T) {
 // TestExecuteTerminalCommand_InvalidDir verifies ToolError for bad worktree.
 func TestExecuteTerminalCommand_InvalidDir(t *testing.T) {
 	_, _, _, _, err := ExecuteTerminalCommand("/nonexistent/dir/xyz", "echo hi", 5*time.Second)
-	if err == nil {
-		t.Fatal("expected error for invalid dir, got nil")
-	}
-	if _, ok := err.(*worktree.ToolError); !ok {
-		t.Fatalf("expected ToolError, got %T", err)
-	}
-}
-
-// TestGetGitDiff_InGitRepo verifies git diff output in a temporary git repository.
-func TestGetGitDiff_InGitRepo(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git not available")
-	}
-
-	dir := t.TempDir()
-
-	run := func(args ...string) {
-		t.Helper()
-		cmd := exec.Command("git", args...)
-		cmd.Dir = dir
-		cmd.Env = append(os.Environ(),
-			"GIT_AUTHOR_NAME=Test",
-			"GIT_AUTHOR_EMAIL=test@example.com",
-			"GIT_COMMITTER_NAME=Test",
-			"GIT_COMMITTER_EMAIL=test@example.com",
-		)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git %v failed: %v\n%s", args, err, out)
-		}
-	}
-
-	run("init")
-	run("config", "user.email", "test@example.com")
-	run("config", "user.name", "Test")
-
-	// Create and commit initial file
-	filePath := filepath.Join(dir, "hello.txt")
-	os.WriteFile(filePath, []byte("initial\n"), 0644)
-	run("add", "hello.txt")
-	run("commit", "-m", "initial commit")
-
-	// Modify the file (unstaged change)
-	os.WriteFile(filePath, []byte("modified\n"), 0644)
-
-	out, err := GetGitDiff(dir)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	// Should show either diff or status
-	if out == "" {
-		t.Error("expected non-empty output from GetGitDiff")
-	}
-}
-
-// TestGetGitDiff_InvalidDir verifies ToolError for bad worktree.
-func TestGetGitDiff_InvalidDir(t *testing.T) {
-	_, err := GetGitDiff("/nonexistent/dir/xyz")
 	if err == nil {
 		t.Fatal("expected error for invalid dir, got nil")
 	}

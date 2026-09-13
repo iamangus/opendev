@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
 	"time"
 
 	"github.com/iamangus/code-mcp/internal/worktree"
@@ -55,30 +54,4 @@ func ExecuteTerminalCommand(worktreeRoot, command string, timeout time.Duration)
 		}
 	}
 	return
-}
-
-// GetGitDiff returns the git diff and status for the given worktree directory.
-func GetGitDiff(worktreeRoot string) (string, error) {
-	info, err := os.Stat(worktreeRoot)
-	if err != nil || !info.IsDir() {
-		return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: worktree root %q does not exist or is not a directory", worktreeRoot)}
-	}
-
-	var out strings.Builder
-
-	diffCmd := exec.Command("git", "diff", "HEAD")
-	diffCmd.Dir = worktreeRoot
-	diffOut, err := diffCmd.Output()
-	if err == nil {
-		out.Write(diffOut)
-	}
-
-	statusCmd := exec.Command("git", "status", "--short")
-	statusCmd.Dir = worktreeRoot
-	statusOut, err := statusCmd.Output()
-	if err == nil {
-		out.Write(statusOut)
-	}
-
-	return out.String(), nil
 }

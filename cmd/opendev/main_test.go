@@ -146,7 +146,7 @@ func TestRegisterReadTools_ToolList(t *testing.T) {
 
 	toolNames := listMCPTools(t, ts.URL)
 
-	wantPresent := []string{"read_file", "read_lines", "list_directory", "grep_search", "get_git_diff"}
+	wantPresent := []string{"read_file", "read_lines", "list_directory", "grep_search"}
 	wantAbsent := []string{"create_file", "search_and_replace"}
 
 	for _, name := range wantPresent {
@@ -176,7 +176,7 @@ func TestRegisterWriteTools_ToolList(t *testing.T) {
 	toolList := listMCPTools(t, ts.URL)
 
 	wantPresent := []string{"create_file", "search_and_replace"}
-	wantAbsent := []string{"read_file", "read_lines", "list_directory", "grep_search", "get_git_diff"}
+	wantAbsent := []string{"read_file", "read_lines", "list_directory", "grep_search"}
 
 	for _, name := range wantPresent {
 		if !toolList[name] {

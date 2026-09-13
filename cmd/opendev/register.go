@@ -24,7 +24,7 @@ const (
 var Profiles = []Profile{ProfileRead, ProfileWrite}
 
 // registerReadTools registers the read-only tool set on s.
-// Included: read_file, read_lines, list_directory, grep_search, get_git_diff.
+// Included: read_file, read_lines, list_directory, grep_search.
 func registerReadTools(s *server.MCPServer, lm *locks.Manager, worktreeRoot string, logger *slog.Logger) {
 	// read_file
 	s.AddTool(
@@ -126,22 +126,6 @@ func registerReadTools(s *server.MCPServer, lm *locks.Manager, worktreeRoot stri
 		},
 	)
 
-	// get_git_diff
-	s.AddTool(
-		mcp.NewTool("get_git_diff",
-			mcp.WithDescription("Get the git diff and status for the worktree."),
-		),
-		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			start := time.Now()
-			diff, toolErr := tools.GetGitDiff(worktreeRoot)
-			if toolErr != nil {
-				logger.Error("tool call failed", "tool", "get_git_diff", "error", toolErr, "duration_ms", time.Since(start).Milliseconds())
-				return mcp.NewToolResultError(toolErr.Error()), nil
-			}
-			logger.Info("tool call completed", "tool", "get_git_diff", "duration_ms", time.Since(start).Milliseconds())
-			return mcp.NewToolResultText(diff), nil
-		},
-	)
 }
 
 // registerWriteTools registers the write/mutate tool set on s.

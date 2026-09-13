@@ -295,7 +295,7 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 	}
 
 	if allowed(RoleWriter, RoleReviewer) {
-		s.AddTool(mcp.NewTool("get_task_diff", mcp.WithDescription("Return the authoritative committed diff for this task from its recorded base SHA to its candidate commit. Use this for task review; get_git_diff only shows uncommitted workspace changes."), mcp.WithString("job_id", mcp.Required()), mcp.WithString("task_key", mcp.Required())), func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		s.AddTool(mcp.NewTool("get_task_diff", mcp.WithDescription("Return the authoritative committed diff for this task from its recorded base SHA to its candidate commit. Every Reviewer must use this as its review target."), mcp.WithString("job_id", mcp.Required()), mcp.WithString("task_key", mcp.Required())), func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			_, task, err := jobTask(config.Store, req)
 			if err != nil {
 				return toolError(err), nil
