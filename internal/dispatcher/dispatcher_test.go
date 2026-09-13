@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -40,6 +41,7 @@ func (s *memoryRunStore) ListUnapplied(_ context.Context) ([]DispatchRun, error)
 			runs = append(runs, run)
 		}
 	}
+	sort.Slice(runs, func(i, j int) bool { return runs[i].TaskID < runs[j].TaskID })
 	return runs, nil
 }
 
@@ -49,6 +51,7 @@ type fakeRunner struct {
 	agentID   string
 	options   agentfoundry.RunOptions
 	getStatus string
+	startErr  error
 }
 
 func (f *fakeRunner) StartRun(_ context.Context, agentID string, options agentfoundry.RunOptions) (string, error) {
@@ -57,6 +60,9 @@ func (f *fakeRunner) StartRun(_ context.Context, agentID string, options agentfo
 	f.starts++
 	f.agentID = agentID
 	f.options = options
+	if f.startErr != nil {
+		return "", f.startErr
+	}
 	return "run-1", nil
 }
 func (f *fakeRunner) GetRun(_ context.Context, _ string) (*agentfoundry.Run, error) {
@@ -129,6 +135,30 @@ func TestReconcileRetriesPersistedStartIntent(t *testing.T) {
 	persisted, _ := store.Get(context.Background(), "opendev:job-1:planner:job:1")
 	if persisted.RunID != "run-1" || persisted.Status != "running" {
 		t.Fatalf("reconciliation did not persist run ID: %+v", persisted)
+	}
+}
+
+func TestReconcileContinuesAfterFailedStartIntent(t *testing.T) {
+	store := &memoryRunStore{runs: map[string]DispatchRun{
+		"a-stale": {TaskID: "a-stale", JobID: "job-1", Role: RoleHolistic, TaskKey: "job", AgentID: "missing", Status: "starting"},
+		"z-terminal": {TaskID: "z-terminal", JobID: "job-1", Role: RoleWriter, TaskKey: "task", AgentID: "writer", RunID: "run-1", Status: "completed", Response: `{"status":"completed"}`},
+	}}
+	var applied int
+	d, err := New(&fakeRunner{startErr: fmt.Errorf("agent not found")}, store, Config{OutcomeHandler: func(_ context.Context, run DispatchRun) error {
+		if run.TaskID == "z-terminal" {
+			applied++
+		}
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if err := d.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if applied != 1 {
+		t.Fatalf("terminal outcomes applied = %d, want 1", applied)
 	}
 }
 

@@ -255,7 +255,9 @@ func (d *Dispatcher) Reconcile(ctx context.Context) error {
 		run := runs[i]
 		if run.RunID == "" {
 			if err := d.launch(ctx, &run); err != nil {
-				return err
+				// One stale launch intent must not prevent later terminal outcomes
+				// from reconciling and repairing its current dispatch selection.
+				d.logger.Warn("reconcile dispatch launch failed", "job_id", run.JobID, "role", run.Role, "task", run.TaskKey, "error", err)
 			}
 			continue
 		}
