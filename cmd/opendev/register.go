@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"log/slog"
+	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/iamangus/code-mcp/internal/locks"
 	"github.com/iamangus/code-mcp/internal/tools"
+	"github.com/iamangus/code-mcp/internal/worktree"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -23,9 +26,29 @@ const (
 // each profile on every repo/branch.
 var Profiles = []Profile{ProfileRead, ProfileWrite}
 
+type workspaceState struct {
+	locks     *locks.Manager
+	revisions *tools.RevisionAuthorizer
+}
+
+var workspaceStates sync.Map
+
+func workspaceStateFor(worktreeRoot string, logger *slog.Logger) *workspaceState {
+	root, err := filepath.Abs(worktreeRoot)
+	if err != nil {
+		root = worktreeRoot
+	}
+	state := &workspaceState{
+		locks:     locks.NewManager(logger),
+		revisions: tools.NewRevisionAuthorizer(),
+	}
+	actual, _ := workspaceStates.LoadOrStore(root, state)
+	return actual.(*workspaceState)
+}
+
 // registerReadTools registers the read-only tool set on s.
 // Included: read_file, read_lines, list_directory, grep_search.
-func registerReadTools(s *server.MCPServer, lm *locks.Manager, worktreeRoot string, logger *slog.Logger) {
+func registerReadTools(s *server.MCPServer, lm *locks.Manager, revisions *tools.RevisionAuthorizer, worktreeRoot string, logger *slog.Logger) {
 	// read_file
 	s.AddTool(
 		mcp.NewTool("read_file",
@@ -44,6 +67,8 @@ func registerReadTools(s *server.MCPServer, lm *locks.Manager, worktreeRoot stri
 				logger.Error("tool call failed", "tool", "read_file", "filepath", fp, "error", toolErr, "duration_ms", time.Since(start).Milliseconds())
 				return mcp.NewToolResultError(toolErr.Error()), nil
 			}
+			abs, _ := worktree.Resolve(worktreeRoot, fp)
+			revisions.Authorize(abs, tools.RevisionToken(content))
 			logger.Info("tool call completed", "tool", "read_file", "filepath", fp, "duration_ms", time.Since(start).Milliseconds())
 			return mcp.NewToolResultText(tools.WithRevision(content)), nil
 		},
@@ -130,7 +155,7 @@ func registerReadTools(s *server.MCPServer, lm *locks.Manager, worktreeRoot stri
 
 // registerWriteTools registers the write/mutate tool set on s.
 // Included: create_file, search_and_replace.
-func registerWriteTools(s *server.MCPServer, lm *locks.Manager, worktreeRoot string, logger *slog.Logger) {
+func registerWriteTools(s *server.MCPServer, lm *locks.Manager, revisions *tools.RevisionAuthorizer, worktreeRoot string, logger *slog.Logger) {
 	// create_file
 	s.AddTool(
 		mcp.NewTool("create_file",
@@ -191,11 +216,21 @@ func registerWriteTools(s *server.MCPServer, lm *locks.Manager, worktreeRoot str
 				logger.Error("tool call failed", "tool", "search_and_replace", "filepath", fp, "error", err, "duration_ms", time.Since(start).Milliseconds())
 				return mcp.NewToolResultError(err.Error()), nil
 			}
+			abs, resolveErr := worktree.Resolve(worktreeRoot, fp)
+			if resolveErr != nil {
+				logger.Error("tool call failed", "tool", "search_and_replace", "filepath", fp, "error", resolveErr, "duration_ms", time.Since(start).Milliseconds())
+				return mcp.NewToolResultError(resolveErr.Error()), nil
+			}
+			if authErr := revisions.Verify(abs, expectedRevision); authErr != nil {
+				logger.Error("tool call failed", "tool", "search_and_replace", "filepath", fp, "error", authErr, "duration_ms", time.Since(start).Milliseconds())
+				return mcp.NewToolResultError(authErr.Error()), nil
+			}
 			result, toolErr := tools.SearchAndReplace(ctx, worktreeRoot, fp, searchBlock, replaceBlock, expectedRevision, lm)
 			if toolErr != nil {
 				logger.Error("tool call failed", "tool", "search_and_replace", "filepath", fp, "error", toolErr, "duration_ms", time.Since(start).Milliseconds())
 				return mcp.NewToolResultError(toolErr.Error()), nil
 			}
+			revisions.Consume(abs, expectedRevision)
 			logger.Info("tool call completed", "tool", "search_and_replace", "filepath", fp, "duration_ms", time.Since(start).Milliseconds())
 			return mcp.NewToolResultText(result), nil
 		},
@@ -204,13 +239,16 @@ func registerWriteTools(s *server.MCPServer, lm *locks.Manager, worktreeRoot str
 }
 
 func newMCPHandler(profile Profile, worktreeRoot string, logger *slog.Logger) *server.StreamableHTTPServer {
-	lm := locks.NewManager(logger)
+	return newMCPHandlerWithState(profile, worktreeRoot, logger, workspaceStateFor(worktreeRoot, logger))
+}
+
+func newMCPHandlerWithState(profile Profile, worktreeRoot string, logger *slog.Logger, state *workspaceState) *server.StreamableHTTPServer {
 	s := server.NewMCPServer("opendev", "1.0.0", server.WithToolCapabilities(true))
 	switch profile {
 	case ProfileRead:
-		registerReadTools(s, lm, worktreeRoot, logger)
+		registerReadTools(s, state.locks, state.revisions, worktreeRoot, logger)
 	case ProfileWrite:
-		registerWriteTools(s, lm, worktreeRoot, logger)
+		registerWriteTools(s, state.locks, state.revisions, worktreeRoot, logger)
 	}
 	return server.NewStreamableHTTPServer(s)
 }

@@ -344,3 +344,30 @@ func TestSearchAndReplace_RejectsStaleRevision(t *testing.T) {
 		t.Fatalf("expected stale revision error, got %v", err)
 	}
 }
+
+func TestRevisionAuthorizer_RequiresFreshReadAfterSuccessfulEdit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "file.txt")
+	original := "first"
+	os.WriteFile(path, []byte(original), 0644)
+
+	authorizer := NewRevisionAuthorizer()
+	firstRevision := RevisionToken(original)
+	authorizer.Authorize(path, firstRevision)
+	if err := authorizer.Verify(path, firstRevision); err != nil {
+		t.Fatalf("Verify initial read: %v", err)
+	}
+	if _, err := SearchAndReplace(bgCtx, dir, "file.txt", "first", "second", firstRevision, newLM()); err != nil {
+		t.Fatalf("SearchAndReplace: %v", err)
+	}
+	authorizer.Consume(path, firstRevision)
+
+	secondRevision := RevisionToken("second")
+	if err := authorizer.Verify(path, secondRevision); err == nil {
+		t.Fatal("expected edit to require a fresh read")
+	}
+	authorizer.Authorize(path, secondRevision)
+	if err := authorizer.Verify(path, secondRevision); err != nil {
+		t.Fatalf("Verify fresh read: %v", err)
+	}
+}

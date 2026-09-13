@@ -18,6 +18,7 @@ import (
 	"github.com/iamangus/code-mcp/internal/gitops"
 	"github.com/iamangus/code-mcp/internal/locks"
 	"github.com/iamangus/code-mcp/internal/manager"
+	"github.com/iamangus/code-mcp/internal/tools"
 	"github.com/mark3labs/mcp-go/server"
 )
 
@@ -137,7 +138,7 @@ func TestRegisterReadTools_ToolList(t *testing.T) {
 	dir := t.TempDir()
 	lm := locks.NewManager(slog.Default())
 	s := server.NewMCPServer("opendev", "1.0.0", server.WithToolCapabilities(true))
-	registerReadTools(s, lm, dir, slog.Default())
+	registerReadTools(s, lm, tools.NewRevisionAuthorizer(), dir, slog.Default())
 
 	// Use stateless mode so tests don't need to manage session negotiation.
 	h := server.NewStreamableHTTPServer(s, server.WithStateLess(true))
@@ -167,7 +168,7 @@ func TestRegisterWriteTools_ToolList(t *testing.T) {
 	dir := t.TempDir()
 	lm := locks.NewManager(slog.Default())
 	s := server.NewMCPServer("opendev", "1.0.0", server.WithToolCapabilities(true))
-	registerWriteTools(s, lm, dir, slog.Default())
+	registerWriteTools(s, lm, tools.NewRevisionAuthorizer(), dir, slog.Default())
 
 	h := server.NewStreamableHTTPServer(s, server.WithStateLess(true))
 	ts := httptest.NewServer(h)

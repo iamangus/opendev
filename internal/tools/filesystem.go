@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/iamangus/code-mcp/internal/locks"
@@ -32,7 +33,45 @@ func revision(content string) string {
 // WithRevision formats content with the token required by mutation tools. The
 // token prevents edits against a stale view after an earlier replacement.
 func WithRevision(content string) string {
-	return fmt.Sprintf("Revision: %s\n\n%s", revision(content), content)
+	return fmt.Sprintf("Revision: %s\n\n%s", RevisionToken(content), content)
+}
+
+func RevisionToken(content string) string {
+	return revision(content)
+}
+
+// RevisionAuthorizer permits exactly one edit using a token produced by
+// read_file. A replacement result deliberately does not authorize another edit.
+type RevisionAuthorizer struct {
+	mu       sync.Mutex
+	approved map[string]string
+}
+
+func NewRevisionAuthorizer() *RevisionAuthorizer {
+	return &RevisionAuthorizer{approved: make(map[string]string)}
+}
+
+func (a *RevisionAuthorizer) Authorize(absPath, token string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.approved[absPath] = token
+}
+
+func (a *RevisionAuthorizer) Verify(absPath, token string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.approved[absPath] != token {
+		return &worktree.ToolError{Message: "Tool Error: read_file must be called after the previous successful edit before editing this file again"}
+	}
+	return nil
+}
+
+func (a *RevisionAuthorizer) Consume(absPath, token string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.approved[absPath] == token {
+		delete(a.approved, absPath)
+	}
 }
 
 var ignoreDirs = map[string]bool{

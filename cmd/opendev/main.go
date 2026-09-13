@@ -23,7 +23,6 @@ import (
 	"github.com/iamangus/code-mcp/internal/graphiti"
 	"github.com/iamangus/code-mcp/internal/graphmcp"
 	"github.com/iamangus/code-mcp/internal/jobmcp"
-	"github.com/iamangus/code-mcp/internal/locks"
 	"github.com/iamangus/code-mcp/internal/manager"
 	"github.com/iamangus/code-mcp/internal/outbox"
 	"github.com/iamangus/code-mcp/internal/pipeline"
@@ -108,8 +107,9 @@ func runSingleServer(mode, addr, dir string, logger *slog.Logger) {
 	switch mode {
 	case "http":
 		mux := http.NewServeMux()
+		state := workspaceStateFor(dir, logger)
 		for _, p := range Profiles {
-			h := newMCPHandler(p, dir, logger)
+			h := newMCPHandlerWithState(p, dir, logger, state)
 			pattern := "/" + string(p) + "/mcp"
 			mux.Handle(pattern, h)
 			logger.Info("registered MCP handler", "profile", p, "dir", dir)
@@ -120,9 +120,9 @@ func runSingleServer(mode, addr, dir string, logger *slog.Logger) {
 			os.Exit(1)
 		}
 	default:
-		lm := locks.NewManager(slog.Default())
+		state := workspaceStateFor(dir, logger)
 		s := server.NewMCPServer("opendev", "1.0.0", server.WithToolCapabilities(true))
-		registerReadTools(s, lm, dir, logger)
+		registerReadTools(s, state.locks, state.revisions, dir, logger)
 		if err := server.ServeStdio(s); err != nil {
 			fmt.Fprintf(os.Stderr, "stdio server error: %v\n", err)
 			os.Exit(1)
