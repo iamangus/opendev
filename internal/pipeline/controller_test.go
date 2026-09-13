@@ -89,6 +89,39 @@ func TestControllerRetriesUnappliedWriter(t *testing.T) {
 	}
 }
 
+func TestControllerPersistsReviewReportAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	_, controller, job := plannedController(t, dir, []Task{task("one")}, []string{"one"})
+	if _, err := controller.StartTaskWork(job.ID, "one", "branch", "/work", "writer-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.RecordWriterCompletion(job.ID, "one", "writer-1", "commit-1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.StartReviewer(job.ID, "one", "reviewer-1"); err != nil {
+		t.Fatal(err)
+	}
+	report := ReviewReport{Verdict: ReviewChangesRequested, Summary: "fix scroll", Findings: []string{"missing cleanup"}, AcceptanceCriteria: []ReviewCriterion{{Criterion: "works", Evidence: "not met"}}}
+	if _, err := controller.RecordReviewReport(job.ID, "one", "reviewer-1", report); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.RecordReview(job.ID, "one", "reviewer-1", ReviewChangesRequested); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := reopened.Get(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := persisted.Plan.Tasks[0]
+	if got.LatestReview == nil || got.LatestReview.ReviewedCommitSHA != "commit-1" || len(got.ReviewHistory) != 1 || got.LatestReview.Findings[0] != "missing cleanup" {
+		t.Fatalf("review report was not persisted: %+v", got)
+	}
+}
+
 func TestControllerDependencyGateAndIntegrationOrder(t *testing.T) {
 	_, controller, job := plannedController(t, t.TempDir(), []Task{task("base"), task("dependent", "base")}, []string{"base", "dependent"})
 	for _, key := range []string{"base", "dependent"} {

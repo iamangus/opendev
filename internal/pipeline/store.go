@@ -85,6 +85,29 @@ type PullRequestContent struct {
 	Body  string `json:"body"`
 }
 
+// ReviewCriterion records the evidence used to evaluate one acceptance criterion.
+// It remains attached to the review that produced it so later revisions cannot
+// silently discard prior feedback.
+type ReviewCriterion struct {
+	Criterion string `json:"criterion"`
+	Satisfied bool   `json:"satisfied"`
+	Evidence  string `json:"evidence"`
+}
+
+// ReviewReport is the durable, immutable reviewer handoff for a task attempt.
+type ReviewReport struct {
+	RunID              string            `json:"run_id"`
+	WriterAttempt      int               `json:"writer_attempt"`
+	ReviewerAttempt    int               `json:"reviewer_attempt"`
+	ReviewedCommitSHA  string            `json:"reviewed_commit_sha,omitempty"`
+	Verdict            ReviewVerdict     `json:"verdict"`
+	Summary            string            `json:"summary"`
+	Findings           []string          `json:"findings,omitempty"`
+	AcceptanceCriteria []ReviewCriterion `json:"acceptance_criteria,omitempty"`
+	Reason             string            `json:"reason,omitempty"`
+	CreatedAt          time.Time         `json:"created_at"`
+}
+
 type Task struct {
 	Key                string               `json:"key"`
 	Kind               TaskKind             `json:"kind,omitempty"`
@@ -96,6 +119,7 @@ type Task struct {
 	Status             TaskStatus           `json:"status"`
 	Branch             string               `json:"branch,omitempty"`
 	WorktreePath       string               `json:"worktree_path,omitempty"`
+	BaseSHA            string               `json:"base_sha,omitempty"`
 	WriterAttempts     int                  `json:"writer_attempts"`
 	ReviewerAttempts   int                  `json:"reviewer_attempts"`
 	WriterRunID        string               `json:"writer_run_id,omitempty"`
@@ -103,6 +127,8 @@ type Task struct {
 	CommitSHA          string               `json:"commit_sha,omitempty"`
 	IntegrationSHA     string               `json:"integration_sha,omitempty"`
 	ReviewVerdict      ReviewVerdict        `json:"review_verdict"`
+	LatestReview       *ReviewReport        `json:"latest_review,omitempty"`
+	ReviewHistory      []ReviewReport       `json:"review_history,omitempty"`
 	ValidationEvidence []ValidationEvidence `json:"validation_evidence,omitempty"`
 	NoChangeReason     string               `json:"no_change_reason,omitempty"`
 	BlockReason        string               `json:"block_reason,omitempty"`

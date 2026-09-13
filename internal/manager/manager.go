@@ -212,6 +212,14 @@ func (m *Manager) HasChanges(worktreePath string) (bool, error) {
 	return strings.TrimSpace(status) != "", nil
 }
 
+func (m *Manager) HeadCommit(worktreePath string) (string, error) {
+	return m.git.HeadCommit(context.Background(), worktreePath)
+}
+
+func (m *Manager) DiffRange(worktreePath, base, target string) (string, error) {
+	return m.git.DiffRange(context.Background(), worktreePath, base, target)
+}
+
 // MergeTask merges an approved task branch and returns the integration HEAD SHA.
 func (m *Manager) MergeTask(repository, sourceBranch, targetBranch string) (string, error) {
 	if err := m.MergeBranch(repository, sourceBranch, targetBranch); err != nil {

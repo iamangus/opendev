@@ -140,6 +140,10 @@ func (e *Exec) Diff(ctx context.Context, dir string) (string, error) {
 	return e.run(ctx, dir, "git", "diff", "HEAD")
 }
 
+func (e *Exec) DiffRange(ctx context.Context, dir, base, target string) (string, error) {
+	return e.run(ctx, dir, "git", "diff", base+".."+target)
+}
+
 func (e *Exec) CommitLog(ctx context.Context, dir string, args ...string) (string, error) {
 	fullArgs := append([]string{"log"}, args...)
 	return e.run(ctx, dir, "git", fullArgs...)

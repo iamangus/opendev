@@ -28,6 +28,12 @@ type RunStore interface {
 	ListUnapplied(ctx context.Context) ([]DispatchRun, error)
 }
 
+// RunInspector is optional so existing durable stores retain the minimal
+// dispatch contract while stores that support it can power operator inspection.
+type RunInspector interface {
+	ListByJob(context.Context, string) ([]DispatchRun, error)
+}
+
 // Supersede marks a terminal dispatch as deliberately replaced by an operator retry.
 func (d *Dispatcher) Supersede(ctx context.Context, taskID, reason string) error {
 	run, err := d.store.Get(ctx, taskID)
@@ -56,6 +62,8 @@ type DispatchRun struct {
 	Response       string
 	Error          string
 	OutcomeApplied bool
+	StartedAt      time.Time
+	CompletedAt    time.Time
 }
 
 // OutcomeHandler applies a terminal run's durable response to the coding pipeline.
@@ -106,6 +114,15 @@ func New(runner Runner, store RunStore, config Config) (*Dispatcher, error) {
 
 func (d *Dispatcher) Close() { d.cancel() }
 
+// InspectJob returns the immutable dispatch records for an operator view.
+func (d *Dispatcher) InspectJob(ctx context.Context, jobID string) ([]DispatchRun, error) {
+	store, ok := d.store.(RunInspector)
+	if !ok {
+		return nil, fmt.Errorf("dispatch store does not support inspection")
+	}
+	return store.ListByJob(ctx, jobID)
+}
+
 func (d *Dispatcher) StartPlanner(ctx context.Context, job *pipeline.Job) (*DispatchRun, error) {
 	if job == nil {
 		return nil, fmt.Errorf("job is required")
@@ -149,7 +166,15 @@ func (d *Dispatcher) StartHolistic(ctx context.Context, job *pipeline.Job) (*Dis
 }
 
 func taskMessage(action string, job *pipeline.Job, task *pipeline.Task) string {
-	return fmt.Sprintf("%s task %s for coding job %s: %s. Your final structured response is authoritative; do not use a reporting or completion MCP tool.", action, task.Key, job.ID, task.Description)
+	message := fmt.Sprintf("%s task %s for coding job %s: %s. Your final structured response is authoritative; do not use a reporting or completion MCP tool.", action, task.Key, job.ID, task.Description)
+	if action == "Implement" && task.LatestReview != nil && task.LatestReview.Verdict == pipeline.ReviewChangesRequested {
+		review := task.LatestReview
+		message += fmt.Sprintf(" This is revision work for writer attempt %d. Address this immutable reviewer feedback from reviewer attempt %d on commit %s: %s", review.WriterAttempt, review.ReviewerAttempt, review.ReviewedCommitSHA, review.Summary)
+		if len(review.Findings) > 0 {
+			message += " Findings: " + strings.Join(review.Findings, " | ")
+		}
+	}
+	return message
 }
 
 func (d *Dispatcher) start(ctx context.Context, job *pipeline.Job, role, taskKey string, attempt int, agentID, message string) (*DispatchRun, error) {
@@ -173,7 +198,7 @@ func (d *Dispatcher) start(ctx context.Context, job *pipeline.Job, role, taskKey
 		}
 		return existing, nil
 	}
-	run := DispatchRun{TaskID: taskID, JobID: job.ID, Role: role, TaskKey: taskKey, Attempt: attempt, AgentID: agentID, Message: message, Status: "starting"}
+	run := DispatchRun{TaskID: taskID, JobID: job.ID, Role: role, TaskKey: taskKey, Attempt: attempt, AgentID: agentID, Message: message, Status: "starting", StartedAt: time.Now().UTC()}
 	if err := d.store.Save(ctx, run); err != nil {
 		return nil, fmt.Errorf("persist dispatch intent: %w", err)
 	}
@@ -256,6 +281,7 @@ func (d *Dispatcher) watch(run DispatchRun) {
 				run.Status = observed.Status
 				run.Response = observed.Response
 				run.Error = observed.Error
+				run.CompletedAt = time.Now().UTC()
 				if err := d.store.Save(d.ctx, run); err == nil {
 					d.logger.Info("AgentFoundry run reached terminal state", "job_id", run.JobID, "role", run.Role, "task", run.TaskKey, "run_id", run.RunID, "status", observed.Status)
 					d.apply(run)

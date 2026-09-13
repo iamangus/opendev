@@ -25,6 +25,7 @@ type GitOps interface {
 	OriginURL(ctx context.Context, dir string) (string, error)
 	CherryPick(ctx context.Context, dir, commit string) error
 	Diff(ctx context.Context, dir string) (string, error)
+	DiffRange(ctx context.Context, dir, base, target string) (string, error)
 	CommitLog(ctx context.Context, dir string, args ...string) (string, error)
 	DefaultBranch(ctx context.Context, dir string) (string, error)
 	BranchExists(ctx context.Context, dir, branch string) (bool, error)

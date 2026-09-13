@@ -22,10 +22,10 @@ func TestRoleEndpointsExposeOnlyAssignedTools(t *testing.T) {
 		want []string
 	}{
 		{RolePlanner, []string{"get_code_job"}},
-		{RoleWriter, []string{"get_code_job", "run_validation"}},
-		{RoleReviewer, []string{"get_code_job", "run_validation"}},
+		{RoleWriter, []string{"get_code_job", "get_task_diff", "run_validation"}},
+		{RoleReviewer, []string{"get_code_job", "get_task_diff", "run_validation"}},
 		{RoleHolistic, []string{"get_code_job"}},
-		{RoleAdmin, []string{"create_code_job", "fork_public_repository", "get_code_job", "lookup_repository", "provision_repository", "publish_approved_code_job", "retry_code_task", "run_validation", "start_holistic_rereview", "start_planning"}},
+		{RoleAdmin, []string{"create_code_job", "fork_public_repository", "get_code_job", "get_code_job_inspection", "get_code_task_inspection", "get_task_diff", "lookup_repository", "provision_repository", "publish_approved_code_job", "retry_code_task", "run_validation", "start_holistic_rereview", "start_planning"}},
 	} {
 		t.Run(string(tc.role), func(t *testing.T) {
 			ts := httptest.NewServer(NewRole(Config{}, tc.role))
@@ -110,6 +110,9 @@ func (f *fakeDispatcher) StartHolistic(context.Context, *pipeline.Job) (*dispatc
 	return &dispatcher.DispatchRun{RunID: "holistic"}, nil
 }
 func (*fakeDispatcher) Supersede(context.Context, string, string) error { return nil }
+func (*fakeDispatcher) InspectJob(context.Context, string) ([]dispatcher.DispatchRun, error) {
+	return nil, nil
+}
 
 type fakeWorktrees struct {
 	created    []string
@@ -125,6 +128,8 @@ func (f *fakeWorktrees) HasChanges(string) (bool, error) { return f.hasChanges, 
 func (*fakeWorktrees) MergeTask(string, string, string) (string, error) {
 	return "integration-sha", nil
 }
+func (*fakeWorktrees) HeadCommit(string) (string, error)                { return "base-sha", nil }
+func (*fakeWorktrees) DiffRange(string, string, string) (string, error) { return "diff", nil }
 
 type fakeRegistrar struct{ branches []string }
 

@@ -198,6 +198,22 @@ func applyReview(ctx context.Context, run dispatcher.DispatchRun, config Config)
 	if verdict == pipeline.ReviewChangesRequested && prior.ReviewerRunID == run.RunID && prior.Status == pipeline.TaskWorking {
 		return nil
 	}
+	report := pipeline.ReviewReport{
+		Verdict:  verdict,
+		Summary:  response.Summary,
+		Findings: append([]string(nil), response.Findings...),
+		Reason:   response.Reason,
+	}
+	for _, criterion := range response.AcceptanceCriteria {
+		report.AcceptanceCriteria = append(report.AcceptanceCriteria, pipeline.ReviewCriterion{
+			Criterion: criterion.Criterion,
+			Satisfied: criterion.Satisfied,
+			Evidence:  criterion.Evidence,
+		})
+	}
+	if _, err := config.Controller.RecordReviewReport(run.JobID, run.TaskKey, run.RunID, report); err != nil {
+		return err
+	}
 	job, err := config.Controller.RecordReview(run.JobID, run.TaskKey, run.RunID, verdict)
 	if err != nil {
 		return err
@@ -209,11 +225,49 @@ func applyReview(ctx context.Context, run dispatcher.DispatchRun, config Config)
 		return err
 	}
 	if verdict == pipeline.ReviewChangesRequested {
-		_, err := startWriter(ctx, job, findTask(job, run.TaskKey), config)
+		task := findTask(job, run.TaskKey)
+		if repeatedReviewFeedback(task) >= 3 {
+			reason := "review feedback repeated across three attempts; blocked to prevent an unproductive revision loop"
+			job, err = config.Controller.BlockTask(run.JobID, run.TaskKey, reason)
+			notify(config, job, outbox.EventBlocked+":"+run.TaskKey, "OpenDev stopped repeated review feedback", reason)
+			return err
+		}
+		_, err := startWriter(ctx, job, task, config)
 		return err
 	}
 	_, _, err = integrateEligible(job.ID, config, ctx)
 	return err
+}
+
+func repeatedReviewFeedback(task *pipeline.Task) int {
+	if task == nil || len(task.ReviewHistory) == 0 {
+		return 0
+	}
+	latest := task.ReviewHistory[len(task.ReviewHistory)-1]
+	if latest.Verdict != pipeline.ReviewChangesRequested {
+		return 0
+	}
+	count := 0
+	for i := len(task.ReviewHistory) - 1; i >= 0; i-- {
+		report := task.ReviewHistory[i]
+		if report.Verdict != pipeline.ReviewChangesRequested || report.Summary != latest.Summary || !sameStrings(report.Findings, latest.Findings) {
+			break
+		}
+		count++
+	}
+	return count
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func applyHolistic(ctx context.Context, run dispatcher.DispatchRun, config Config) error {

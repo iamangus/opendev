@@ -31,6 +31,19 @@ func (c *Controller) StartTaskWork(jobID, taskKey, branch, worktreePath, runID s
 	return c.store.startTaskWork(jobID, taskKey, branch, worktreePath, runID)
 }
 
+func (c *Controller) RecordTaskBase(jobID, taskKey, baseSHA string) (*Job, error) {
+	return c.store.updateTask(jobID, taskKey, func(_ *Job, task *Task) error {
+		if strings.TrimSpace(baseSHA) == "" {
+			return fmt.Errorf("%w: base SHA is required", ErrInvalidTransition)
+		}
+		if task.BaseSHA != "" && task.BaseSHA != baseSHA {
+			return fmt.Errorf("%w: task base SHA is immutable", ErrInvalidTransition)
+		}
+		task.BaseSHA = baseSHA
+		return nil
+	})
+}
+
 func (c *Controller) RecordWriterCompletion(jobID, taskKey, runID, commitSHA string, evidence []ValidationEvidence) (*Job, error) {
 	return c.store.recordWriterCompletion(jobID, taskKey, runID, commitSHA, evidence)
 }
@@ -41,6 +54,11 @@ func (c *Controller) RecordNoChanges(jobID, taskKey, runID, reason string, evide
 
 func (c *Controller) RecordReview(jobID, taskKey, runID string, verdict ReviewVerdict) (*Job, error) {
 	return c.store.recordReview(jobID, taskKey, runID, verdict)
+}
+
+// RecordReviewReport saves the complete reviewer decision before advancing the task.
+func (c *Controller) RecordReviewReport(jobID, taskKey, runID string, report ReviewReport) (*Job, error) {
+	return c.store.recordReviewReport(jobID, taskKey, runID, report)
 }
 
 // StartReviewer records the exact reviewer run before it can submit a verdict.
@@ -198,6 +216,35 @@ func (s *Store) recordReview(jobID, taskKey, runID string, verdict ReviewVerdict
 			task.Status = TaskChangesRequested
 		case ReviewBlocked:
 			task.Status = TaskBlocked
+		}
+		return nil
+	})
+}
+
+func (s *Store) recordReviewReport(jobID, taskKey, runID string, report ReviewReport) (*Job, error) {
+	if strings.TrimSpace(runID) == "" || report.Verdict != ReviewApproved && report.Verdict != ReviewChangesRequested && report.Verdict != ReviewBlocked {
+		return nil, fmt.Errorf("%w: valid reviewer run ID and verdict are required", ErrInvalidTransition)
+	}
+	return s.updateTask(jobID, taskKey, func(job *Job, task *Task) error {
+		// The report is recorded before transition validation so rejected outcomes
+		// remain inspectable rather than surviving only in a dispatch log.
+		if task.Status == TaskReviewing && task.ReviewerRunID != runID && task.ReviewerAttempts < task.WriterAttempts {
+			task.ReviewerRunID = runID
+			task.ReviewerAttempts++
+		}
+		report.RunID = runID
+		report.WriterAttempt = task.WriterAttempts
+		report.ReviewerAttempt = task.ReviewerAttempts
+		report.ReviewedCommitSHA = task.CommitSHA
+		report.CreatedAt = time.Now().UTC()
+		if task.ReviewerRunID == runID {
+			for _, existing := range task.ReviewHistory {
+				if existing.RunID == runID {
+					return nil
+				}
+			}
+			task.LatestReview = &report
+			task.ReviewHistory = append(task.ReviewHistory, report)
 		}
 		return nil
 	})

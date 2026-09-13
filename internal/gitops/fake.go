@@ -123,6 +123,10 @@ func (f *Fake) Diff(_ context.Context, dir string) (string, error) {
 	return f.str("Diff"), f.err("Diff")
 }
 
+func (f *Fake) DiffRange(_ context.Context, dir, base, target string) (string, error) {
+	return f.Diff(context.Background(), dir)
+}
+
 func (f *Fake) CommitLog(_ context.Context, dir string, args ...string) (string, error) {
 	allArgs := append([]string{dir}, args...)
 	f.record("CommitLog", allArgs...)

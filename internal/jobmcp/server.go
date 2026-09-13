@@ -26,6 +26,7 @@ type Dispatcher interface {
 	StartReviewer(context.Context, *pipeline.Job, *pipeline.Task) (*dispatcher.DispatchRun, error)
 	StartHolistic(context.Context, *pipeline.Job) (*dispatcher.DispatchRun, error)
 	Supersede(context.Context, string, string) error
+	InspectJob(context.Context, string) ([]dispatcher.DispatchRun, error)
 }
 
 type Worktrees interface {
@@ -33,6 +34,8 @@ type Worktrees interface {
 	Commit(worktreePath string) (string, error)
 	HasChanges(worktreePath string) (bool, error)
 	MergeTask(repository, sourceBranch, targetBranch string) (string, error)
+	HeadCommit(worktreePath string) (string, error)
+	DiffRange(worktreePath, base, target string) (string, error)
 }
 
 // Registrar is deliberately narrow so job orchestration cannot alter HTTP routing.
@@ -99,6 +102,47 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 		return false
 	}
 	if allowed() {
+		s.AddTool(mcp.NewTool("get_code_task_inspection",
+			mcp.WithDescription("Return the complete durable audit trail for one task, including review feedback and its AgentFoundry dispatch attempts. Read-only."),
+			mcp.WithString("job_id", mcp.Required()),
+			mcp.WithString("task_key", mcp.Required()),
+		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			job, task, err := jobTask(config.Store, req)
+			if err != nil {
+				return toolError(err), nil
+			}
+			runs, err := config.Dispatcher.InspectJob(ctx, job.ID)
+			if err != nil {
+				return toolError(err), nil
+			}
+			taskRuns := make([]dispatcher.DispatchRun, 0)
+			for _, run := range runs {
+				if run.TaskKey == task.Key {
+					taskRuns = append(taskRuns, run)
+				}
+			}
+			return toolJSON(map[string]any{"job_id": job.ID, "repository": job.Repository, "task": task, "dispatch_runs": taskRuns}), nil
+		})
+
+		s.AddTool(mcp.NewTool("get_code_job_inspection",
+			mcp.WithDescription("Return the durable controller, review, and AgentFoundry dispatch audit trail for a coding job. This is read-only and includes raw terminal agent responses."),
+			mcp.WithString("job_id", mcp.Required()),
+		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			jobID, err := req.RequireString("job_id")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			job, err := config.Store.Get(jobID)
+			if err != nil {
+				return toolError(err), nil
+			}
+			runs, err := config.Dispatcher.InspectJob(ctx, jobID)
+			if err != nil {
+				return toolError(err), nil
+			}
+			return toolJSON(map[string]any{"job": job, "dispatch_runs": runs}), nil
+		})
+
 		s.AddTool(mcp.NewTool("retry_code_task",
 			mcp.WithDescription("Retry a Writer task whose terminal result could not be applied. The rejected result is retained as superseded history."),
 			mcp.WithString("job_id", mcp.Required()),
@@ -106,21 +150,39 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 			mcp.WithString("reason", mcp.Required()),
 		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			jobID, err := req.RequireString("job_id")
-			if err != nil { return mcp.NewToolResultError(err.Error()), nil }
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
 			taskKey, err := req.RequireString("task_key")
-			if err != nil { return mcp.NewToolResultError(err.Error()), nil }
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
 			reason, err := req.RequireString("reason")
-			if err != nil { return mcp.NewToolResultError(err.Error()), nil }
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
 			job, err := config.Store.Get(jobID)
-			if err != nil { return toolError(err), nil }
+			if err != nil {
+				return toolError(err), nil
+			}
 			task := findTask(job, taskKey)
-			if task == nil { return mcp.NewToolResultError("task not found"), nil }
-			if task.Status != pipeline.TaskWorking || task.WriterRunID == "" { return mcp.NewToolResultError("only an unapplied Writer task can be retried"), nil }
-			if err := config.Dispatcher.Supersede(ctx, dispatcher.TaskID(job.ID, dispatcher.RoleWriter, task.Key, task.WriterAttempts), reason); err != nil { return toolError(err), nil }
+			if task == nil {
+				return mcp.NewToolResultError("task not found"), nil
+			}
+			if task.Status != pipeline.TaskWorking || task.WriterRunID == "" {
+				return mcp.NewToolResultError("only an unapplied Writer task can be retried"), nil
+			}
+			if err := config.Dispatcher.Supersede(ctx, dispatcher.TaskID(job.ID, dispatcher.RoleWriter, task.Key, task.WriterAttempts), reason); err != nil {
+				return toolError(err), nil
+			}
 			job, err = config.Controller.RetryWriter(job.ID, task.Key, task.WriterRunID)
-			if err != nil { return toolError(err), nil }
+			if err != nil {
+				return toolError(err), nil
+			}
 			run, err := startWriter(ctx, job, findTask(job, taskKey), config)
-			if err != nil { return toolError(err), nil }
+			if err != nil {
+				return toolError(err), nil
+			}
 			return toolJSON(map[string]any{"job_id": job.ID, "task_key": taskKey, "run_id": run.RunID}), nil
 		})
 		s.AddTool(mcp.NewTool("lookup_repository",
@@ -233,6 +295,21 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 	}
 
 	if allowed(RoleWriter, RoleReviewer) {
+		s.AddTool(mcp.NewTool("get_task_diff", mcp.WithDescription("Return the authoritative committed diff for this task from its recorded base SHA to its candidate commit. Use this for task review; get_git_diff only shows uncommitted workspace changes."), mcp.WithString("job_id", mcp.Required()), mcp.WithString("task_key", mcp.Required())), func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			_, task, err := jobTask(config.Store, req)
+			if err != nil {
+				return toolError(err), nil
+			}
+			if task.BaseSHA == "" || task.CommitSHA == "" {
+				return mcp.NewToolResultError("task has no committed candidate diff yet"), nil
+			}
+			diff, err := config.Worktrees.DiffRange(task.WorktreePath, task.BaseSHA, task.CommitSHA)
+			if err != nil {
+				return toolError(err), nil
+			}
+			return toolJSON(map[string]any{"base_sha": task.BaseSHA, "commit_sha": task.CommitSHA, "diff": diff}), nil
+		})
+
 		s.AddTool(mcp.NewTool("run_validation",
 			mcp.WithDescription("Run one named validation declared in this task's repository .opendev/validations.yml. Arbitrary commands are not allowed."),
 			mcp.WithString("job_id", mcp.Required()),
@@ -483,6 +560,17 @@ func startWriter(ctx context.Context, job *pipeline.Job, task *pipeline.Task, co
 	dir, err := config.Worktrees.CreateWorktree(job.Repository, branch, job.IntegrationBranch)
 	if err != nil {
 		return nil, fmt.Errorf("create task worktree %q: %w", task.Key, err)
+	}
+	if task.BaseSHA == "" {
+		baseSHA, err := config.Worktrees.HeadCommit(dir)
+		if err != nil {
+			return nil, fmt.Errorf("record task base SHA: %w", err)
+		}
+		job, err = config.Controller.RecordTaskBase(job.ID, task.Key, baseSHA)
+		if err != nil {
+			return nil, err
+		}
+		task = findTask(job, task.Key)
 	}
 	config.Registrar.RegisterWorktree(job.Repository, branch, dir)
 	// Dispatch needs the route before StartTaskWork durably records it.

@@ -506,6 +506,14 @@ func (d *lazyDispatcher) Supersede(ctx context.Context, taskID, reason string) e
 	return inner.Supersede(ctx, taskID, reason)
 }
 
+func (d *lazyDispatcher) InspectJob(ctx context.Context, jobID string) ([]dispatcher.DispatchRun, error) {
+	inner, err := d.get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return inner.InspectJob(ctx, jobID)
+}
+
 func (d *lazyDispatcher) get(ctx context.Context) (*dispatcher.Dispatcher, error) {
 	d.mu.Lock()
 	if d.dispatcher != nil {

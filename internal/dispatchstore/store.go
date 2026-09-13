@@ -71,6 +71,20 @@ func (s *Store) ListUnapplied(_ context.Context) ([]dispatcher.DispatchRun, erro
 	return runs, nil
 }
 
+// ListByJob returns every attempt, including applied and superseded results.
+func (s *Store) ListByJob(_ context.Context, jobID string) ([]dispatcher.DispatchRun, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	runs := make([]dispatcher.DispatchRun, 0)
+	for _, run := range s.runs {
+		if run.JobID == jobID {
+			runs = append(runs, run)
+		}
+	}
+	sort.Slice(runs, func(i, j int) bool { return runs[i].TaskID < runs[j].TaskID })
+	return runs, nil
+}
+
 func (s *Store) load() error {
 	data, err := os.ReadFile(s.path)
 	if os.IsNotExist(err) {
