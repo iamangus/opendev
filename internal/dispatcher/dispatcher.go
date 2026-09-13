@@ -3,6 +3,7 @@ package dispatcher
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -58,6 +59,7 @@ type DispatchRun struct {
 	AgentID        string
 	Message        string
 	RunID          string
+	WorkflowID     string
 	Status         string
 	Response       string
 	Error          string
@@ -74,6 +76,17 @@ type Runner interface {
 	StartRun(context.Context, string, agentfoundry.RunOptions) (string, error)
 	GetRun(context.Context, string) (*agentfoundry.Run, error)
 	GetRunByTaskID(context.Context, string) (*agentfoundry.Run, error)
+}
+
+// DetailedRunner is implemented by AgentFoundry clients that expose the
+// durable Temporal workflow identity at submission time.
+type DetailedRunner interface {
+	StartRunDetail(context.Context, string, agentfoundry.RunOptions) (*agentfoundry.Run, error)
+}
+
+// TraceRunner returns a durable normalized Temporal trace for a workflow.
+type TraceRunner interface {
+	GetExecutionTrace(context.Context, string) (json.RawMessage, error)
 }
 
 type Config struct {
@@ -121,6 +134,20 @@ func (d *Dispatcher) InspectJob(ctx context.Context, jobID string) ([]DispatchRu
 		return nil, fmt.Errorf("dispatch store does not support inspection")
 	}
 	return store.ListByJob(ctx, jobID)
+}
+
+// ExecutionTrace resolves the durable per-turn AgentFoundry trace recorded for
+// a dispatch. Legacy records without workflow identity remain inspectable but
+// cannot be traced.
+func (d *Dispatcher) ExecutionTrace(ctx context.Context, run DispatchRun) (json.RawMessage, error) {
+	if run.WorkflowID == "" {
+		return nil, fmt.Errorf("dispatch run %q has no workflow ID", run.TaskID)
+	}
+	tracer, ok := d.runner.(TraceRunner)
+	if !ok {
+		return nil, fmt.Errorf("AgentFoundry runner does not support execution traces")
+	}
+	return tracer.GetExecutionTrace(ctx, run.WorkflowID)
 }
 
 func (d *Dispatcher) StartPlanner(ctx context.Context, job *pipeline.Job) (*DispatchRun, error) {
@@ -236,7 +263,7 @@ func (d *Dispatcher) launch(ctx context.Context, run *DispatchRun) error {
 	if recovered, err := d.runner.GetRunByTaskID(ctx, run.TaskID); err != nil {
 		return fmt.Errorf("find existing %s run: %w", run.Role, err)
 	} else if recovered != nil {
-		run.RunID, run.Status, run.Response, run.Error = recovered.ID, recovered.Status, recovered.Response, recovered.Error
+		run.RunID, run.WorkflowID, run.Status, run.Response, run.Error = recovered.ID, recovered.WorkflowID, recovered.Status, recovered.Response, recovered.Error
 		if err := d.store.Save(ctx, *run); err != nil {
 			return fmt.Errorf("persist recovered AgentFoundry run: %w", err)
 		}
@@ -247,11 +274,20 @@ func (d *Dispatcher) launch(ctx context.Context, run *DispatchRun) error {
 		}
 		return nil
 	}
-	runID, err := d.runner.StartRun(ctx, run.AgentID, agentfoundry.RunOptions{Message: run.Message, TaskID: run.TaskID, MCPServers: d.mcpServers})
-	if err != nil {
-		return fmt.Errorf("start %s run: %w", run.Role, err)
+	options := agentfoundry.RunOptions{Message: run.Message, TaskID: run.TaskID, MCPServers: d.mcpServers}
+	if detailed, ok := d.runner.(DetailedRunner); ok {
+		started, err := detailed.StartRunDetail(ctx, run.AgentID, options)
+		if err != nil {
+			return fmt.Errorf("start %s run: %w", run.Role, err)
+		}
+		run.RunID, run.WorkflowID, run.Status = started.ID, started.WorkflowID, "running"
+	} else {
+		runID, err := d.runner.StartRun(ctx, run.AgentID, options)
+		if err != nil {
+			return fmt.Errorf("start %s run: %w", run.Role, err)
+		}
+		run.RunID, run.Status = runID, "running"
 	}
-	run.RunID, run.Status = runID, "running"
 	if err := d.store.Save(ctx, *run); err != nil {
 		return fmt.Errorf("persist AgentFoundry run ID: %w", err)
 	}

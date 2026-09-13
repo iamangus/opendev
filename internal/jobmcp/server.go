@@ -29,6 +29,10 @@ type Dispatcher interface {
 	InspectJob(context.Context, string) ([]dispatcher.DispatchRun, error)
 }
 
+type executionTracer interface {
+	ExecutionTrace(context.Context, dispatcher.DispatchRun) (json.RawMessage, error)
+}
+
 type Worktrees interface {
 	CreateWorktree(repository, branch, base string) (string, error)
 	Commit(worktreePath string) (string, error)
@@ -106,6 +110,7 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 			mcp.WithDescription("Return the complete durable audit trail for one task, including review feedback and its AgentFoundry dispatch attempts. Read-only."),
 			mcp.WithString("job_id", mcp.Required()),
 			mcp.WithString("task_key", mcp.Required()),
+			mcp.WithBoolean("include_execution_trace", mcp.Description("Include normalized per-turn AgentFoundry model, tool, schema, and terminal events.")),
 		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			job, task, err := jobTask(config.Store, req)
 			if err != nil {
@@ -121,12 +126,31 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 					taskRuns = append(taskRuns, run)
 				}
 			}
-			return toolJSON(map[string]any{"job_id": job.ID, "repository": job.Repository, "task": task, "dispatch_runs": taskRuns}), nil
+			result := map[string]any{"job_id": job.ID, "repository": job.Repository, "task": task, "dispatch_runs": taskRuns}
+			if req.GetBool("include_execution_trace", false) {
+				traces := make(map[string]any, len(taskRuns))
+				tracer, ok := config.Dispatcher.(executionTracer)
+				for _, run := range taskRuns {
+					if !ok {
+						traces[run.TaskID] = map[string]string{"error": "execution tracing is unavailable"}
+						continue
+					}
+					trace, traceErr := tracer.ExecutionTrace(ctx, run)
+					if traceErr != nil {
+						traces[run.TaskID] = map[string]string{"error": traceErr.Error()}
+						continue
+					}
+					traces[run.TaskID] = trace
+				}
+				result["execution_traces"] = traces
+			}
+			return toolJSON(result), nil
 		})
 
 		s.AddTool(mcp.NewTool("get_code_job_inspection",
 			mcp.WithDescription("Return the durable controller, review, and AgentFoundry dispatch audit trail for a coding job. This is read-only and includes raw terminal agent responses."),
 			mcp.WithString("job_id", mcp.Required()),
+			mcp.WithBoolean("include_execution_trace", mcp.Description("Include normalized per-turn AgentFoundry model, tool, schema, and terminal events.")),
 		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			jobID, err := req.RequireString("job_id")
 			if err != nil {
@@ -140,7 +164,25 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 			if err != nil {
 				return toolError(err), nil
 			}
-			return toolJSON(map[string]any{"job": job, "dispatch_runs": runs}), nil
+			result := map[string]any{"job": job, "dispatch_runs": runs}
+			if req.GetBool("include_execution_trace", false) {
+				traces := make(map[string]any, len(runs))
+				tracer, ok := config.Dispatcher.(executionTracer)
+				for _, run := range runs {
+					if !ok {
+						traces[run.TaskID] = map[string]string{"error": "execution tracing is unavailable"}
+						continue
+					}
+					trace, traceErr := tracer.ExecutionTrace(ctx, run)
+					if traceErr != nil {
+						traces[run.TaskID] = map[string]string{"error": traceErr.Error()}
+						continue
+					}
+					traces[run.TaskID] = trace
+				}
+				result["execution_traces"] = traces
+			}
+			return toolJSON(result), nil
 		})
 
 		s.AddTool(mcp.NewTool("retry_code_task",

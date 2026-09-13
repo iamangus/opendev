@@ -3,6 +3,7 @@ package tools
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,6 +23,17 @@ const MaxFileSize = 1 << 20 // 1 MiB
 // after whitespace normalisation. Below this threshold the match is too
 // ambiguous to apply safely, and the closest snippet is returned to the agent.
 const fuzzyMatchThreshold = 0.85
+
+func revision(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return fmt.Sprintf("sha256:%x", sum)
+}
+
+// WithRevision formats content with the token required by mutation tools. The
+// token prevents edits against a stale view after an earlier replacement.
+func WithRevision(content string) string {
+	return fmt.Sprintf("Revision: %s\n\n%s", revision(content), content)
+}
 
 var ignoreDirs = map[string]bool{
 	".git": true, "node_modules": true, "build": true, "dist": true,
@@ -257,7 +269,7 @@ func GrepSearch(ctx context.Context, worktreeRoot, query, directory string, lm *
 
 // SearchAndReplace finds a block of text in a file and replaces it.
 // It first tries an exact match, then falls back to fuzzy matching.
-func SearchAndReplace(ctx context.Context, worktreeRoot, filePath, searchBlock, replaceBlock string, lm *locks.Manager) (string, error) {
+func SearchAndReplace(ctx context.Context, worktreeRoot, filePath, searchBlock, replaceBlock, expectedRevision string, lm *locks.Manager) (string, error) {
 	abs, err := worktree.Resolve(worktreeRoot, filePath)
 	if err != nil {
 		return "", err
@@ -272,6 +284,9 @@ func SearchAndReplace(ctx context.Context, worktreeRoot, filePath, searchBlock, 
 		return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: cannot read file: %v", err)}
 	}
 	content := string(data)
+	if expectedRevision != revision(content) {
+		return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: stale revision for %s. Read the file again before editing. Current revision: %s", filePath, revision(content))}
+	}
 
 	// Exact match
 	count := strings.Count(content, searchBlock)
@@ -284,7 +299,7 @@ func SearchAndReplace(ctx context.Context, worktreeRoot, filePath, searchBlock, 
 			return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: cannot write file: %v", err)}
 		}
 		idx := strings.Index(newContent, replaceBlock)
-		return buildContext(newContent, idx, replaceBlock, abs), nil
+		return fmt.Sprintf("New revision: %s\n%s", revision(newContent), buildContext(newContent, idx, replaceBlock, abs)), nil
 	}
 
 	// Fuzzy match: normalize whitespace and compare line-by-line windows
@@ -327,7 +342,7 @@ func SearchAndReplace(ctx context.Context, worktreeRoot, filePath, searchBlock, 
 			return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: cannot write file: %v", err)}
 		}
 		idx := strings.Index(newContent, replaceBlock)
-		return buildContext(newContent, idx, replaceBlock, abs), nil
+		return fmt.Sprintf("New revision: %s\n%s", revision(newContent), buildContext(newContent, idx, replaceBlock, abs)), nil
 	}
 
 	snippet := ""

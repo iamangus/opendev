@@ -29,7 +29,7 @@ func registerReadTools(s *server.MCPServer, lm *locks.Manager, worktreeRoot stri
 	// read_file
 	s.AddTool(
 		mcp.NewTool("read_file",
-			mcp.WithDescription("Read the entire contents of a file within the worktree."),
+			mcp.WithDescription("Read the entire contents of a file within the worktree. Returns a revision token required for search_and_replace."),
 			mcp.WithString("filepath", mcp.Required(), mcp.Description("Path to the file, relative to the worktree root.")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -45,7 +45,7 @@ func registerReadTools(s *server.MCPServer, lm *locks.Manager, worktreeRoot stri
 				return mcp.NewToolResultError(toolErr.Error()), nil
 			}
 			logger.Info("tool call completed", "tool", "read_file", "filepath", fp, "duration_ms", time.Since(start).Milliseconds())
-			return mcp.NewToolResultText(content), nil
+			return mcp.NewToolResultText(tools.WithRevision(content)), nil
 		},
 	)
 
@@ -163,10 +163,11 @@ func registerWriteTools(s *server.MCPServer, lm *locks.Manager, worktreeRoot str
 	// search_and_replace
 	s.AddTool(
 		mcp.NewTool("search_and_replace",
-			mcp.WithDescription("Find a block of text in a file and replace it. Uses exact match, then fuzzy match."),
+			mcp.WithDescription("Replace text in a file using the revision returned by read_file. You must read the file again after every successful edit before editing it again."),
 			mcp.WithString("filepath", mcp.Required(), mcp.Description("Path to the file, relative to the worktree root.")),
 			mcp.WithString("search_block", mcp.Required(), mcp.Description("The exact block of text to find.")),
 			mcp.WithString("replace_block", mcp.Required(), mcp.Description("The text to replace the search_block with.")),
+			mcp.WithString("expected_revision", mcp.Required(), mcp.Description("Revision token from the latest read_file result for this file.")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			start := time.Now()
@@ -185,7 +186,12 @@ func registerWriteTools(s *server.MCPServer, lm *locks.Manager, worktreeRoot str
 				logger.Error("tool call failed", "tool", "search_and_replace", "filepath", fp, "error", err, "duration_ms", time.Since(start).Milliseconds())
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-			result, toolErr := tools.SearchAndReplace(ctx, worktreeRoot, fp, searchBlock, replaceBlock, lm)
+			expectedRevision, err := req.RequireString("expected_revision")
+			if err != nil {
+				logger.Error("tool call failed", "tool", "search_and_replace", "filepath", fp, "error", err, "duration_ms", time.Since(start).Milliseconds())
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			result, toolErr := tools.SearchAndReplace(ctx, worktreeRoot, fp, searchBlock, replaceBlock, expectedRevision, lm)
 			if toolErr != nil {
 				logger.Error("tool call failed", "tool", "search_and_replace", "filepath", fp, "error", toolErr, "duration_ms", time.Since(start).Milliseconds())
 				return mcp.NewToolResultError(toolErr.Error()), nil

@@ -30,14 +30,16 @@ type RunOptions struct {
 
 // Run is the observable state returned by AgentFoundry.
 type Run struct {
-	ID       string `json:"id"`
-	Status   string `json:"status"`
-	Response string `json:"response,omitempty"`
-	Error    string `json:"error,omitempty"`
+	ID         string `json:"id"`
+	Status     string `json:"status"`
+	Response   string `json:"response,omitempty"`
+	Error      string `json:"error,omitempty"`
+	WorkflowID string `json:"workflow_id,omitempty"`
 }
 
 type runResponse struct {
-	RunID string `json:"run_id"`
+	RunID      string `json:"run_id"`
+	WorkflowID string `json:"workflow_id,omitempty"`
 }
 
 // Client calls AgentFoundry's run API. It never logs requests or headers.
@@ -69,21 +71,31 @@ func NewClientWithHTTPClient(baseURL, apiKey string, httpClient *http.Client) (*
 // StartRun starts an asynchronous agent run. The caller owns retry safety and
 // can use GetRunByTaskID to recover an accepted submission after a restart.
 func (c *Client) StartRun(ctx context.Context, agentID string, options RunOptions) (string, error) {
+	run, err := c.StartRunDetail(ctx, agentID, options)
+	if err != nil {
+		return "", err
+	}
+	return run.ID, nil
+}
+
+// StartRunDetail starts a run and returns its stable Temporal workflow identity
+// for durable cross-service inspection.
+func (c *Client) StartRunDetail(ctx context.Context, agentID string, options RunOptions) (*Run, error) {
 	if strings.TrimSpace(agentID) == "" || strings.TrimSpace(options.Message) == "" {
-		return "", fmt.Errorf("agent ID and message are required")
+		return nil, fmt.Errorf("agent ID and message are required")
 	}
 	data, err := json.Marshal(options)
 	if err != nil {
-		return "", fmt.Errorf("encode AgentFoundry run request: %w", err)
+		return nil, fmt.Errorf("encode AgentFoundry run request: %w", err)
 	}
 	var response runResponse
 	if err := c.doJSON(ctx, http.MethodPost, "/api/v1/agents/"+url.PathEscape(agentID)+"/run", bytes.NewReader(data), &response); err != nil {
-		return "", err
+		return nil, err
 	}
 	if response.RunID == "" {
-		return "", fmt.Errorf("AgentFoundry run response omitted run_id")
+		return nil, fmt.Errorf("AgentFoundry run response omitted run_id")
 	}
-	return response.RunID, nil
+	return &Run{ID: response.RunID, WorkflowID: response.WorkflowID}, nil
 }
 
 // GetRun returns the latest state for a run.
@@ -140,6 +152,19 @@ func (c *Client) CancelRun(ctx context.Context, runID string) error {
 		return fmt.Errorf("run ID is required")
 	}
 	return c.doJSON(ctx, http.MethodPost, "/api/v1/runs/"+url.PathEscape(runID)+"/cancel", nil, nil)
+}
+
+// GetExecutionTrace returns the durable normalized Temporal trace for a
+// completed or active workflow. Unlike run status, it survives run cleanup.
+func (c *Client) GetExecutionTrace(ctx context.Context, workflowID string) (json.RawMessage, error) {
+	if strings.TrimSpace(workflowID) == "" {
+		return nil, fmt.Errorf("workflow ID is required")
+	}
+	var trace json.RawMessage
+	if err := c.doJSON(ctx, http.MethodGet, "/api/v1/executions/"+url.PathEscape(workflowID)+"/trace", nil, &trace); err != nil {
+		return nil, err
+	}
+	return trace, nil
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, body io.Reader, output any) error {

@@ -262,7 +262,7 @@ func TestSearchAndReplace_UniqueMatch(t *testing.T) {
 	original := "hello world\nfoo bar\ngoodbye"
 	os.WriteFile(filepath.Join(dir, "file.txt"), []byte(original), 0644)
 
-	out, err := SearchAndReplace(bgCtx, dir, "file.txt", "foo bar", "replaced", newLM())
+	out, err := SearchAndReplace(bgCtx, dir, "file.txt", "foo bar", "replaced", revision(original), newLM())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestSearchAndReplace_MultipleMatches(t *testing.T) {
 	original := "foo\nfoo\nbar"
 	os.WriteFile(filepath.Join(dir, "file.txt"), []byte(original), 0644)
 
-	_, err := SearchAndReplace(bgCtx, dir, "file.txt", "foo", "baz", newLM())
+	_, err := SearchAndReplace(bgCtx, dir, "file.txt", "foo", "baz", revision(original), newLM())
 	if err == nil {
 		t.Fatal("expected error for multiple matches, got nil")
 	}
@@ -308,7 +308,7 @@ func TestSearchAndReplace_FuzzyMatch(t *testing.T) {
 	searchBlock := "func hello() {\n    return nil\n}"
 	replaceBlock := "func hello() {\n    return \"world\"\n}"
 
-	out, err := SearchAndReplace(bgCtx, dir, "file.go", searchBlock, replaceBlock, newLM())
+	out, err := SearchAndReplace(bgCtx, dir, "file.go", searchBlock, replaceBlock, revision(original), newLM())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -323,7 +323,7 @@ func TestSearchAndReplace_NoMatchBelowThreshold(t *testing.T) {
 	original := "completely different content here"
 	os.WriteFile(filepath.Join(dir, "file.txt"), []byte(original), 0644)
 
-	_, err := SearchAndReplace(bgCtx, dir, "file.txt", "totally unrelated search block that won't match", "replacement", newLM())
+	_, err := SearchAndReplace(bgCtx, dir, "file.txt", "totally unrelated search block that won't match", "replacement", revision(original), newLM())
 	if err == nil {
 		t.Fatal("expected error for no match, got nil")
 	}
@@ -333,5 +333,14 @@ func TestSearchAndReplace_NoMatchBelowThreshold(t *testing.T) {
 	}
 	if !strings.Contains(te.Message, "not found") {
 		t.Errorf("unexpected message: %s", te.Message)
+	}
+}
+
+func TestSearchAndReplace_RejectsStaleRevision(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "file.txt"), []byte("old"), 0644)
+	_, err := SearchAndReplace(bgCtx, dir, "file.txt", "old", "new", "sha256:stale", newLM())
+	if err == nil || !strings.Contains(err.Error(), "stale revision") {
+		t.Fatalf("expected stale revision error, got %v", err)
 	}
 }
