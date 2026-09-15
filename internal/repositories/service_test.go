@@ -25,6 +25,10 @@ func (m *fakeManager) SyncRepo(url, name string, _ ...string) error {
 
 func (m *fakeManager) RepoDir(name string) string { return filepath.Join(m.root, name) }
 
+func (m *fakeManager) CreateFoundationBranch(_, _, _ string) (string, string, error) {
+	return filepath.Join(m.root, "foundation"), "foundation-sha", m.err
+}
+
 type fakeMetadataReader struct{ metadata repositorycatalog.GitMetadata }
 
 func (r fakeMetadataReader) ReadGitMetadata(context.Context, string) (repositorycatalog.GitMetadata, error) {

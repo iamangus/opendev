@@ -25,6 +25,8 @@ const (
 	JobWorking           JobStatus = "working"
 	JobReviewing         JobStatus = "reviewing"
 	JobIntegrating       JobStatus = "integrating"
+	JobAwaitingCI        JobStatus = "awaiting_ci"
+	JobCIRemediating     JobStatus = "ci_remediating"
 	JobHolisticReviewing JobStatus = "holistic_reviewing"
 	JobReadyToPublish    JobStatus = "ready_to_publish"
 	JobPublished         JobStatus = "published"
@@ -39,6 +41,7 @@ type TaskKind string
 const (
 	TaskImplementation TaskKind = "implementation"
 	TaskValidation     TaskKind = "validation"
+	TaskRemediation    TaskKind = "ci_remediation"
 )
 
 const (
@@ -70,6 +73,35 @@ const (
 	MergeOpen         MergeState = "open"
 	MergeMerged       MergeState = "merged"
 )
+
+type CIState string
+
+const (
+	CIPending CIState = "pending"
+	CIPassed  CIState = "passed"
+	CIFailed  CIState = "failed"
+	CIBlocked CIState = "blocked"
+)
+
+// CheckResult captures the GitHub Action evidence for one exact PR head SHA.
+type CheckResult struct {
+	Name       string `json:"name"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion,omitempty"`
+	DetailsURL string `json:"details_url,omitempty"`
+	Summary    string `json:"summary,omitempty"`
+}
+
+// CIRecord binds required GitHub checks to an immutable PR head. Results for a
+// different SHA are ignored by the controller.
+type CIRecord struct {
+	HeadSHA            string        `json:"head_sha"`
+	RequiredChecks     []string      `json:"required_checks"`
+	State              CIState       `json:"state"`
+	Checks             []CheckResult `json:"checks,omitempty"`
+	FailureFingerprint string        `json:"failure_fingerprint,omitempty"`
+	UpdatedAt          time.Time     `json:"updated_at"`
+}
 
 // ValidationEvidence is an immutable record of validation reported for a task.
 type ValidationEvidence struct {
@@ -181,6 +213,9 @@ type Job struct {
 	PullRequestNumber     int                 `json:"pull_request_number,omitempty"`
 	PullRequestTitle      string              `json:"pull_request_title,omitempty"`
 	PullRequestBody       string              `json:"pull_request_body,omitempty"`
+	CI                    *CIRecord           `json:"ci,omitempty"`
+	CIFailureFingerprints []string            `json:"ci_failure_fingerprints,omitempty"`
+	FoundationPending     bool                `json:"foundation_pending,omitempty"`
 	MergeState            MergeState          `json:"merge_state"`
 	Failure               string              `json:"failure,omitempty"`
 	CreatedAt             time.Time           `json:"created_at"`
@@ -217,6 +252,109 @@ func (s *Store) FailJob(jobID, reason string) (*Job, error) {
 	}
 	job.Status, job.Failure = JobFailed, reason
 	return s.saveAndCloneLocked(job)
+}
+
+func (s *Store) startCI(jobID, sha string, required []string) (*Job, error) {
+	if strings.TrimSpace(sha) == "" || len(required) == 0 {
+		return nil, fmt.Errorf("%w: CI SHA and required checks are required", ErrInvalidTransition)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[jobID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if job.CI != nil && job.CI.HeadSHA == sha && job.Status == JobAwaitingCI {
+		return cloneJob(job), nil
+	}
+	if job.Status != JobHolisticReviewing && job.Status != JobAwaitingCI {
+		return nil, transition(job.Status, "start CI")
+	}
+	job.Status = JobAwaitingCI
+	job.CI = &CIRecord{HeadSHA: sha, RequiredChecks: append([]string(nil), required...), State: CIPending, UpdatedAt: time.Now().UTC()}
+	return s.saveAndCloneLocked(job)
+}
+
+func (s *Store) recordCI(jobID, sha string, state CIState, checks []CheckResult, fingerprint string) (*Job, error) {
+	if state != CIPending && state != CIPassed && state != CIFailed && state != CIBlocked {
+		return nil, fmt.Errorf("%w: invalid CI state %q", ErrInvalidTransition, state)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[jobID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if job.CI == nil || job.CI.HeadSHA != sha {
+		return cloneJob(job), nil
+	}
+	job.CI.State = state
+	job.CI.Checks = append([]CheckResult(nil), checks...)
+	job.CI.FailureFingerprint = fingerprint
+	job.CI.UpdatedAt = time.Now().UTC()
+	if state == CIPassed {
+		job.Status = JobHolisticReviewing
+	} else if state == CIBlocked {
+		job.Status = JobFailed
+		job.Failure = "required GitHub Actions checks could not run"
+	} else if state == CIFailed && fingerprint != "" {
+		job.CIFailureFingerprints = append(job.CIFailureFingerprints, fingerprint)
+	}
+	return s.saveAndCloneLocked(job)
+}
+
+// startCIRemediation creates a narrowly scoped Writer/Reviewer task directly
+// on the integration branch for the current failed PR head.
+func (s *Store) startCIRemediation(jobID, fingerprint string, checks []CheckResult) (*Job, *Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[jobID]
+	if !ok {
+		return nil, nil, ErrNotFound
+	}
+	if job.Status != JobAwaitingCI || job.CI == nil || job.CI.State != CIFailed || job.CI.FailureFingerprint != fingerprint {
+		return nil, nil, transition(job.Status, "start CI remediation")
+	}
+	identical := 0
+	for _, prior := range job.CIFailureFingerprints {
+		if prior == fingerprint {
+			identical++
+		}
+	}
+	if identical >= 3 {
+		job.Status = JobFailed
+		job.Failure = "required CI returned the same failure three times; remediation stopped"
+		updated, err := s.saveAndCloneLocked(job)
+		return updated, nil, err
+	}
+	for i := range job.Plan.Tasks {
+		task := &job.Plan.Tasks[i]
+		if task.Kind == TaskRemediation && task.BaseSHA == job.CI.HeadSHA && task.BlockReason == fingerprint {
+			copy := *task
+			return cloneJob(job), &copy, nil
+		}
+	}
+	key := fmt.Sprintf("ci-remediation-%d", len(job.Plan.Tasks)+1)
+	task := Task{Key: key, Kind: TaskRemediation, Title: "Fix failed required CI", Description: ciFailureDescription(checks), AcceptanceCriteria: []string{"The required CI failure is resolved", "The draft PR is updated with a reviewed fix"}, Status: TaskPlanned, Branch: job.IntegrationBranch, BaseSHA: job.CI.HeadSHA, ReviewVerdict: ReviewPending, BlockReason: fingerprint}
+	job.Plan.Tasks = append(job.Plan.Tasks, task)
+	job.Plan.IntegrationOrder = append(job.Plan.IntegrationOrder, key)
+	job.Status = JobCIRemediating
+	updated, err := s.saveAndCloneLocked(job)
+	if err != nil {
+		return nil, nil, err
+	}
+	return updated, &task, nil
+}
+
+func ciFailureDescription(checks []CheckResult) string {
+	var parts []string
+	for _, check := range checks {
+		if strings.EqualFold(check.Conclusion, "success") {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("Required check %q ended %s/%s. %s\n%s", check.Name, check.Status, check.Conclusion, check.Summary, check.DetailsURL))
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 type persisted struct {
@@ -318,7 +456,24 @@ func (s *Store) StartPlanning(id string) (*Job, error) {
 	if job.Status != JobCreated {
 		return nil, fmt.Errorf("%w: job is %s, expected %s", ErrInvalidJob, job.Status, JobCreated)
 	}
-	job.Status, job.UpdatedAt = JobPlanning, time.Now().UTC()
+	job.Status, job.FoundationPending, job.UpdatedAt = JobPlanning, false, time.Now().UTC()
+	if err := s.saveLocked(); err != nil {
+		return nil, err
+	}
+	return cloneJob(job), nil
+}
+
+func (s *Store) MarkFoundationPending(id string) (*Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if job.Status != JobCreated {
+		return nil, fmt.Errorf("%w: job is %s, expected %s", ErrInvalidJob, job.Status, JobCreated)
+	}
+	job.FoundationPending, job.UpdatedAt = true, time.Now().UTC()
 	if err := s.saveLocked(); err != nil {
 		return nil, err
 	}

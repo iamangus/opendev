@@ -71,4 +71,9 @@ type CheckRun struct {
 	Name       string `json:"name"`
 	Status     string `json:"status"`
 	Conclusion string `json:"conclusion"`
+	DetailsURL string `json:"details_url,omitempty"`
+	Output     struct {
+		Title   string `json:"title,omitempty"`
+		Summary string `json:"summary,omitempty"`
+	} `json:"output,omitempty"`
 }

@@ -91,6 +91,20 @@ func (c *Controller) RecordPullRequest(jobID string, number int, url string) (*J
 	return c.store.recordPullRequest(jobID, number, url)
 }
 
+// StartCI records the exact draft-PR head that GitHub Actions must validate.
+func (c *Controller) StartCI(jobID, sha string, required []string) (*Job, error) {
+	return c.store.startCI(jobID, sha, required)
+}
+
+// RecordCI records check results only for the currently awaited PR head.
+func (c *Controller) RecordCI(jobID, sha string, state CIState, checks []CheckResult, fingerprint string) (*Job, error) {
+	return c.store.recordCI(jobID, sha, state, checks, fingerprint)
+}
+
+func (c *Controller) StartCIRemediation(jobID, fingerprint string, checks []CheckResult) (*Job, *Task, error) {
+	return c.store.startCIRemediation(jobID, fingerprint, checks)
+}
+
 func (c *Controller) RecordMerge(jobID string) (*Job, error) { return c.store.recordMerge(jobID) }
 
 func (c *Controller) BlockTask(jobID, taskKey, reason string) (*Job, error) {
@@ -391,7 +405,7 @@ func (s *Store) recordPullRequest(jobID string, number int, url string) (*Job, e
 	if job.PullRequestNumber == number && job.PullRequestURL == url && job.MergeState != MergeNotRequested {
 		return cloneJob(job), nil
 	}
-	if job.Status != JobReadyToPublish || job.PullRequestNumber != 0 || job.MergeState != MergeNotRequested {
+	if (job.Status != JobReadyToPublish && job.Status != JobHolisticReviewing) || job.PullRequestNumber != 0 || job.MergeState != MergeNotRequested {
 		return nil, transition(job.Status, "record pull request")
 	}
 	job.PullRequestNumber, job.PullRequestURL, job.MergeState = number, url, MergeOpen

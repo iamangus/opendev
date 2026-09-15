@@ -4,6 +4,7 @@ package jobmcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -350,42 +351,6 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 			return toolJSON(map[string]any{"base_sha": task.BaseSHA, "commit_sha": task.CommitSHA, "diff": diff}), nil
 		})
 
-		s.AddTool(mcp.NewTool("run_validation",
-			mcp.WithDescription("Run one named validation declared in this task's repository .opendev/validations.yml. Arbitrary commands are not allowed."),
-			mcp.WithString("job_id", mcp.Required()),
-			mcp.WithString("task_key", mcp.Required()),
-			mcp.WithString("validation_name", mcp.Required()),
-		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-			if config.Validation == nil {
-				return toolError(fmt.Errorf("validation runner is not configured")), nil
-			}
-			_, task, err := jobTask(config.Store, req)
-			if err != nil {
-				return toolError(err), nil
-			}
-			name, err := req.RequireString("validation_name")
-			if err != nil {
-				return mcp.NewToolResultError(err.Error()), nil
-			}
-			isAssigned := false
-			for _, declared := range task.Validation {
-				if declared == name {
-					isAssigned = true
-					break
-				}
-			}
-			if !isAssigned {
-				return toolError(fmt.Errorf("validation %q is not assigned to task %q", name, task.Key)), nil
-			}
-			if task.WorktreePath == "" {
-				return toolError(fmt.Errorf("task worktree is not ready")), nil
-			}
-			result, err := config.Validation.Run(ctx, task.WorktreePath, name)
-			if err != nil {
-				return toolError(fmt.Errorf("validation failed: %w\n%s", err, result.Output)), nil
-			}
-			return toolJSON(result), nil
-		})
 	}
 
 	if allowed() {
@@ -405,6 +370,15 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 				}
 				if repo == nil {
 					return toolError(fmt.Errorf("target repository %q is no longer available", job.Repository)), nil
+				}
+				if _, err := config.Repositories.EnsureFoundation(ctx, job.Repository); err != nil {
+					if errors.Is(err, repositories.ErrFoundationPending) {
+						if _, markErr := config.Store.MarkFoundationPending(job.ID); markErr != nil {
+							return toolError(markErr), nil
+						}
+						return toolJSON(map[string]any{"job_id": job.ID, "status": "foundation_pending"}), nil
+					}
+					return toolError(fmt.Errorf("ensure repository foundation before planning: %w", err)), nil
 				}
 			}
 			if config.DispatchReady != nil {
@@ -645,9 +619,21 @@ func integrateEligible(jobID string, config Config, ctx context.Context) (*pipel
 		if _, err := config.Controller.StartIntegration(job.ID, task.Key); err != nil {
 			return nil, "", err
 		}
-		sha, err := config.Worktrees.MergeTask(job.Repository, task.Branch, job.IntegrationBranch)
-		if err != nil {
-			return nil, "", fmt.Errorf("integrate task %q: %w", task.Key, err)
+		var sha string
+		if task.Kind == pipeline.TaskRemediation && task.Branch == job.IntegrationBranch {
+			pusher, ok := config.Worktrees.(branchPusher)
+			if !ok {
+				return nil, "", fmt.Errorf("worktree manager does not support pushing remediation branch")
+			}
+			if err := pusher.PushBranch(job.Repository, job.IntegrationBranch); err != nil {
+				return nil, "", fmt.Errorf("push remediation task %q: %w", task.Key, err)
+			}
+			sha = task.CommitSHA
+		} else {
+			sha, err = config.Worktrees.MergeTask(job.Repository, task.Branch, job.IntegrationBranch)
+			if err != nil {
+				return nil, "", fmt.Errorf("integrate task %q: %w", task.Key, err)
+			}
 		}
 		job, err = config.Controller.RecordIntegration(job.ID, task.Key, sha)
 		if err != nil {
@@ -660,15 +646,52 @@ func integrateEligible(jobID string, config Config, ctx context.Context) (*pipel
 	if job.Status != pipeline.JobHolisticReviewing {
 		return job, "", nil
 	}
-	run, err := config.Dispatcher.StartHolistic(ctx, job)
-	if err != nil {
-		return nil, "", err
+	job, err = startDraftPRCI(ctx, job, config)
+	return job, "", err
+}
+
+type branchPusher interface {
+	PushBranch(repository, branch string) error
+}
+
+func startDraftPRCI(ctx context.Context, job *pipeline.Job, config Config) (*pipeline.Job, error) {
+	if config.GitHub == nil {
+		return nil, fmt.Errorf("GitHub integration is required for draft PR CI")
 	}
-	job, err = config.Controller.StartHolisticReviewer(job.ID, run.RunID, job.IntegrationSHA)
-	if err != nil {
-		return nil, "", err
+	pusher, ok := config.Worktrees.(branchPusher)
+	if !ok {
+		return nil, fmt.Errorf("worktree manager does not support pushing integration branches")
 	}
-	return job, run.RunID, nil
+	if err := pusher.PushBranch(job.Repository, job.IntegrationBranch); err != nil {
+		return nil, fmt.Errorf("push integration branch before draft PR: %w", err)
+	}
+	if job.PullRequestNumber == 0 {
+		title := "OpenDev draft"
+		if job.Plan != nil && strings.TrimSpace(job.Plan.Summary) != "" {
+			title += ": " + strings.TrimSpace(job.Plan.Summary)
+		}
+		pr, err := config.GitHub.CreatePR(ctx, githubpkg.CreatePROptions{Repo: job.Repository, Title: title, Head: job.IntegrationBranch, Base: job.TargetBranch, Body: "OpenDev is running required CI checks before final review.", Draft: true})
+		if err != nil {
+			return nil, fmt.Errorf("create draft pull request: %w", err)
+		}
+		var recordErr error
+		job, recordErr = config.Controller.RecordPullRequest(job.ID, pr.Number, pr.HTMLURL)
+		if recordErr != nil {
+			return nil, fmt.Errorf("record draft pull request: %w", recordErr)
+		}
+		notify(config, job, outbox.EventPROpened, "", "")
+	}
+	pr, err := config.GitHub.GetPR(ctx, job.Repository, job.PullRequestNumber)
+	if err != nil {
+		return nil, fmt.Errorf("get draft pull request: %w", err)
+	}
+	if !pr.Draft || !strings.EqualFold(pr.State, "open") {
+		return nil, fmt.Errorf("pull request #%d is not an open draft", pr.Number)
+	}
+	if pr.Head.SHA != job.IntegrationSHA {
+		return nil, fmt.Errorf("draft pull request #%d head SHA %s differs from integration SHA %s", pr.Number, pr.Head.SHA, job.IntegrationSHA)
+	}
+	return config.Controller.StartCI(job.ID, pr.Head.SHA, []string{"OpenDev CI"})
 }
 
 func taskDependenciesIntegrated(job *pipeline.Job, task *pipeline.Task) bool {

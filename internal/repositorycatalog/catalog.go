@@ -32,16 +32,29 @@ type GitMetadataReader interface {
 
 // Record is one repository's durable catalog entry.
 type Record struct {
-	Name          string    `json:"name"`
-	Path          string    `json:"path"`
-	OriginURL     string    `json:"origin_url,omitempty"`
-	DefaultBranch string    `json:"default_branch,omitempty"`
-	HeadSHA       string    `json:"head_sha,omitempty"`
-	Aliases       []string  `json:"aliases,omitempty"`
-	Domains       []string  `json:"domains,omitempty"`
-	Topics        []string  `json:"topics,omitempty"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	Name          string      `json:"name"`
+	Path          string      `json:"path"`
+	OriginURL     string      `json:"origin_url,omitempty"`
+	DefaultBranch string      `json:"default_branch,omitempty"`
+	HeadSHA       string      `json:"head_sha,omitempty"`
+	Aliases       []string    `json:"aliases,omitempty"`
+	Domains       []string    `json:"domains,omitempty"`
+	Topics        []string    `json:"topics,omitempty"`
+	Foundation    *Foundation `json:"foundation,omitempty"`
+	CreatedAt     time.Time   `json:"created_at"`
+	UpdatedAt     time.Time   `json:"updated_at"`
+}
+
+// Foundation records the one-time OpenDev repository foundation lifecycle.
+// Future upgrades are explicit rather than silently changing a ready repository.
+type Foundation struct {
+	Version   string    `json:"version"`
+	Branch    string    `json:"branch,omitempty"`
+	PRNumber  int       `json:"pr_number,omitempty"`
+	PRURL     string    `json:"pr_url,omitempty"`
+	SHA       string    `json:"sha,omitempty"`
+	Status    string    `json:"status"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type persisted struct {
@@ -91,7 +104,7 @@ func (c *Catalog) Refresh(ctx context.Context, repo manager.RepoInfo) (*Record, 
 	if err != nil {
 		return nil, fmt.Errorf("read Git metadata for %s: %w", name, err)
 	}
-	return c.Save(Record{
+	record := Record{
 		Name:          name,
 		Path:          repo.Dir,
 		OriginURL:     strings.TrimSpace(metadata.OriginURL),
@@ -100,7 +113,11 @@ func (c *Catalog) Refresh(ctx context.Context, repo manager.RepoInfo) (*Record, 
 		Aliases:       normalizedStrings(metadata.Aliases),
 		Domains:       normalizedStrings(metadata.Domains),
 		Topics:        normalizedStrings(metadata.Topics),
-	})
+	}
+	if previous, getErr := c.Get(name); getErr == nil && previous != nil {
+		record.Foundation = previous.Foundation
+	}
+	return c.Save(record)
 }
 
 // Get returns a copy of a record, or nil when it is unknown.
@@ -137,6 +154,9 @@ func (c *Catalog) Save(record Record) (*Record, error) {
 	now := time.Now().UTC()
 	if previous, ok := c.records[name]; ok {
 		record.CreatedAt = previous.CreatedAt
+		if record.Foundation == nil {
+			record.Foundation = previous.Foundation
+		}
 	} else if record.CreatedAt.IsZero() {
 		record.CreatedAt = now
 	}

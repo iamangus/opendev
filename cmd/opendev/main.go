@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/iamangus/code-mcp/internal/agentfoundry"
 	"github.com/iamangus/code-mcp/internal/dispatcher"
@@ -185,7 +186,11 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 	}
 	var repositoryService *repositories.Service
 	if ghClient != nil {
-		repositoryService, err = repositories.New(mgr, catalog, ghClient)
+		owners := strings.Split(os.Getenv("OPENDEV_OWNED_GITHUB_ACCOUNTS"), ",")
+		if len(owners) == 1 && strings.TrimSpace(owners[0]) == "" {
+			owners = []string{os.Getenv("GITHUB_OWNER")}
+		}
+		repositoryService, err = repositories.New(mgr, catalog, ghClient, owners...)
 		if err != nil {
 			logger.Error("repository provisioning initialization failed", "error", err)
 			return
@@ -316,6 +321,22 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 		logger.Error("startup dispatch reconciliation failed", "error", err)
 	}
 	resumePendingHolisticReviews(context.Background(), jobStore, jobController, jobDispatcher, logger)
+	observeCI := func() {
+		if err := jobmcp.ResumeFoundationPlanning(context.Background(), jobMCPConfig); err != nil {
+			logger.Error("resume foundation planning", "error", err)
+		}
+		if err := jobmcp.ObservePendingCI(context.Background(), jobMCPConfig); err != nil {
+			logger.Error("observe draft PR CI", "error", err)
+		}
+	}
+	observeCI()
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			observeCI()
+		}
+	}()
 	select {}
 }
 

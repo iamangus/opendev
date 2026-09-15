@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/iamangus/code-mcp/internal/foundation"
 	"github.com/iamangus/code-mcp/internal/gitops"
 )
 
@@ -25,6 +26,37 @@ type RepoInfo struct {
 	Dir           string       `json:"dir"`
 	DefaultBranch string       `json:"default_branch"`
 	Branches      []BranchInfo `json:"branches"`
+}
+
+// CreateFoundationBranch writes the fixed repository foundation to an isolated
+// branch, commits it, and pushes it for review. It never accepts agent-provided
+// paths or content.
+func (m *Manager) CreateFoundationBranch(repo, branch, base string) (string, string, error) {
+	dir, err := m.CreateWorktree(repo, branch, base)
+	if err != nil {
+		return "", "", err
+	}
+	for path, content := range foundation.Files() {
+		fullPath := filepath.Join(dir, path)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+			return "", "", fmt.Errorf("create foundation directory: %w", err)
+		}
+		if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
+			return "", "", fmt.Errorf("write foundation file %s: %w", path, err)
+		}
+	}
+	ctx := context.Background()
+	if err := m.git.Commit(ctx, dir, "chore: add OpenDev repository foundation"); err != nil {
+		return "", "", fmt.Errorf("commit foundation: %w", err)
+	}
+	if err := m.git.Push(ctx, dir, branch); err != nil {
+		return "", "", fmt.Errorf("push foundation branch: %w", err)
+	}
+	sha, err := m.git.HeadCommit(ctx, dir)
+	if err != nil {
+		return "", "", fmt.Errorf("read foundation commit: %w", err)
+	}
+	return dir, sha, nil
 }
 
 // RepositoryMetadata identifies the origin and current revision of a clone.

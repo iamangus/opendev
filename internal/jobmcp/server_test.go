@@ -22,10 +22,10 @@ func TestRoleEndpointsExposeOnlyAssignedTools(t *testing.T) {
 		want []string
 	}{
 		{RolePlanner, []string{"get_code_job"}},
-		{RoleWriter, []string{"get_code_job", "get_task_diff", "run_validation"}},
-		{RoleReviewer, []string{"get_code_job", "get_task_diff", "run_validation"}},
+		{RoleWriter, []string{"get_code_job", "get_task_diff"}},
+		{RoleReviewer, []string{"get_code_job", "get_task_diff"}},
 		{RoleHolistic, []string{"get_code_job"}},
-		{RoleAdmin, []string{"create_code_job", "fork_public_repository", "get_code_job", "get_code_job_inspection", "get_code_task_inspection", "get_task_diff", "lookup_repository", "provision_repository", "publish_approved_code_job", "retry_code_task", "run_validation", "start_holistic_rereview", "start_planning"}},
+		{RoleAdmin, []string{"create_code_job", "fork_public_repository", "get_code_job", "get_code_job_inspection", "get_code_task_inspection", "get_task_diff", "lookup_repository", "provision_repository", "publish_approved_code_job", "retry_code_task", "start_holistic_rereview", "start_planning"}},
 	} {
 		t.Run(string(tc.role), func(t *testing.T) {
 			ts := httptest.NewServer(NewRole(Config{}, tc.role))
@@ -128,6 +128,7 @@ func (f *fakeWorktrees) HasChanges(string) (bool, error) { return f.hasChanges, 
 func (*fakeWorktrees) MergeTask(string, string, string) (string, error) {
 	return "integration-sha", nil
 }
+func (*fakeWorktrees) PushBranch(string, string) error                  { return nil }
 func (*fakeWorktrees) HeadCommit(string) (string, error)                { return "base-sha", nil }
 func (*fakeWorktrees) DiffRange(string, string, string) (string, error) { return "diff", nil }
 
@@ -294,7 +295,10 @@ func TestWriterAndReviewerOutcomesAdvanceStages(t *testing.T) {
 		t.Fatal(err)
 	}
 	dispatch := &fakeDispatcher{}
-	config := Config{Store: store, Controller: pipeline.NewController(store), Dispatcher: dispatch, Worktrees: &fakeWorktrees{hasChanges: true}, Registrar: &fakeRegistrar{}}
+	github := githubpkg.NewFakeClient()
+	github.CreatePRResult = &githubpkg.PR{Number: 9, HTMLURL: "https://example.test/pr/9"}
+	github.GetPRResult = &githubpkg.PR{Number: 9, State: "open", Draft: true, Head: githubpkg.PRHead{SHA: "integration-sha"}}
+	config := Config{Store: store, Controller: pipeline.NewController(store), Dispatcher: dispatch, Worktrees: &fakeWorktrees{hasChanges: true}, Registrar: &fakeRegistrar{}, GitHub: github}
 	if _, err := startReadyWriters(context.Background(), job, config); err != nil {
 		t.Fatal(err)
 	}
@@ -313,6 +317,9 @@ func TestWriterAndReviewerOutcomesAdvanceStages(t *testing.T) {
 	current, _ = store.Get(job.ID)
 	if findTask(current, "one").Status != pipeline.TaskIntegrated {
 		t.Fatalf("review outcome did not integrate task: %+v", current)
+	}
+	if current.Status != pipeline.JobAwaitingCI || current.CI == nil || current.CI.HeadSHA != "integration-sha" {
+		t.Fatalf("integrated task did not enter draft PR CI: %+v", current)
 	}
 }
 

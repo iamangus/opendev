@@ -1,0 +1,58 @@
+name: OpenDev Reusable CI
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        required: false
+        default: auto
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: OpenDev CI
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        if: hashFiles('**/go.mod') != ''
+        with:
+          go-version: stable
+      - uses: actions/setup-node@v4
+        if: hashFiles('**/package.json') != ''
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: '**/package-lock.json'
+      - uses: actions/setup-python@v5
+        if: hashFiles('**/pyproject.toml', '**/requirements*.txt') != ''
+        with:
+          python-version: '3.13'
+      - name: Run OpenDev CI contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f go.mod ]; then
+            go test ./...
+          fi
+          if [ -f package.json ]; then
+            npm ci
+            npm test --if-present
+            npm run build --if-present
+          fi
+          if [ -f pyproject.toml ] || [ -f requirements.txt ]; then
+            python -m pip install --upgrade pip
+            if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+            if [ -f pyproject.toml ]; then pip install -e .; fi
+            python -m pytest
+          fi
+          if [ -f Makefile ]; then
+            make test
+          fi

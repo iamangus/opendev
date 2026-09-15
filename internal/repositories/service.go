@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/iamangus/code-mcp/internal/foundation"
 	"github.com/iamangus/code-mcp/internal/github"
 	"github.com/iamangus/code-mcp/internal/manager"
 	"github.com/iamangus/code-mcp/internal/repositorycatalog"
@@ -15,17 +17,22 @@ import (
 type repositoryManager interface {
 	SyncRepo(repoURL, name string, expectedDefaultBranch ...string) error
 	RepoDir(repo string) string
+	CreateFoundationBranch(repo, branch, base string) (string, string, error)
 }
+
+// ErrFoundationPending indicates that a repository foundation PR is awaiting CI.
+var ErrFoundationPending = errors.New("repository foundation is pending")
 
 // Service reconciles GitHub-owned repositories with local clones and the catalog.
 type Service struct {
 	manager repositoryManager
 	catalog *repositorycatalog.Catalog
 	github  github.Client
+	owners  map[string]struct{}
 }
 
 // New creates a repository provisioning service.
-func New(manager repositoryManager, catalog *repositorycatalog.Catalog, githubClient github.Client) (*Service, error) {
+func New(manager repositoryManager, catalog *repositorycatalog.Catalog, githubClient github.Client, ownedAccounts ...string) (*Service, error) {
 	if manager == nil {
 		return nil, fmt.Errorf("repository manager is required")
 	}
@@ -35,7 +42,134 @@ func New(manager repositoryManager, catalog *repositorycatalog.Catalog, githubCl
 	if githubClient == nil {
 		return nil, fmt.Errorf("GitHub client is required")
 	}
-	return &Service{manager: manager, catalog: catalog, github: githubClient}, nil
+	owners := make(map[string]struct{}, len(ownedAccounts))
+	for _, owner := range ownedAccounts {
+		if owner = strings.ToLower(strings.TrimSpace(owner)); owner != "" {
+			owners[owner] = struct{}{}
+		}
+	}
+	return &Service{manager: manager, catalog: catalog, github: githubClient, owners: owners}, nil
+}
+
+// EnsureFoundation lazily starts or completes the fixed OpenDev foundation for
+// an owned, non-fork repository. Lookup and catalog refresh remain read-only.
+func (s *Service) EnsureFoundation(ctx context.Context, name string) (*repositorycatalog.Record, error) {
+	name, err := repositoryName(name)
+	if err != nil {
+		return nil, err
+	}
+	repo, err := s.github.GetRepository(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if !s.managed(repo) {
+		return nil, fmt.Errorf("repository %q is not an owned non-fork repository", name)
+	}
+	record, err := s.syncAndRefresh(ctx, name, repo)
+	if err != nil {
+		return nil, err
+	}
+	if ready(record) {
+		return record, nil
+	}
+	if record.Foundation != nil && record.Foundation.PRNumber > 0 {
+		return s.reconcileFoundation(ctx, name, repo, record)
+	}
+	branch := "opendev/foundation-" + foundation.Version
+	_, sha, err := s.manager.CreateFoundationBranch(name, branch, repo.DefaultBranch)
+	if err != nil {
+		return nil, err
+	}
+	pr, err := s.github.CreatePR(ctx, github.CreatePROptions{
+		Repo: name, Title: "chore: add OpenDev repository foundation", Head: branch, Base: repo.DefaultBranch,
+		Body: "Adds the versioned OpenDev CI and repository readiness contract.", Draft: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create foundation pull request: %w", err)
+	}
+	record.Foundation = &repositorycatalog.Foundation{Version: foundation.Version, Branch: branch, PRNumber: pr.Number, PRURL: pr.HTMLURL, SHA: sha, Status: "pending", UpdatedAt: time.Now().UTC()}
+	if _, err := s.catalog.Save(*record); err != nil {
+		return nil, err
+	}
+	return record, ErrFoundationPending
+}
+
+func (s *Service) reconcileFoundation(ctx context.Context, name string, repo *github.Repository, record *repositorycatalog.Record) (*repositorycatalog.Record, error) {
+	pr, err := s.github.GetPR(ctx, name, record.Foundation.PRNumber)
+	if err != nil {
+		return nil, err
+	}
+	if pr.Merged {
+		refreshed, err := s.syncAndRefresh(ctx, name, repo)
+		if err != nil {
+			return nil, err
+		}
+		refreshed.Foundation = &repositorycatalog.Foundation{Version: foundation.Version, Branch: record.Foundation.Branch, PRNumber: pr.Number, PRURL: pr.HTMLURL, SHA: pr.Head.SHA, Status: "ready", UpdatedAt: time.Now().UTC()}
+		return s.catalog.Save(*refreshed)
+	}
+	checks, err := s.github.GetPRChecks(ctx, name, pr.Head.SHA)
+	if err != nil {
+		return nil, err
+	}
+	if foundationChecksFailed(checks) {
+		record.Foundation.Status = "blocked"
+		record.Foundation.UpdatedAt = time.Now().UTC()
+		_, saveErr := s.catalog.Save(*record)
+		return record, saveErr
+	}
+	if !foundationChecksSucceeded(checks) {
+		return record, ErrFoundationPending
+	}
+	if err := s.github.PromotePR(ctx, name, pr.Number); err != nil {
+		return nil, err
+	}
+	if err := s.github.MergePR(ctx, name, pr.Number); err != nil {
+		return nil, err
+	}
+	return s.reconcileFoundation(ctx, name, repo, record)
+}
+
+func (s *Service) managed(repo *github.Repository) bool {
+	if repo == nil || repo.Fork {
+		return false
+	}
+	if len(s.owners) == 0 {
+		return true
+	}
+	owner, _, found := strings.Cut(strings.ToLower(repo.FullName), "/")
+	if !found {
+		return false
+	}
+	_, ok := s.owners[owner]
+	return ok
+}
+
+func ready(record *repositorycatalog.Record) bool {
+	return record != nil && record.Foundation != nil && record.Foundation.Version == foundation.Version && record.Foundation.Status == "ready"
+}
+
+func foundationChecksSucceeded(checks *github.PRChecks) bool {
+	if checks == nil {
+		return false
+	}
+	for _, check := range checks.CheckRuns {
+		if check.Name == "OpenDev CI" && strings.EqualFold(check.Status, "completed") && strings.EqualFold(check.Conclusion, "success") {
+			return true
+		}
+	}
+	return false
+}
+
+func foundationChecksFailed(checks *github.PRChecks) bool {
+	if checks == nil {
+		return false
+	}
+	for _, check := range checks.CheckRuns {
+		if check.Name == "OpenDev CI" && strings.EqualFold(check.Status, "completed") && !strings.EqualFold(check.Conclusion, "success") {
+			return true
+		}
+	}
+	return false
 }
 
 // Lookup reconciles an existing GitHub repository and returns its catalog record.

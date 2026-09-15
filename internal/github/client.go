@@ -88,6 +88,9 @@ func (c *HTTPClient) CreateRepository(ctx context.Context, name, description str
 		"name":        name,
 		"description": description,
 		"private":     private,
+		// New owned repositories need a default branch before the deterministic
+		// OpenDev foundation can be committed and reviewed.
+		"auto_init": true,
 	}
 
 	var repo Repository
