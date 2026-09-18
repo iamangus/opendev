@@ -3,7 +3,7 @@ package foundation
 
 import "fmt"
 
-const Version = "v2"
+const Version = "v3"
 
 const (
 	ManifestPath = ".opendev/repository.yml"
@@ -27,7 +27,7 @@ permissions:
 
 jobs:
   ci:
-    uses: iamangus/opendev/.github/workflows/opendev-ci.yml@v2
+    uses: iamangus/opendev/.github/workflows/opendev-ci.yml@v3
     with:
       profile: auto
 `,
