@@ -124,6 +124,20 @@ func (c *Controller) RetryWriter(jobID, taskKey, runID string) (*Job, error) {
 	})
 }
 
+// ResumeBlockedWriter re-opens a task its Writer reported blocked. The block
+// reason stays in durable history; a fresh Writer attempt decides anew.
+func (c *Controller) ResumeBlockedWriter(jobID, taskKey string) (*Job, error) {
+	return c.store.updateTask(jobID, taskKey, func(job *Job, task *Task) error {
+		if task.Status != TaskBlocked || task.WriterRunID == "" {
+			return transition(task.Status, "resume blocked writer")
+		}
+		task.WriterRunID = ""
+		task.Status = TaskPlanned
+		job.Status = JobPlanned
+		return nil
+	})
+}
+
 func (c *Controller) FailJob(jobID, reason string) (*Job, error) {
 	return c.store.FailJob(jobID, reason)
 }

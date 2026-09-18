@@ -89,6 +89,31 @@ func TestControllerRetriesUnappliedWriter(t *testing.T) {
 	}
 }
 
+func TestControllerResumesWriterBlockedTask(t *testing.T) {
+	_, controller, job := plannedController(t, t.TempDir(), []Task{task("one")}, []string{"one"})
+	if _, err := controller.StartTaskWork(job.ID, "one", "branch", "/work", "writer-1"); err != nil {
+		t.Fatal(err)
+	}
+	job, err := controller.BlockTask(job.ID, "one", "revision protocol confusion")
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err = controller.ResumeBlockedWriter(job.ID, "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := job.Plan.Tasks[0]; got.Status != TaskPlanned || got.WriterRunID != "" || got.WriterAttempts != 1 || got.BlockReason == "" {
+		t.Fatalf("blocked task not resumed with history preserved: %+v", got)
+	}
+	job, err = controller.StartTaskWork(job.ID, "one", "branch", "/work", "writer-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := job.Plan.Tasks[0]; got.Status != TaskWorking || got.WriterRunID != "writer-2" || got.WriterAttempts != 2 {
+		t.Fatalf("resumed writer not dispatched: %+v", got)
+	}
+}
+
 func TestControllerPersistsReviewReportAcrossRestart(t *testing.T) {
 	dir := t.TempDir()
 	_, controller, job := plannedController(t, dir, []Task{task("one")}, []string{"one"})

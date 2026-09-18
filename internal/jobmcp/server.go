@@ -188,7 +188,7 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 		})
 
 		s.AddTool(mcp.NewTool("retry_code_task",
-			mcp.WithDescription("Retry a Writer task whose terminal result could not be applied. The rejected result is retained as superseded history."),
+			mcp.WithDescription("Retry a Writer task whose terminal result could not be applied, or resume a task its Writer reported blocked. Durable history is preserved."),
 			mcp.WithString("job_id", mcp.Required()),
 			mcp.WithString("task_key", mcp.Required()),
 			mcp.WithString("reason", mcp.Required()),
@@ -213,15 +213,22 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 			if task == nil {
 				return mcp.NewToolResultError("task not found"), nil
 			}
-			if task.Status != pipeline.TaskWorking || task.WriterRunID == "" {
-				return mcp.NewToolResultError("only an unapplied Writer task can be retried"), nil
-			}
-			if err := config.Dispatcher.Supersede(ctx, dispatcher.TaskID(job.ID, dispatcher.RoleWriter, task.Key, task.WriterAttempts), reason); err != nil {
-				return toolError(err), nil
-			}
-			job, err = config.Controller.RetryWriter(job.ID, task.Key, task.WriterRunID)
-			if err != nil {
-				return toolError(err), nil
+			switch {
+			case task.Status == pipeline.TaskWorking && task.WriterRunID != "":
+				if err := config.Dispatcher.Supersede(ctx, dispatcher.TaskID(job.ID, dispatcher.RoleWriter, task.Key, task.WriterAttempts), reason); err != nil {
+					return toolError(err), nil
+				}
+				job, err = config.Controller.RetryWriter(job.ID, task.Key, task.WriterRunID)
+				if err != nil {
+					return toolError(err), nil
+				}
+			case task.Status == pipeline.TaskBlocked:
+				job, err = config.Controller.ResumeBlockedWriter(job.ID, task.Key)
+				if err != nil {
+					return toolError(err), nil
+				}
+			default:
+				return mcp.NewToolResultError("only an unapplied or Writer-blocked task can be retried"), nil
 			}
 			run, err := startWriter(ctx, job, findTask(job, taskKey), config)
 			if err != nil {
@@ -229,6 +236,7 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 			}
 			return toolJSON(map[string]any{"job_id": job.ID, "task_key": taskKey, "run_id": run.RunID}), nil
 		})
+
 		s.AddTool(mcp.NewTool("lookup_repository",
 			mcp.WithDescription("Reconcile one owned repository with the durable catalog and local clone. This creates nothing."),
 			mcp.WithString("repository", mcp.Required(), mcp.Description("Owned GitHub repository name.")),

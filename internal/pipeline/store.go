@@ -538,7 +538,10 @@ func validatePlan(plan Plan) error {
 	}
 	keys := make(map[string]struct{}, len(plan.Tasks))
 	for _, task := range plan.Tasks {
-		if task.Kind != "" && task.Kind != TaskImplementation && task.Kind != TaskValidation {
+		if task.Kind == TaskValidation {
+			return fmt.Errorf("task %q uses obsolete validation kind; testing runs through GitHub Actions after the draft PR", task.Key)
+		}
+		if task.Kind != "" && task.Kind != TaskImplementation {
 			return fmt.Errorf("%w: task %q has invalid kind %q", ErrInvalidPlan, task.Key, task.Kind)
 		}
 		if task.Key == "" || task.Title == "" || task.Description == "" || len(task.AcceptanceCriteria) == 0 {
