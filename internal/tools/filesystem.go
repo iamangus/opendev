@@ -2,10 +2,13 @@ package tools
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -75,7 +78,7 @@ func (a *RevisionAuthorizer) Consume(absPath, token string) {
 }
 
 var ignoreDirs = map[string]bool{
-	".git": true, "node_modules": true, "build": true, "dist": true,
+	".git": true, ".opendev": true, "node_modules": true, "build": true, "dist": true,
 	".next": true, "__pycache__": true, ".cache": true, "coverage": true,
 	"out": true, "target": true, "vendor": true, ".venv": true, "venv": true,
 }
@@ -233,7 +236,12 @@ func ListDirectory(ctx context.Context, worktreeRoot, dirPath string, recursive 
 	return sb.String(), nil
 }
 
-// GrepSearch searches for a pattern (regex or literal) within files in a directory.
+// GrepSearch searches for a pattern (regex or literal) within files in a
+// directory. It prefers ripgrep, which respects ignore files and skips
+// binaries, and always bounds the returned output: a multi-megabyte result is
+// useless to a model and has starved the MCP client pipeline before.
+const maxGrepOutput = 32 << 10 // 32 KiB
+
 func GrepSearch(ctx context.Context, worktreeRoot, query, directory string, lm *locks.Manager) (string, error) {
 	searchPath := worktreeRoot
 	if directory != "" {
@@ -244,12 +252,20 @@ func GrepSearch(ctx context.Context, worktreeRoot, query, directory string, lm *
 		return "", err
 	}
 
+	if _, lookErr := exec.LookPath("rg"); lookErr == nil {
+		if out, truncated, runErr := grepWithRipgrep(ctx, abs, query); runErr == nil {
+			return boundGrepOutput(out, truncated), nil
+		}
+		// Fall through to the in-process walker when ripgrep is unusable.
+	}
+
 	re, err := regexp.Compile(query)
 	if err != nil {
 		re = regexp.MustCompile(regexp.QuoteMeta(query))
 	}
 
 	var results strings.Builder
+	truncated := false
 
 	walkErr := filepath.Walk(abs, func(path string, fi os.FileInfo, err error) error {
 		if err != nil {
@@ -259,6 +275,13 @@ func GrepSearch(ctx context.Context, worktreeRoot, query, directory string, lm *
 			if ignoreDirs[fi.Name()] && path != abs {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		if truncated {
+			return filepath.SkipAll
+		}
+		// Skip files that cannot reasonably contain a useful text match.
+		if fi.Size() > 1<<20 {
 			return nil
 		}
 
@@ -278,24 +301,31 @@ func GrepSearch(ctx context.Context, worktreeRoot, query, directory string, lm *
 			return nil
 		}
 
+		rel, _ := filepath.Rel(worktreeRoot, path)
 		lines := strings.Split(string(data), "\n")
 		for i, line := range lines {
-			if re.MatchString(line) {
-				rel, _ := filepath.Rel(worktreeRoot, path)
-				// Include context: 2 lines before and after
-				start := i - 2
-				if start < 0 {
-					start = 0
-				}
-				end := i + 2
-				if end >= len(lines) {
-					end = len(lines) - 1
-				}
-				for ctx := start; ctx <= end; ctx++ {
-					results.WriteString(fmt.Sprintf("%s:%d: %s\n", rel, ctx+1, lines[ctx]))
-				}
-				results.WriteString("---\n")
+			if !re.MatchString(line) {
+				continue
 			}
+			start := i - 2
+			if start < 0 {
+				start = 0
+			}
+			end := i + 2
+			if end >= len(lines) {
+				end = len(lines) - 1
+			}
+			for ctx := start; ctx <= end; ctx++ {
+				if results.Len() > maxGrepOutput {
+					truncated = true
+					return filepath.SkipAll
+				}
+				results.WriteString(fmt.Sprintf("%s:%d: %s\n", rel, ctx+1, lines[ctx]))
+			}
+			if truncated {
+				return filepath.SkipAll
+			}
+			results.WriteString("---\n")
 		}
 		return nil
 	})
@@ -303,7 +333,46 @@ func GrepSearch(ctx context.Context, worktreeRoot, query, directory string, lm *
 		return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: error walking directory: %v", walkErr)}
 	}
 
-	return results.String(), nil
+	return boundGrepOutput(results.String(), truncated), nil
+}
+
+// grepWithRipgrep runs ripgrep over the resolved path and returns up to
+// maxGrepOutput+1 bytes so callers can detect truncation without buffering an
+// unbounded result.
+func grepWithRipgrep(ctx context.Context, abs, query string) (string, bool, error) {
+	cmd := exec.CommandContext(ctx, "rg", "--no-heading", "-n", "-C", "2", "--glob", "!.opendev/**", "--glob", "!.git/**", "-e", query, ".")
+	cmd.Dir = abs
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", false, err
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		return "", false, err
+	}
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_, _ = cmd.Process.Wait()
+	}()
+
+	data := make([]byte, maxGrepOutput+1)
+	n, readErr := io.ReadFull(stdout, data)
+	if readErr != nil && readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
+		return "", false, readErr
+	}
+	truncated := n == len(data)
+	return string(data[:n]), truncated, nil
+}
+
+// boundGrepOutput appends a truncation notice when the output was cut short.
+func boundGrepOutput(out string, truncated bool) string {
+	if !truncated {
+		return out
+	}
+	return out + "\n[output truncated: too many matches. Narrow the query or search a subdirectory; use list_directory to find candidates.]\n"
 }
 
 // SearchAndReplace finds a block of text in a file and replaces it.

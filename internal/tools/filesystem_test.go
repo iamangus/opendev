@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -253,6 +254,50 @@ func TestGrepSearch_RegexSearch(t *testing.T) {
 	// info line is far from any error line so should not appear as context
 	if strings.Contains(out, "info: all good") {
 		t.Errorf("should not match info line as context, got: %s", out)
+	}
+}
+
+// TestGrepSearch_IgnoresOpenDevState verifies internal OpenDev state (nested
+// worktrees under .opendev) never floods search results.
+func TestGrepSearch_IgnoresOpenDevState(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "main.txt"), []byte("needle here\n"), 0644)
+	stateDir := filepath.Join(dir, ".opendev", "worktrees", "job-1")
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(stateDir, "copy.txt"), []byte("needle in worktree\n"), 0644)
+
+	out, err := GrepSearch(bgCtx, dir, "needle", "", newLM())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out, "main.txt") {
+		t.Errorf("expected main match, got: %s", out)
+	}
+	if strings.Contains(out, "job-1") || strings.Contains(out, "worktree") {
+		t.Errorf(".opendev state leaked into results: %s", out)
+	}
+}
+
+// TestGrepSearch_BoundsOutput verifies oversized result sets are truncated
+// instead of returning megabytes to the model.
+func TestGrepSearch_BoundsOutput(t *testing.T) {
+	dir := t.TempDir()
+	line := strings.Repeat("match ", 100) + "\n"
+	for i := 0; i < 400; i++ {
+		os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%03d.txt", i)), []byte(line), 0644)
+	}
+
+	out, err := GrepSearch(bgCtx, dir, "match", "", newLM())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(out) > 40<<10 {
+		t.Errorf("output not bounded: %d bytes", len(out))
+	}
+	if !strings.Contains(out, "output truncated") {
+		t.Errorf("missing truncation notice: %d bytes ending %q", len(out), out[len(out)-100:])
 	}
 }
 

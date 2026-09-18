@@ -15,8 +15,9 @@ FROM debian:bookworm-slim
 
 # git              – needed for clone/worktree operations via the management API
 # ca-certificates  – needed for HTTPS clones
+# ripgrep          – fast ignore-aware search backend for the grep_search tool
 RUN apt-get update -qq \
- && apt-get install -y --no-install-recommends git ca-certificates \
+ && apt-get install -y --no-install-recommends git ca-certificates ripgrep \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/go /usr/local/go
