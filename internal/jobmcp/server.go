@@ -252,6 +252,31 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 			return toolJSON(map[string]any{"job_id": job.ID, "task_key": taskKey, "run_id": run.RunID}), nil
 		})
 
+		s.AddTool(mcp.NewTool("reset_holistic_review",
+			mcp.WithDescription("Force a fresh holistic review round for a job whose review is stranded (stale verdict or an adopted old run). Clears round state and dispatches a new holistic run."),
+			mcp.WithString("job_id", mcp.Required()),
+		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			jobID, err := req.RequireString("job_id")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			job, err := config.Store.Get(jobID)
+			if err != nil {
+				return toolError(err), nil
+			}
+			job, err = config.Controller.ResetHolisticRound(jobID)
+			if err != nil {
+				return toolError(err), nil
+			}
+			run, err := config.Dispatcher.StartHolistic(ctx, job)
+			if err != nil {
+				return toolError(err), nil
+			}
+			if _, err := config.Controller.StartHolisticReviewer(job.ID, run.RunID, job.IntegrationSHA); err != nil {
+				return toolError(err), nil
+			}
+			return toolJSON(map[string]any{"job_id": job.ID, "round": job.HolisticRounds, "run_id": run.RunID}), nil
+		})
 		s.AddTool(mcp.NewTool("lookup_repository",
 			mcp.WithDescription("Reconcile one owned repository with the durable catalog and local clone. This creates nothing."),
 			mcp.WithString("repository", mcp.Required(), mcp.Description("Owned GitHub repository name.")),

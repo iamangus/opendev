@@ -26,7 +26,7 @@ func TestRoleEndpointsExposeOnlyAssignedTools(t *testing.T) {
 		{RoleWriter, []string{"get_code_job", "get_task_diff"}},
 		{RoleReviewer, []string{"get_code_job", "get_task_diff"}},
 		{RoleHolistic, []string{"get_code_job"}},
-		{RoleAdmin, []string{"create_code_job", "fork_public_repository", "get_code_job", "get_code_job_inspection", "get_code_task_inspection", "get_task_diff", "lookup_repository", "provision_repository", "publish_approved_code_job", "retry_code_task", "start_holistic_rereview", "start_planning"}},
+		{RoleAdmin, []string{"create_code_job", "fork_public_repository", "get_code_job", "get_code_job_inspection", "get_code_task_inspection", "get_task_diff", "lookup_repository", "provision_repository", "publish_approved_code_job", "reset_holistic_review", "retry_code_task", "start_holistic_rereview", "start_planning"}},
 	} {
 		t.Run(string(tc.role), func(t *testing.T) {
 			ts := httptest.NewServer(NewRole(Config{}, tc.role))
