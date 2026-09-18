@@ -177,6 +177,9 @@ func applyWriterBlocked(ctx context.Context, run dispatcher.DispatchRun, config 
 		failures = config.WorktreeToolFailures(task.WorktreePath, run.StartedAt.Add(-time.Minute))
 	}
 	if len(failures) > 0 {
+		if config.Logger != nil {
+			config.Logger.Info("writer blocker verified by recorded tool failures", "job_id", run.JobID, "task", run.TaskKey, "failures", len(failures), "first", failures[0], "window_since", run.StartedAt.Add(-time.Minute))
+		}
 		blocked, err := config.Controller.BlockTask(run.JobID, run.TaskKey, response.Reason)
 		if err != nil {
 			return err
