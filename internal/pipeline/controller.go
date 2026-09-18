@@ -138,6 +138,20 @@ func (c *Controller) ResumeBlockedWriter(jobID, taskKey string) (*Job, error) {
 	})
 }
 
+// ReopenNoChangesTask re-opens a task its Writer reported as needing no
+// changes, for example after a holistic review found the work incomplete.
+func (c *Controller) ReopenNoChangesTask(jobID, taskKey string) (*Job, error) {
+	return c.store.updateTask(jobID, taskKey, func(job *Job, task *Task) error {
+		if task.Status != TaskNoChanges {
+			return transition(task.Status, "reopen no-changes task")
+		}
+		task.WriterRunID = ""
+		task.Status = TaskPlanned
+		job.Status = JobPlanned
+		return nil
+	})
+}
+
 func (c *Controller) FailJob(jobID, reason string) (*Job, error) {
 	return c.store.FailJob(jobID, reason)
 }

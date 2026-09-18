@@ -237,6 +237,11 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 				if err != nil {
 					return toolError(err), nil
 				}
+			case task.Status == pipeline.TaskNoChanges:
+				job, err = config.Controller.ReopenNoChangesTask(job.ID, task.Key)
+				if err != nil {
+					return toolError(err), nil
+				}
 			default:
 				return mcp.NewToolResultError("only an unapplied or Writer-blocked task can be retried"), nil
 			}
