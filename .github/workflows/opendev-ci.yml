@@ -39,11 +39,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f go.mod ]; then
-            sudo apt-get update
-            sudo apt-get install -y libolm-dev
-            go test ./...
-          fi
           if [ -f frontend/package.json ]; then
             (cd frontend && npm ci && npm test --if-present && npm run build --if-present)
           fi
@@ -51,6 +46,11 @@ jobs:
             npm ci
             npm test --if-present
             npm run build --if-present
+          fi
+          if [ -f go.mod ]; then
+            sudo apt-get update
+            sudo apt-get install -y libolm-dev
+            go test ./...
           fi
           if [ -f pyproject.toml ] || [ -f requirements.txt ]; then
             python -m pip install --upgrade pip
