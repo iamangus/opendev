@@ -63,10 +63,13 @@ func (a *RevisionAuthorizer) Authorize(absPath, token string) {
 func (a *RevisionAuthorizer) Verify(absPath, token string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.approved[absPath] != token {
-		return &worktree.ToolError{Message: "Tool Error: read_file must be called after the previous successful edit before editing this file again"}
+	if a.approved[absPath] == token {
+		return nil
 	}
-	return nil
+	if _, pending := a.approved[absPath]; pending {
+		return &worktree.ToolError{Message: "Tool Error: the supplied expected_revision does not match the current read_file revision for this file. Call read_file on it again and pass the revision token from that exact result."}
+	}
+	return &worktree.ToolError{Message: "Tool Error: read_file must be called after the previous successful edit before editing this file again. Call read_file on this file, then retry with the revision token from that result as expected_revision."}
 }
 
 func (a *RevisionAuthorizer) Consume(absPath, token string) {
@@ -393,7 +396,7 @@ func SearchAndReplace(ctx context.Context, worktreeRoot, filePath, searchBlock, 
 	}
 	content := string(data)
 	if expectedRevision != revision(content) {
-		return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: stale revision for %s. Read the file again before editing. Current revision: %s", filePath, revision(content))}
+		return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: stale revision for %s. Call read_file on it again; pass the revision token from that result as expected_revision.", filePath)}
 	}
 
 	// Exact match
@@ -406,8 +409,7 @@ func SearchAndReplace(ctx context.Context, worktreeRoot, filePath, searchBlock, 
 		if err := os.WriteFile(abs, []byte(newContent), 0644); err != nil {
 			return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: cannot write file: %v", err)}
 		}
-		idx := strings.Index(newContent, replaceBlock)
-		return fmt.Sprintf("New revision: %s\n%s", revision(newContent), buildContext(newContent, idx, replaceBlock, abs)), nil
+		return fmt.Sprintf("Successfully replaced in %s. This result does not authorize another edit: call read_file on %s again before the next search_and_replace; its result carries the expected_revision to use.", filePath, filePath), nil
 	}
 
 	// Fuzzy match: normalize whitespace and compare line-by-line windows
@@ -449,8 +451,7 @@ func SearchAndReplace(ctx context.Context, worktreeRoot, filePath, searchBlock, 
 		if err := os.WriteFile(abs, []byte(newContent), 0644); err != nil {
 			return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: cannot write file: %v", err)}
 		}
-		idx := strings.Index(newContent, replaceBlock)
-		return fmt.Sprintf("New revision: %s\n%s", revision(newContent), buildContext(newContent, idx, replaceBlock, abs)), nil
+		return fmt.Sprintf("Successfully replaced in %s. This result does not authorize another edit: call read_file on %s again before the next search_and_replace; its result carries the expected_revision to use.", filePath, filePath), nil
 	}
 
 	snippet := ""
