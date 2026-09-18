@@ -495,7 +495,7 @@ func publishApprovedJob(ctx context.Context, jobID string, config Config) (*pipe
 			return nil, fmt.Errorf("job %s has no generated pull request presentation", job.ID)
 		}
 		pr, err := config.GitHub.CreatePR(ctx, githubpkg.CreatePROptions{
-			Repo: job.Repository, Title: job.PullRequestTitle, Head: job.IntegrationBranch,
+			Repo: job.Repository, Title: truncateTitle(job.PullRequestTitle), Head: job.IntegrationBranch,
 			Base: job.TargetBranch, Body: job.PullRequestBody, Draft: false,
 		})
 		if err != nil {
@@ -607,6 +607,15 @@ func enforceWriterAttemptLimit(job *pipeline.Job, task *pipeline.Task, config Co
 	}
 	notify(config, blocked, outbox.EventBlocked+":"+task.Key, task.Title, reason)
 	return true, nil
+}
+
+// truncateTitle clamps PR titles to GitHub's 256-character limit.
+func truncateTitle(title string) string {
+	title = strings.TrimSpace(title)
+	if len(title) <= 256 {
+		return title
+	}
+	return strings.TrimSpace(title[:253]) + "..."
 }
 
 func startReadyWriters(ctx context.Context, job *pipeline.Job, config Config) ([]string, error) {
@@ -732,7 +741,7 @@ func startDraftPRCI(ctx context.Context, job *pipeline.Job, config Config) (*pip
 		if job.Plan != nil && strings.TrimSpace(job.Plan.Summary) != "" {
 			title += ": " + strings.TrimSpace(job.Plan.Summary)
 		}
-		pr, err := config.GitHub.CreatePR(ctx, githubpkg.CreatePROptions{Repo: job.Repository, Title: title, Head: job.IntegrationBranch, Base: job.TargetBranch, Body: "OpenDev is running required CI checks before final review.", Draft: true})
+		pr, err := config.GitHub.CreatePR(ctx, githubpkg.CreatePROptions{Repo: job.Repository, Title: truncateTitle(title), Head: job.IntegrationBranch, Base: job.TargetBranch, Body: "OpenDev is running required CI checks before final review.", Draft: true})
 		if err != nil {
 			return nil, fmt.Errorf("create draft pull request: %w", err)
 		}
