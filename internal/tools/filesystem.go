@@ -72,6 +72,26 @@ func (a *RevisionAuthorizer) Verify(absPath, token string) error {
 	return &worktree.ToolError{Message: "Tool Error: read_file must be called after the previous successful edit before editing this file again. Call read_file on this file, then retry with the revision token from that result as expected_revision."}
 }
 
+// VerifyOrAdopt authorizes an edit when the token was issued by read_file, or
+// when it matches the file's current content hash. The content match tolerates
+// a model passing an equivalent token from its context while still rejecting
+// every token that predates the current file state.
+func (a *RevisionAuthorizer) VerifyOrAdopt(absPath, token, currentRevision string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.approved[absPath] == token {
+		return nil
+	}
+	if currentRevision != "" && token == currentRevision {
+		a.approved[absPath] = token
+		return nil
+	}
+	if _, pending := a.approved[absPath]; pending {
+		return &worktree.ToolError{Message: "Tool Error: the supplied expected_revision matches neither the current file revision nor an authorized read. Call read_file on this file and pass the revision token from that exact result."}
+	}
+	return &worktree.ToolError{Message: "Tool Error: read_file must be called after the previous successful edit before editing this file again. Call read_file on this file, then retry with the revision token from that result as expected_revision."}
+}
+
 func (a *RevisionAuthorizer) Consume(absPath, token string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

@@ -323,6 +323,29 @@ func TestSearchAndReplace_UniqueMatch(t *testing.T) {
 	}
 }
 
+// TestRevisionAuthorizer_VerifyOrAdopt tolerates an equivalent current-content
+// token while rejecting tokens from before the current file state.
+func TestRevisionAuthorizer_VerifyOrAdopt(t *testing.T) {
+	a := NewRevisionAuthorizer()
+	abs := "/work/file.txt"
+	current := "sha256:current"
+
+	// A token equal to the current content hash is adopted without a prior read.
+	if err := a.VerifyOrAdopt(abs, current, current); err != nil {
+		t.Fatalf("current-content token should be adopted: %v", err)
+	}
+	// The adopted token authorizes exactly one edit.
+	if err := a.Verify(abs, current); err != nil {
+		t.Fatalf("adopted token should verify: %v", err)
+	}
+	a.Consume(abs, current)
+	// A stale token (content has since changed) is rejected.
+	a.Authorize(abs, "sha256:newer")
+	if err := a.VerifyOrAdopt(abs, current, "sha256:different"); err == nil {
+		t.Fatal("stale token should be rejected when it predates current content")
+	}
+}
+
 // TestSearchAndReplace_MultipleMatches verifies ToolError when search_block is ambiguous.
 func TestSearchAndReplace_MultipleMatches(t *testing.T) {
 	dir := t.TempDir()

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -255,9 +256,15 @@ func registerWriteTools(s *server.MCPServer, lm *locks.Manager, revisions *tools
 				logger.Error("tool call failed", "tool", "search_and_replace", "filepath", fp, "error", resolveErr, "duration_ms", time.Since(start).Milliseconds())
 				return mcp.NewToolResultError(resolveErr.Error()), nil
 			}
-			if authErr := revisions.Verify(abs, expectedRevision); authErr != nil {
-				logger.Error("tool call failed", "tool", "search_and_replace", "filepath", fp, "error", authErr, "duration_ms", time.Since(start).Milliseconds())
-				return mcp.NewToolResultError(authErr.Error()), nil
+			if lm.RLock(ctx, abs) == nil {
+				current, readErr := os.ReadFile(abs)
+				lm.RUnlock(abs)
+				if readErr == nil {
+					if authErr := revisions.VerifyOrAdopt(abs, expectedRevision, tools.RevisionToken(string(current))); authErr != nil {
+						logger.Error("tool call failed", "tool", "search_and_replace", "filepath", fp, "error", authErr, "duration_ms", time.Since(start).Milliseconds())
+						return mcp.NewToolResultError(authErr.Error()), nil
+					}
+				}
 			}
 			result, toolErr := tools.SearchAndReplace(ctx, worktreeRoot, fp, searchBlock, replaceBlock, expectedRevision, lm)
 			if toolErr != nil {
