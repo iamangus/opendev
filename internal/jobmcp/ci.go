@@ -16,6 +16,12 @@ func ObservePendingCI(ctx context.Context, config Config) error {
 		return nil
 	}
 	for _, job := range config.Store.List() {
+		if job.Status == pipeline.JobReadyToPublish && job.HolisticReviewVerdict == pipeline.ReviewApproved {
+			if _, err := publishApprovedJob(ctx, job.ID, config); err != nil {
+				return fmt.Errorf("resume approved publication for job %s: %w", job.ID, err)
+			}
+			continue
+		}
 		if job.Status != pipeline.JobAwaitingCI || job.CI == nil {
 			continue
 		}
