@@ -2,6 +2,7 @@ package jobmcp
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -357,10 +358,55 @@ func applyHolistic(ctx context.Context, run dispatcher.DispatchRun, config Confi
 		err = failErr
 		return err
 	}
+	if verdict == pipeline.ReviewChangesRequested {
+		rounds, updated, err := config.Store.IncrementHolisticRounds(job.ID)
+		if err != nil {
+			return err
+		}
+		if rounds > maxHolisticRemediationRounds {
+			reason := fmt.Sprintf("holistic review requested changes in %d remediation rounds; stopping", rounds-1)
+			failed, failErr := config.Controller.FailJob(job.ID, reason)
+			notify(config, failed, outbox.EventFailed, response.Summary, reason)
+			return failErr
+		}
+		reopened, err := config.Store.ReopenIncompleteTasks(job.ID)
+		if err != nil {
+			// Everything was already integrated and approved; the request must
+			// target the integrated diff itself, so route it through PR-branch
+			// remediation via the CI path's synthetic task machinery.
+			return remediateIntegratedDiff(ctx, updated, config, response)
+		}
+		notify(config, reopened, outbox.EventCIRemediating, response.Summary, strings.Join(response.Findings, "\n"))
+		_, err = startReadyWriters(ctx, reopened, config)
+		return err
+	}
 	if verdict == pipeline.ReviewApproved {
 		_, err = publishApprovedJob(ctx, updated.ID, config)
 	}
 	return err
+}
+
+// maxHolisticRemediationRounds bounds holistic changes-requested cycles.
+const maxHolisticRemediationRounds = 3
+
+// remediateIntegratedDiff hands a holistic changes-requested verdict about an
+// already fully integrated diff to the PR-branch remediation machinery by
+// creating a synthetic remediation task keyed to the integration SHA.
+func remediateIntegratedDiff(ctx context.Context, job *pipeline.Job, config Config, response reviewResponse) error {
+	fingerprint := fmt.Sprintf("holistic:%x", sha256.Sum256([]byte(strings.Join(response.Findings, "\n"))))
+	checks := []pipeline.CheckResult(nil)
+	if job.CI != nil {
+		checks = job.CI.Checks
+	}
+	controller := pipeline.NewController(config.Store)
+	_, task, err := controller.StartCIRemediation(job.ID, fingerprint, checks)
+	if err != nil {
+		return err
+	}
+	if config.Logger != nil {
+		config.Logger.Info("holistic remediation dispatched", "job_id", job.ID, "task", task.Key)
+	}
+	return nil
 }
 
 func recordTerminalFailure(run dispatcher.DispatchRun, config Config) error {

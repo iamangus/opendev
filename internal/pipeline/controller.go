@@ -464,6 +464,59 @@ func (s *Store) updateTask(jobID, taskKey string, update func(*Job, *Task) error
 	return nil, fmt.Errorf("%w: task %q", ErrNotFound, taskKey)
 }
 
+// IncrementHolisticRounds counts holistic changes-requested rounds and returns
+// the new count so applyHolistic can bound remediation loops.
+func (s *Store) IncrementHolisticRounds(jobID string) (int, *Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[jobID]
+	if !ok {
+		return 0, nil, ErrNotFound
+	}
+	job.HolisticRounds++
+	updated, err := s.saveAndCloneLocked(job)
+	if err != nil {
+		return 0, nil, err
+	}
+	return job.HolisticRounds, updated, nil
+}
+
+// ReopenIncompleteTasks returns tasks whose work the holistic review found
+// insufficient (no_changes or writer-blocked) to planned for another attempt.
+func (s *Store) ReopenIncompleteTasks(jobID string) (*Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[jobID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if job.Plan == nil {
+		return nil, fmt.Errorf("%w: job has no plan", ErrInvalidTransition)
+	}
+	reopened := 0
+	for i := range job.Plan.Tasks {
+		task := &job.Plan.Tasks[i]
+		switch task.Status {
+		case TaskNoChanges:
+			task.Status = TaskPlanned
+			task.NoChangeReason = ""
+			task.WriterRunID = ""
+			reopened++
+		case TaskBlocked:
+			if task.WriterRunID != "" {
+				task.Status = TaskPlanned
+				task.WriterRunID = ""
+				reopened++
+			}
+		}
+	}
+	if reopened == 0 {
+		return nil, fmt.Errorf("%w: no incomplete tasks to reopen", ErrInvalidTransition)
+	}
+	job.Status = JobPlanned
+	return s.saveAndCloneLocked(job)
+}
+
 func (s *Store) saveAndCloneLocked(job *Job) (*Job, error) {
 	job.UpdatedAt = time.Now().UTC()
 	if err := s.saveLocked(); err != nil {

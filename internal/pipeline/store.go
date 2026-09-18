@@ -216,6 +216,7 @@ type Job struct {
 	CI                    *CIRecord           `json:"ci,omitempty"`
 	CIFailureFingerprints []string            `json:"ci_failure_fingerprints,omitempty"`
 	FoundationPending     bool                `json:"foundation_pending,omitempty"`
+	HolisticRounds        int                 `json:"holistic_rounds,omitempty"`
 	MergeState            MergeState          `json:"merge_state"`
 	Failure               string              `json:"failure,omitempty"`
 	CreatedAt             time.Time           `json:"created_at"`
