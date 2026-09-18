@@ -91,7 +91,7 @@ func (s *Service) EnsureFoundation(ctx context.Context, name string) (*repositor
 		return nil, fmt.Errorf("create foundation pull request: %w", err)
 	}
 	if rules, ok := s.github.(requiredCheckConfigurer); ok {
-		if err := rules.EnsureRequiredCheck(ctx, name, repo.DefaultBranch, "OpenDev CI"); err != nil {
+		if err := rules.EnsureRequiredCheck(ctx, name, repo.DefaultBranch, "ci / OpenDev CI"); err != nil {
 			return nil, fmt.Errorf("configure foundation required check: %w", err)
 		}
 	}
@@ -161,7 +161,7 @@ func foundationChecksSucceeded(checks *github.PRChecks) bool {
 		return false
 	}
 	for _, check := range checks.CheckRuns {
-		if check.Name == "OpenDev CI" && strings.EqualFold(check.Status, "completed") && strings.EqualFold(check.Conclusion, "success") {
+		if check.Name == "ci / OpenDev CI" && strings.EqualFold(check.Status, "completed") && strings.EqualFold(check.Conclusion, "success") {
 			return true
 		}
 	}
@@ -173,7 +173,7 @@ func foundationChecksFailed(checks *github.PRChecks) bool {
 		return false
 	}
 	for _, check := range checks.CheckRuns {
-		if check.Name == "OpenDev CI" && strings.EqualFold(check.Status, "completed") && !strings.EqualFold(check.Conclusion, "success") {
+		if check.Name == "ci / OpenDev CI" && strings.EqualFold(check.Status, "completed") && !strings.EqualFold(check.Conclusion, "success") {
 			return true
 		}
 	}

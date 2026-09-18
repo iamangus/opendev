@@ -15,7 +15,7 @@ const (
 // cannot select an executor or arbitrary credentials.
 func Files() map[string]string {
 	return map[string]string{
-		ManifestPath: fmt.Sprintf("version: %s\nci:\n  profile: auto\n  required_checks:\n    - OpenDev CI\n", Version),
+		ManifestPath: fmt.Sprintf("version: %s\nci:\n  profile: auto\n  required_checks:\n    - ci / OpenDev CI\n", Version),
 		WorkflowPath: `name: OpenDev CI
 
 on:

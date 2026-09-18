@@ -691,7 +691,7 @@ func startDraftPRCI(ctx context.Context, job *pipeline.Job, config Config) (*pip
 	if pr.Head.SHA != job.IntegrationSHA {
 		return nil, fmt.Errorf("draft pull request #%d head SHA %s differs from integration SHA %s", pr.Number, pr.Head.SHA, job.IntegrationSHA)
 	}
-	return config.Controller.StartCI(job.ID, pr.Head.SHA, []string{"OpenDev CI"})
+	return config.Controller.StartCI(job.ID, pr.Head.SHA, []string{"ci / OpenDev CI"})
 }
 
 func taskDependenciesIntegrated(job *pipeline.Job, task *pipeline.Task) bool {
