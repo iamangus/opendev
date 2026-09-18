@@ -22,6 +22,18 @@ func ObservePendingCI(ctx context.Context, config Config) error {
 			}
 			continue
 		}
+		if job.Status == pipeline.JobHolisticReviewing && job.CI != nil && job.CI.State == pipeline.CIPassed && job.HolisticReviewRunID == "" {
+			// A restart or a failed dispatch stranded the holistic round: CI has
+			// passed and no review run is recorded, so dispatch one now.
+			run, err := config.Dispatcher.StartHolistic(ctx, job)
+			if err != nil {
+				return fmt.Errorf("resume holistic review for job %s: %w", job.ID, err)
+			}
+			if _, err := config.Controller.StartHolisticReviewer(job.ID, run.RunID, job.IntegrationSHA); err != nil {
+				return fmt.Errorf("record resumed holistic review for job %s: %w", job.ID, err)
+			}
+			continue
+		}
 		if job.Status != pipeline.JobAwaitingCI || job.CI == nil {
 			continue
 		}
