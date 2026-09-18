@@ -40,7 +40,10 @@ jobs:
         run: |
           set -euo pipefail
           if [ -f go.mod ]; then
-            go test ./...
+            CGO_ENABLED=0 go test ./...
+          fi
+          if [ -f frontend/package.json ]; then
+            (cd frontend && npm ci && npm test --if-present && npm run build --if-present)
           fi
           if [ -f package.json ]; then
             npm ci

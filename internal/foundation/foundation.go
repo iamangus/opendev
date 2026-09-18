@@ -3,7 +3,7 @@ package foundation
 
 import "fmt"
 
-const Version = "v1"
+const Version = "v2"
 
 const (
 	ManifestPath = ".opendev/repository.yml"
