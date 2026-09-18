@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/iamangus/code-mcp/internal/dispatcher"
 	githubpkg "github.com/iamangus/code-mcp/internal/github"
@@ -504,6 +505,24 @@ func publishApprovedJob(ctx context.Context, jobID string, config Config) (*pipe
 		merged, err := config.Controller.RecordMerge(job.ID)
 		notify(config, merged, outbox.EventMerged, "", "")
 		return merged, err
+	}
+	if pr.Draft {
+		if err := config.GitHub.PromotePR(ctx, job.Repository, pr.Number); err != nil {
+			return nil, fmt.Errorf("promote pull request: %w", err)
+		}
+		for attempt := 0; attempt < 10; attempt++ {
+			pr, err = config.GitHub.GetPR(ctx, job.Repository, pr.Number)
+			if err != nil {
+				return nil, fmt.Errorf("confirm pull request promotion: %w", err)
+			}
+			if !pr.Draft {
+				break
+			}
+			if attempt == 9 {
+				return nil, fmt.Errorf("pull request #%d is still draft after promotion", pr.Number)
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
 	if !strings.EqualFold(pr.State, "open") || pr.Draft {
 		return nil, fmt.Errorf("pull request #%d must be open and ready for review before merge", pr.Number)
