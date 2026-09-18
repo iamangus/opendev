@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,9 +27,42 @@ const (
 // each profile on every repo/branch.
 var Profiles = []Profile{ProfileRead, ProfileWrite}
 
+type toolFailure struct {
+	Time  time.Time
+	Tool  string
+	Error string
+}
+
 type workspaceState struct {
 	locks     *locks.Manager
 	revisions *tools.RevisionAuthorizer
+
+	mu       sync.Mutex
+	failures []toolFailure
+}
+
+// recordFailure keeps a bounded log of workspace tool failures so Writer
+// blocker claims can be verified against what actually happened.
+func (s *workspaceState) recordFailure(tool, message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failures = append(s.failures, toolFailure{Time: time.Now().UTC(), Tool: tool, Error: message})
+	if len(s.failures) > 200 {
+		s.failures = s.failures[len(s.failures)-200:]
+	}
+}
+
+// FailuresSince returns tool failures recorded at or after the given time.
+func (s *workspaceState) FailuresSince(since time.Time) []toolFailure {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []toolFailure
+	for _, f := range s.failures {
+		if !f.Time.Before(since) {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 var workspaceStates sync.Map
@@ -241,9 +275,23 @@ func registerWriteTools(s *server.MCPServer, lm *locks.Manager, revisions *tools
 func newMCPHandler(profile Profile, worktreeRoot string, logger *slog.Logger) *server.StreamableHTTPServer {
 	return newMCPHandlerWithState(profile, worktreeRoot, logger, workspaceStateFor(worktreeRoot, logger))
 }
-
 func newMCPHandlerWithState(profile Profile, worktreeRoot string, logger *slog.Logger, state *workspaceState) *server.StreamableHTTPServer {
-	s := server.NewMCPServer("opendev", "1.0.0", server.WithToolCapabilities(true))
+	s := server.NewMCPServer("opendev", "1.0.0",
+		server.WithToolCapabilities(true),
+		server.WithToolHandlerMiddleware(func(next server.ToolHandlerFunc) server.ToolHandlerFunc {
+			return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				result, err := next(ctx, req)
+				if err != nil {
+					state.recordFailure(req.Params.Name, err.Error())
+					return result, err
+				}
+				if result != nil && result.IsError {
+					state.recordFailure(req.Params.Name, toolResultError(result))
+				}
+				return result, err
+			}
+		}),
+	)
 	switch profile {
 	case ProfileRead:
 		registerReadTools(s, state.locks, state.revisions, worktreeRoot, logger)
@@ -251,4 +299,19 @@ func newMCPHandlerWithState(profile Profile, worktreeRoot string, logger *slog.L
 		registerWriteTools(s, state.locks, state.revisions, worktreeRoot, logger)
 	}
 	return server.NewStreamableHTTPServer(s)
+}
+
+// toolResultError extracts a bounded error message from an error tool result.
+func toolResultError(result *mcp.CallToolResult) string {
+	var parts []string
+	for _, c := range result.Content {
+		if tc, ok := c.(mcp.TextContent); ok {
+			parts = append(parts, tc.Text)
+		}
+	}
+	msg := strings.Join(parts, "\n")
+	if len(msg) > 500 {
+		msg = msg[:500]
+	}
+	return msg
 }

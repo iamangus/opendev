@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/iamangus/code-mcp/internal/dispatcher"
 	githubpkg "github.com/iamangus/code-mcp/internal/github"
@@ -275,6 +276,80 @@ func TestWriterCompletedWithoutChangesIsRecordedWithoutCommit(t *testing.T) {
 	current, _ := store.Get(job.ID)
 	if task := findTask(current, "one"); task.Status != pipeline.TaskNoChanges || current.Status != pipeline.JobNoChanges {
 		t.Fatalf("completed clean worktree was not recorded as no changes: job=%+v task=%+v", current, task)
+	}
+}
+
+func TestUnverifiedWriterBlockerSubmitsWorkForReview(t *testing.T) {
+	store, err := pipeline.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.Create("repo", "directive", "main", "", "planner", "writer", "reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartPlanning(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	job, err = store.SubmitPlan(job.ID, pipeline.Plan{Summary: "plan", Tasks: []pipeline.Task{{Key: "one", Title: "One", Description: "Implement", AcceptanceCriteria: []string{"works"}}}, IntegrationOrder: []string{"one"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch := &fakeDispatcher{}
+	worktrees := &fakeWorktrees{hasChanges: true}
+	config := Config{Store: store, Controller: pipeline.NewController(store), Dispatcher: dispatch, Worktrees: worktrees, Registrar: &fakeRegistrar{}}
+	if _, err := startReadyWriters(context.Background(), job, config); err != nil {
+		t.Fatal(err)
+	}
+	handler := OutcomeHandler(config)
+	run := dispatcher.DispatchRun{JobID: job.ID, Role: dispatcher.RoleWriter, TaskKey: "one", RunID: "writer-one", Status: "completed", Response: `{"status":"blocked","summary":"claimed tooling problems","reason":"revision-token synchronization failures","validation_evidence":[]}`}
+	if err := handler(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := store.Get(job.ID)
+	task := findTask(current, "one")
+	if task.Status != pipeline.TaskReviewing || task.CommitSHA != "commit-sha" || task.WriterRunID != "writer-one" {
+		t.Fatalf("unverified blocker did not submit work for review: job=%+v task=%+v", current, task)
+	}
+	if current.Status != pipeline.JobReviewing || len(dispatch.reviewerTasks) != 1 {
+		t.Fatalf("reviewer not started for unverified blocker: job=%+v reviewers=%d", current, len(dispatch.reviewerTasks))
+	}
+}
+
+func TestVerifiedWriterBlockerBlocksTask(t *testing.T) {
+	store, err := pipeline.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.Create("repo", "directive", "main", "", "planner", "writer", "reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartPlanning(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	job, err = store.SubmitPlan(job.ID, pipeline.Plan{Summary: "plan", Tasks: []pipeline.Task{{Key: "one", Title: "One", Description: "Implement", AcceptanceCriteria: []string{"works"}}}, IntegrationOrder: []string{"one"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch := &fakeDispatcher{}
+	worktrees := &fakeWorktrees{hasChanges: true}
+	config := Config{Store: store, Controller: pipeline.NewController(store), Dispatcher: dispatch, Worktrees: worktrees, Registrar: &fakeRegistrar{},
+		WorktreeToolFailures: func(path string, since time.Time) []ToolFailureInfo {
+			return []ToolFailureInfo{{Time: time.Now().UTC(), Tool: "search_and_replace", Error: "revision mismatch"}}
+		}}
+	if _, err := startReadyWriters(context.Background(), job, config); err != nil {
+		t.Fatal(err)
+	}
+	handler := OutcomeHandler(config)
+	run := dispatcher.DispatchRun{JobID: job.ID, Role: dispatcher.RoleWriter, TaskKey: "one", RunID: "writer-one", Status: "completed", Response: `{"status":"blocked","summary":"real tooling problem","reason":"revision mismatch","validation_evidence":[]}`}
+	if err := handler(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := store.Get(job.ID)
+	task := findTask(current, "one")
+	if task.Status != pipeline.TaskBlocked || task.WriterRunID != "writer-one" {
+		t.Fatalf("verified blocker did not block the task: job=%+v task=%+v", current, task)
 	}
 }
 

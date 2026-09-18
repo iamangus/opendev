@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/iamangus/code-mcp/internal/dispatcher"
 	"github.com/iamangus/code-mcp/internal/outbox"
@@ -92,11 +93,6 @@ func applyWriter(ctx context.Context, run dispatcher.DispatchRun, config Config)
 	if response.ValidationEvidence == nil {
 		return fmt.Errorf("writer response omitted validation_evidence")
 	}
-	if response.Status == "blocked" {
-		job, err := config.Controller.BlockTask(run.JobID, run.TaskKey, response.Reason)
-		notify(config, job, outbox.EventBlocked+":"+run.TaskKey, response.Summary, response.Reason)
-		return err
-	}
 	job, err := config.Store.Get(run.JobID)
 	if err != nil {
 		return err
@@ -104,6 +100,9 @@ func applyWriter(ctx context.Context, run dispatcher.DispatchRun, config Config)
 	task := findTask(job, run.TaskKey)
 	if task == nil || task.WriterRunID != run.RunID {
 		return fmt.Errorf("writer run does not own task %q", run.TaskKey)
+	}
+	if response.Status == "blocked" {
+		return applyWriterBlocked(ctx, run, config, job, task, response)
 	}
 	if task.Status == pipeline.TaskReviewing {
 		if task.ReviewerRunID != "" {
@@ -153,6 +152,59 @@ func applyWriter(ctx context.Context, run dispatcher.DispatchRun, config Config)
 		return err
 	}
 	job, err = config.Controller.RecordWriterCompletion(job.ID, task.Key, run.RunID, sha, *response.ValidationEvidence)
+	if err != nil {
+		return err
+	}
+	task = findTask(job, task.Key)
+	review, err := config.Dispatcher.StartReviewer(ctx, job, task)
+	if err != nil {
+		return err
+	}
+	_, err = config.Controller.StartReviewer(job.ID, task.Key, review.RunID)
+	return err
+}
+
+// applyWriterBlocked verifies a Writer's blocker claim against recorded
+// workspace tool failures before the claim may block the task. A claim with no
+// recorded tool failures in the run window is treated as fabricated: real work
+// is committed and submitted to review, while an empty worktree fails honestly.
+func applyWriterBlocked(ctx context.Context, run dispatcher.DispatchRun, config Config, job *pipeline.Job, task *pipeline.Task, response writerResponse) error {
+	if task.Status != pipeline.TaskWorking {
+		return nil
+	}
+	var failures []ToolFailureInfo
+	if config.WorktreeToolFailures != nil && task.WorktreePath != "" {
+		failures = config.WorktreeToolFailures(task.WorktreePath, run.StartedAt.Add(-time.Minute))
+	}
+	if len(failures) > 0 {
+		blocked, err := config.Controller.BlockTask(run.JobID, run.TaskKey, response.Reason)
+		if err != nil {
+			return err
+		}
+		notify(config, blocked, outbox.EventBlocked+":"+run.TaskKey, response.Summary, response.Reason)
+		return nil
+	}
+	if config.Logger != nil {
+		config.Logger.Warn("writer blocker claim unverified; no tool failures recorded", "job_id", run.JobID, "task", run.TaskKey, "claim", response.Reason)
+	}
+	hasChanges, err := config.Worktrees.HasChanges(task.WorktreePath)
+	if err != nil {
+		return err
+	}
+	if !hasChanges {
+		reason := fmt.Sprintf("writer reported blocked with no recorded tool failures and no worktree changes: %s", response.Reason)
+		blocked, err := config.Controller.BlockTask(run.JobID, run.TaskKey, reason)
+		if err != nil {
+			return err
+		}
+		notify(config, blocked, outbox.EventBlocked+":"+run.TaskKey, response.Summary, reason)
+		return nil
+	}
+	sha, err := config.Worktrees.Commit(task.WorktreePath)
+	if err != nil {
+		return err
+	}
+	job, err = config.Controller.RecordWriterCompletion(job.ID, task.Key, run.RunID, sha, append([]pipeline.ValidationEvidence(nil), *response.ValidationEvidence...))
 	if err != nil {
 		return err
 	}

@@ -263,6 +263,15 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 		),
 		Logger: logger,
 		Outbox: notificationOutbox,
+		WorktreeToolFailures: func(worktreePath string, since time.Time) []jobmcp.ToolFailureInfo {
+			state := workspaceStateFor(worktreePath, logger)
+			recorded := state.FailuresSince(since)
+			info := make([]jobmcp.ToolFailureInfo, 0, len(recorded))
+			for _, f := range recorded {
+				info = append(info, jobmcp.ToolFailureInfo{Time: f.Time, Tool: f.Tool, Error: f.Error})
+			}
+			return info
+		},
 	}
 	// Agent outcomes are applied only by the dispatcher after its terminal
 	// response has been durably stored; role MCP endpoints are inspection-only.

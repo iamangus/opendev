@@ -50,6 +50,13 @@ type Registrar interface {
 	RegisterReference(jobID, repository, directory string)
 }
 
+// ToolFailureInfo describes one recorded workspace tool failure.
+type ToolFailureInfo struct {
+	Time  time.Time `json:"time"`
+	Tool  string    `json:"tool"`
+	Error string    `json:"error"`
+}
+
 type Config struct {
 	Store         *pipeline.Store
 	Controller    *pipeline.Controller
@@ -64,6 +71,9 @@ type Config struct {
 	AllowNoChecks bool
 	Logger        *slog.Logger
 	Outbox        *outbox.Store
+	// WorktreeToolFailures reports tool failures recorded for a worktree at or
+	// after the given time. Used to verify Writer blocker claims.
+	WorktreeToolFailures func(worktreePath string, since time.Time) []ToolFailureInfo
 }
 
 type ValidationRunner interface {
