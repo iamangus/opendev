@@ -92,7 +92,13 @@ func (s *Service) EnsureFoundation(ctx context.Context, name string) (*repositor
 	}
 	if rules, ok := s.github.(requiredCheckConfigurer); ok {
 		if err := rules.EnsureRequiredCheck(ctx, name, repo.DefaultBranch, "ci / OpenDev CI"); err != nil {
-			return nil, fmt.Errorf("configure foundation required check: %w", err)
+			if !errors.Is(err, github.ErrPlanLimited) {
+				return nil, fmt.Errorf("configure foundation required check: %w", err)
+			}
+			// GitHub plan limitation, for example branch protection on a private
+			// repository without GitHub Pro. OpenDev's controller still requires
+			// the check for every merge, so bootstrap continues without the
+			// GitHub-side enforcement layer.
 		}
 	}
 	record.Foundation = &repositorycatalog.Foundation{Version: foundation.Version, Branch: branch, PRNumber: pr.Number, PRURL: pr.HTMLURL, SHA: sha, Status: "pending", UpdatedAt: time.Now().UTC()}

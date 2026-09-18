@@ -8,6 +8,11 @@ import (
 // ErrNotFound indicates that GitHub did not find the requested resource.
 var ErrNotFound = errors.New("github: resource not found")
 
+// ErrPlanLimited indicates GitHub rejected the operation because the account or
+// repository plan does not support it, such as branch protection on a private
+// repository without GitHub Pro.
+var ErrPlanLimited = errors.New("github: operation unavailable on this GitHub plan")
+
 // Client is the interface for GitHub API operations.
 type Client interface {
 	ListOwnedRepositories(ctx context.Context) ([]Repository, error)

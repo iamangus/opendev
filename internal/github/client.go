@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -267,11 +268,14 @@ func (c *HTTPClient) EnsureRequiredCheck(ctx context.Context, repo, branch, chec
 		}
 		return fmt.Errorf("existing branch protection for %s requires an explicit update to add %q", branch, check)
 	}
-	if !errors.Is(err, ErrNotFound) {
-		return err
+	if errors.Is(err, ErrNotFound) {
+		payload := map[string]any{"required_status_checks": map[string]any{"strict": true, "contexts": []string{check}}, "enforce_admins": false, "required_pull_request_reviews": nil, "restrictions": nil, "required_linear_history": false, "allow_force_pushes": false, "allow_deletions": false, "block_creations": false, "required_conversation_resolution": false, "lock_branch": false, "allow_fork_syncing": false}
+		return c.do(ctx, http.MethodPut, fmt.Sprintf("/repos/%s/%s/branches/%s/protection", c.owner, repo, branch), payload, nil)
 	}
-	payload := map[string]any{"required_status_checks": map[string]any{"strict": true, "contexts": []string{check}}, "enforce_admins": false, "required_pull_request_reviews": nil, "restrictions": nil, "required_linear_history": false, "allow_force_pushes": false, "allow_deletions": false, "block_creations": false, "required_conversation_resolution": false, "lock_branch": false, "allow_fork_syncing": false}
-	return c.do(ctx, http.MethodPut, fmt.Sprintf("/repos/%s/%s/branches/%s/protection", c.owner, repo, branch), payload, nil)
+	if strings.Contains(err.Error(), ": 403 ") {
+		return fmt.Errorf("%w: %v", ErrPlanLimited, err)
+	}
+	return err
 }
 
 func (c *HTTPClient) do(ctx context.Context, method, path string, reqBody any, out any) error {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/iamangus/code-mcp/internal/github"
@@ -201,5 +202,64 @@ func TestLookupDoesNotSyncStaleCatalogEntry(t *testing.T) {
 	record, err := service.Lookup(context.Background(), "missing")
 	if err != nil || record != nil || len(manager.syncURLs) != 0 {
 		t.Fatalf("Lookup = %+v, %v; sync=%v", record, err, manager.syncURLs)
+	}
+}
+
+type foundationGitHub struct {
+	fakeGitHub
+	pr          *github.PR
+	ensureErr   error
+	ensureCalls int
+}
+
+func (f *foundationGitHub) CreatePR(context.Context, github.CreatePROptions) (*github.PR, error) {
+	return f.pr, nil
+}
+
+func (f *foundationGitHub) EnsureRequiredCheck(context.Context, string, string, string) error {
+	f.ensureCalls++
+	return f.ensureErr
+}
+
+func newFoundationService(t *testing.T, client *foundationGitHub) (*Service, *fakeManager, *repositorycatalog.Catalog) {
+	t.Helper()
+	manager := &fakeManager{root: filepath.Join(t.TempDir(), "repos")}
+	catalog, err := repositorycatalog.New(t.TempDir(), fakeMetadataReader{metadata: repositorycatalog.GitMetadata{OriginURL: "https://github.com/acme/drill.git", HeadSHA: "abc123"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := New(manager, catalog, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service, manager, catalog
+}
+
+func TestEnsureFoundationContinuesWhenProtectionIsPlanLimited(t *testing.T) {
+	client := &foundationGitHub{fakeGitHub: *newFakeGitHub(), pr: &github.PR{Number: 7, HTMLURL: "https://github.com/acme/drill/pull/7"}}
+	client.repositories["drill"] = &github.Repository{Name: "drill", FullName: "acme/drill", CloneURL: "https://github.com/acme/drill.git", DefaultBranch: "main", Private: true}
+	client.ensureErr = github.ErrPlanLimited
+	service, _, catalog := newFoundationService(t, client)
+
+	record, err := service.EnsureFoundation(context.Background(), "drill")
+	if !errors.Is(err, ErrFoundationPending) {
+		t.Fatalf("EnsureFoundation = %v, want ErrFoundationPending", err)
+	}
+	if client.ensureCalls != 1 || record.Foundation == nil || record.Foundation.Status != "pending" {
+		t.Fatalf("ensure=%d foundation=%+v", client.ensureCalls, record.Foundation)
+	}
+	if _, err := catalog.Get("drill"); err != nil {
+		t.Fatalf("catalog persist: %v", err)
+	}
+}
+
+func TestEnsureFoundationFailsOnUnexpectedProtectionError(t *testing.T) {
+	client := &foundationGitHub{fakeGitHub: *newFakeGitHub(), pr: &github.PR{Number: 7, HTMLURL: "https://github.com/acme/drill/pull/7"}}
+	client.repositories["drill"] = &github.Repository{Name: "drill", FullName: "acme/drill", CloneURL: "https://github.com/acme/drill.git", DefaultBranch: "main", Private: true}
+	client.ensureErr = errors.New("connection dropped")
+	service, _, _ := newFoundationService(t, client)
+
+	if _, err := service.EnsureFoundation(context.Background(), "drill"); err == nil || !strings.Contains(err.Error(), "configure foundation required check") {
+		t.Fatalf("EnsureFoundation = %v, want configure failure", err)
 	}
 }
