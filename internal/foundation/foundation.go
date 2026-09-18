@@ -27,7 +27,7 @@ permissions:
 
 jobs:
   ci:
-    uses: iamangus/opendev/.github/workflows/opendev-ci.yml@v1
+    uses: iamangus/opendev/.github/workflows/opendev-ci.yml@v2
     with:
       profile: auto
 `,
