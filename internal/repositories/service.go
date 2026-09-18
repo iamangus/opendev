@@ -131,6 +131,22 @@ func (s *Service) reconcileFoundation(ctx context.Context, name string, repo *gi
 	if err := s.github.PromotePR(ctx, name, pr.Number); err != nil {
 		return nil, err
 	}
+	// GitHub accepts the promotion before the draft flag is consistently visible
+	// to its merge endpoint. Wait for the read-after-write state instead of
+	// issuing a merge that is guaranteed to be rejected as still-draft.
+	for attempt := 0; attempt < 10; attempt++ {
+		pr, err = s.github.GetPR(ctx, name, pr.Number)
+		if err != nil {
+			return nil, err
+		}
+		if !pr.Draft {
+			break
+		}
+		if attempt == 9 {
+			return record, ErrFoundationPending
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 	if err := s.github.MergePR(ctx, name, pr.Number); err != nil {
 		return nil, err
 	}
