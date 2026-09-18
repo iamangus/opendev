@@ -46,8 +46,17 @@ func (m *Manager) CreateFoundationBranch(repo, branch, base string) (string, str
 		}
 	}
 	ctx := context.Background()
-	if err := m.git.Commit(ctx, dir, "chore: add OpenDev repository foundation"); err != nil {
-		return "", "", fmt.Errorf("commit foundation: %w", err)
+	status, err := m.git.Status(ctx, dir)
+	if err != nil {
+		return "", "", fmt.Errorf("read foundation status: %w", err)
+	}
+	// A retry can find the branch already carrying the exact foundation
+	// content. Treat a clean tree as already-committed instead of failing on
+	// an empty commit.
+	if strings.TrimSpace(status) != "" {
+		if err := m.git.Commit(ctx, dir, "chore: add OpenDev repository foundation"); err != nil {
+			return "", "", fmt.Errorf("commit foundation: %w", err)
+		}
 	}
 	if err := m.git.Push(ctx, dir, branch); err != nil {
 		return "", "", fmt.Errorf("push foundation branch: %w", err)

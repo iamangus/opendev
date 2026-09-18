@@ -83,12 +83,19 @@ func (s *Service) EnsureFoundation(ctx context.Context, name string) (*repositor
 	if err != nil {
 		return nil, err
 	}
-	pr, err := s.github.CreatePR(ctx, github.CreatePROptions{
-		Repo: name, Title: "chore: add OpenDev repository foundation", Head: branch, Base: repo.DefaultBranch,
-		Body: "Adds the versioned OpenDev CI and repository readiness contract.", Draft: true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create foundation pull request: %w", err)
+	// A prior attempt may have opened the foundation PR before failing later
+	// steps. Adopt it instead of creating a duplicate.
+	pr, err := s.github.FindPR(ctx, name, branch)
+	if errors.Is(err, github.ErrNotFound) {
+		pr, err = s.github.CreatePR(ctx, github.CreatePROptions{
+			Repo: name, Title: "chore: add OpenDev repository foundation", Head: branch, Base: repo.DefaultBranch,
+			Body: "Adds the versioned OpenDev CI and repository readiness contract.", Draft: true,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create foundation pull request: %w", err)
+		}
+	} else if err != nil {
+		return nil, err
 	}
 	if rules, ok := s.github.(requiredCheckConfigurer); ok {
 		if err := rules.EnsureRequiredCheck(ctx, name, repo.DefaultBranch, "ci / OpenDev CI"); err != nil {

@@ -42,17 +42,29 @@ func (m *Manager) SyncRepo(repoURL, name string, expectedDefaultBranch ...string
 		if branch == "" {
 			var err error
 			branch, err = m.git.DefaultBranch(ctx, repoDir)
-			if err != nil { return fmt.Errorf("determine primary mirror branch for %q: %w", name, err) }
+			if err != nil {
+				return fmt.Errorf("determine primary mirror branch for %q: %w", name, err)
+			}
 		} else {
 			remote, err := m.git.RemoteBranchExists(ctx, repoDir, branch)
-			if err != nil { return fmt.Errorf("verify remote default branch for %q: %w", name, err) }
-			if !remote { return fmt.Errorf("remote default branch %q for %q does not exist", branch, name) }
-			local, err := m.git.BranchExists(ctx, repoDir, branch)
-			if err != nil { return fmt.Errorf("verify local default branch for %q: %w", name, err) }
-			if !local {
-				if err := m.git.CreateBranch(ctx, repoDir, branch, "origin/"+branch); err != nil { return fmt.Errorf("create local default branch for %q: %w", name, err) }
+			if err != nil {
+				return fmt.Errorf("verify remote default branch for %q: %w", name, err)
 			}
-			if err := m.git.Checkout(ctx, repoDir, branch); err != nil { return fmt.Errorf("checkout default branch for %q: %w", name, err) }
+			if !remote {
+				return fmt.Errorf("remote default branch %q for %q does not exist", branch, name)
+			}
+			local, err := m.git.BranchExists(ctx, repoDir, branch)
+			if err != nil {
+				return fmt.Errorf("verify local default branch for %q: %w", name, err)
+			}
+			if !local {
+				if err := m.git.CreateBranch(ctx, repoDir, branch, "origin/"+branch); err != nil {
+					return fmt.Errorf("create local default branch for %q: %w", name, err)
+				}
+			}
+			if err := m.git.Checkout(ctx, repoDir, branch); err != nil {
+				return fmt.Errorf("checkout default branch for %q: %w", name, err)
+			}
 		}
 		if err := m.git.FastForward(ctx, repoDir, branch); err != nil {
 			return fmt.Errorf("fast-forward primary mirror for %q: %w", name, err)

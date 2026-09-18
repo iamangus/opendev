@@ -142,6 +142,22 @@ func (c *HTTPClient) CreatePR(ctx context.Context, opts CreatePROptions) (*PR, e
 	return &pr, nil
 }
 
+func (c *HTTPClient) FindPR(ctx context.Context, repo, headBranch string) (*PR, error) {
+	start := time.Now()
+	path := fmt.Sprintf("/repos/%s/%s/pulls?head=%s:%s&state=open", c.owner, repo, c.owner, headBranch)
+
+	var prs []PR
+	if err := c.do(ctx, http.MethodGet, path, nil, &prs); err != nil {
+		c.logger.Error("github: FindPR failed", "repo", repo, "head", headBranch, "error", err, "duration_ms", time.Since(start).Milliseconds())
+		return nil, err
+	}
+	if len(prs) == 0 {
+		return nil, ErrNotFound
+	}
+	c.logger.Info("github: open PR found", "repo", repo, "head", headBranch, "number", prs[0].Number, "duration_ms", time.Since(start).Milliseconds())
+	return &prs[0], nil
+}
+
 func (c *HTTPClient) UpdatePR(ctx context.Context, repo string, number int, title, body string) error {
 	start := time.Now()
 	path := fmt.Sprintf("/repos/%s/%s/pulls/%d", c.owner, repo, number)

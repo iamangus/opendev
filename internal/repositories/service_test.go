@@ -83,22 +83,25 @@ func (f *fakeGitHub) ForkPublicRepository(_ context.Context, owner, upstream, na
 }
 
 func (f *fakeGitHub) CreatePR(context.Context, github.CreatePROptions) (*github.PR, error) {
-	return nil, errors.New("not implemented")
+	return nil, errors.New("not implemented: CREATEPR_MARKER")
+}
+func (f *fakeGitHub) FindPR(context.Context, string, string) (*github.PR, error) {
+	return nil, github.ErrNotFound
 }
 func (f *fakeGitHub) UpdatePR(context.Context, string, int, string, string) error {
-	return errors.New("not implemented")
+	return errors.New("not implemented: OTHER")
 }
 func (f *fakeGitHub) PromotePR(context.Context, string, int) error {
-	return errors.New("not implemented")
+	return errors.New("not implemented: OTHER")
 }
 func (f *fakeGitHub) GetPR(context.Context, string, int) (*github.PR, error) {
-	return nil, errors.New("not implemented")
+	return nil, errors.New("not implemented: GETPR")
 }
 func (f *fakeGitHub) GetPRChecks(context.Context, string, string) (*github.PRChecks, error) {
-	return nil, errors.New("not implemented")
+	return nil, errors.New("not implemented: GETPRCHECKS")
 }
 func (f *fakeGitHub) MergePR(context.Context, string, int) error {
-	return errors.New("not implemented")
+	return errors.New("not implemented: OTHER")
 }
 
 func newService(t *testing.T, client *fakeGitHub) (*Service, *fakeManager, *repositorycatalog.Catalog) {
@@ -210,9 +213,25 @@ type foundationGitHub struct {
 	pr          *github.PR
 	ensureErr   error
 	ensureCalls int
+	findResults []error
+	findCalls   int
+	createCalls int
 }
 
 func (f *foundationGitHub) CreatePR(context.Context, github.CreatePROptions) (*github.PR, error) {
+	f.createCalls++
+	return f.pr, nil
+}
+
+func (f *foundationGitHub) FindPR(context.Context, string, string) (*github.PR, error) {
+	if f.findCalls >= len(f.findResults) {
+		return nil, github.ErrNotFound
+	}
+	err := f.findResults[f.findCalls]
+	f.findCalls++
+	if err != nil {
+		return nil, err
+	}
 	return f.pr, nil
 }
 
@@ -247,6 +266,28 @@ func TestEnsureFoundationContinuesWhenProtectionIsPlanLimited(t *testing.T) {
 	}
 	if client.ensureCalls != 1 || record.Foundation == nil || record.Foundation.Status != "pending" {
 		t.Fatalf("ensure=%d foundation=%+v", client.ensureCalls, record.Foundation)
+	}
+	if _, err := catalog.Get("drill"); err != nil {
+		t.Fatalf("catalog persist: %v", err)
+	}
+}
+
+func TestEnsureFoundationRetriesAdoptExistingFoundationPR(t *testing.T) {
+	client := &foundationGitHub{fakeGitHub: *newFakeGitHub(), pr: &github.PR{Number: 7, HTMLURL: "https://github.com/acme/drill/pull/7"}}
+	client.repositories["drill"] = &github.Repository{Name: "drill", FullName: "acme/drill", CloneURL: "https://github.com/acme/drill.git", DefaultBranch: "main", Private: true}
+	client.ensureErr = github.ErrPlanLimited
+	client.findResults = []error{nil}
+	service, _, catalog := newFoundationService(t, client)
+
+	record, err := service.EnsureFoundation(context.Background(), "drill")
+	if !errors.Is(err, ErrFoundationPending) {
+		t.Fatalf("EnsureFoundation = %v, want ErrFoundationPending", err)
+	}
+	if client.createCalls != 0 || client.findCalls != 1 || client.ensureCalls != 1 {
+		t.Fatalf("create=%d find=%d ensure=%d", client.createCalls, client.findCalls, client.ensureCalls)
+	}
+	if record.Foundation == nil || record.Foundation.PRNumber != 7 || record.Foundation.Status != "pending" {
+		t.Fatalf("foundation = %+v", record.Foundation)
 	}
 	if _, err := catalog.Get("drill"); err != nil {
 		t.Fatalf("catalog persist: %v", err)

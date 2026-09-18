@@ -20,6 +20,8 @@ type FakeClient struct {
 	ForkPublicRepositoryError   error
 	CreatePRResult              *PR
 	CreatePRError               error
+	FindPRResult                *PR
+	FindPRError                 error
 	UpdatePRError               error
 	PromotePRError              error
 	GetPRResult                 *PR
@@ -43,6 +45,7 @@ func NewFakeClient() *FakeClient {
 		CreateRepositoryResult:      &Repository{Name: "test", FullName: "test/test", CloneURL: "https://github.com/test/test.git", DefaultBranch: "main"},
 		ForkPublicRepositoryResult:  &Repository{Name: "test", FullName: "test/test", CloneURL: "https://github.com/test/test.git", DefaultBranch: "main", Fork: true},
 		CreatePRResult:              &PR{Number: 1, HTMLURL: "https://github.com/test/test/pull/1"},
+		FindPRError:                 ErrNotFound,
 		GetPRResult:                 &PR{Number: 1, HTMLURL: "https://github.com/test/test/pull/1"},
 	}
 }
@@ -80,6 +83,13 @@ func (f *FakeClient) CreatePR(_ context.Context, opts CreatePROptions) (*PR, err
 	defer f.mu.Unlock()
 	f.Calls = append(f.Calls, FakeCall{Method: "CreatePR", Args: []any{opts}})
 	return f.CreatePRResult, f.CreatePRError
+}
+
+func (f *FakeClient) FindPR(_ context.Context, repo, headBranch string) (*PR, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, FakeCall{Method: "FindPR", Args: []any{repo, headBranch}})
+	return f.FindPRResult, f.FindPRError
 }
 
 func (f *FakeClient) UpdatePR(_ context.Context, repo string, number int, title, body string) error {
