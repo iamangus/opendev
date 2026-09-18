@@ -156,10 +156,45 @@ func (c *HTTPClient) UpdatePR(ctx context.Context, repo string, number int, titl
 
 func (c *HTTPClient) PromotePR(ctx context.Context, repo string, number int) error {
 	start := time.Now()
-	path := fmt.Sprintf("/repos/%s/%s/pulls/%d", c.owner, repo, number)
-	payload := map[string]any{"draft": false}
-
-	if err := c.do(ctx, http.MethodPatch, path, payload, nil); err != nil {
+	pr, err := c.GetPR(ctx, repo, number)
+	if err != nil {
+		c.logger.Error("github: PromotePR failed", "repo", repo, "number", number, "error", err, "duration_ms", time.Since(start).Milliseconds())
+		return err
+	}
+	if pr.NodeID == "" {
+		err := fmt.Errorf("promote pull request #%d: missing GraphQL node ID", number)
+		c.logger.Error("github: PromotePR failed", "repo", repo, "number", number, "error", err, "duration_ms", time.Since(start).Milliseconds())
+		return err
+	}
+	// The REST PATCH draft:false transition is not reliably observable to
+	// follow-up REST reads. The GraphQL ready-for-review mutation is the
+	// authoritative promotion path.
+	payload := map[string]any{
+		"query": `mutation($id: ID!) {
+			convertPullRequestToReadyForReview(input: {pullRequestId: $id}) {
+				pullRequest { isDraft }
+			}
+		}`,
+		"variables": map[string]any{"id": pr.NodeID},
+	}
+	var result struct {
+		Data struct {
+			ConvertPullRequestToReadyForReview struct {
+				PullRequest struct {
+					IsDraft bool `json:"isDraft"`
+				} `json:"pullRequest"`
+			} `json:"convertPullRequestToReadyForReview"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/graphql", payload, &result); err != nil {
+		c.logger.Error("github: PromotePR failed", "repo", repo, "number", number, "error", err, "duration_ms", time.Since(start).Milliseconds())
+		return err
+	}
+	if len(result.Errors) > 0 {
+		err := fmt.Errorf("github promote pull request #%d: %s", number, result.Errors[0].Message)
 		c.logger.Error("github: PromotePR failed", "repo", repo, "number", number, "error", err, "duration_ms", time.Since(start).Milliseconds())
 		return err
 	}

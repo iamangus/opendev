@@ -48,6 +48,7 @@ type CreatePROptions struct {
 // PR represents a GitHub pull request.
 type PR struct {
 	Number  int    `json:"number"`
+	NodeID  string `json:"node_id"`
 	HTMLURL string `json:"html_url"`
 	State   string `json:"state"`
 	Merged  bool   `json:"merged"`

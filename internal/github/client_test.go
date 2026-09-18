@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -275,16 +276,35 @@ func TestHTTPClient_UpdatePR(t *testing.T) {
 
 func TestHTTPClient_PromotePR(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPatch {
-			t.Errorf("expected PATCH, got %s", r.Method)
+		switch r.Method {
+		case http.MethodGet:
+			if r.URL.Path != "/repos/owner/myrepo/pulls/42" {
+				t.Errorf("unexpected path: %s", r.URL.Path)
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"number":42,"node_id":"PR_nodeid42","draft":true}`))
+		case http.MethodPost:
+			if r.URL.Path != "/graphql" {
+				t.Errorf("unexpected path: %s", r.URL.Path)
+			}
+			var body struct {
+				Query     string `json:"query"`
+				Variables struct {
+					ID string `json:"id"`
+				} `json:"variables"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			if !strings.Contains(body.Query, "convertPullRequestToReadyForReview") {
+				t.Errorf("expected ready-for-review mutation, got %q", body.Query)
+			}
+			if body.Variables.ID != "PR_nodeid42" {
+				t.Errorf("expected PR node ID, got %q", body.Variables.ID)
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"data":{"convertPullRequestToReadyForReview":{"pullRequest":{"isDraft":false}}}}`))
+		default:
+			t.Errorf("unexpected method: %s", r.Method)
 		}
-		var body map[string]any
-		json.NewDecoder(r.Body).Decode(&body)
-		if body["draft"] != false {
-			t.Errorf("expected draft=false, got %v", body["draft"])
-		}
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{}`))
 	}))
 	defer srv.Close()
 
