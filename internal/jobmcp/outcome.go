@@ -359,12 +359,8 @@ func applyHolistic(ctx context.Context, run dispatcher.DispatchRun, config Confi
 		return err
 	}
 	if verdict == pipeline.ReviewChangesRequested {
-		rounds, updated, err := config.Store.IncrementHolisticRounds(job.ID)
-		if err != nil {
-			return err
-		}
-		if rounds > maxHolisticRemediationRounds {
-			reason := fmt.Sprintf("holistic review requested changes in %d remediation rounds; stopping", rounds-1)
+		if job.HolisticRounds > maxHolisticRemediationRounds {
+			reason := fmt.Sprintf("holistic review requested changes across %d rounds; stopping", job.HolisticRounds)
 			failed, failErr := config.Controller.FailJob(job.ID, reason)
 			notify(config, failed, outbox.EventFailed, response.Summary, reason)
 			return failErr

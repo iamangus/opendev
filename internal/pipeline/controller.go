@@ -381,12 +381,14 @@ func (s *Store) recordHolisticReview(jobID, runID, integrationSHA string, verdic
 
 // ResetHolisticRound clears a stale holistic verdict and run ownership after
 // CI passed for a new integration head, so a fresh holistic round can be
-// dispatched and recorded.
+// dispatched and recorded. The round count increments so each round owns a
+// unique dispatch identity.
 func (c *Controller) ResetHolisticRound(jobID string) (*Job, error) {
 	return c.store.updateJob(jobID, func(job *Job) error {
 		if job.Status != JobHolisticReviewing {
 			return transition(job.Status, "reset holistic round")
 		}
+		job.HolisticRounds++
 		job.HolisticReviewVerdict = ReviewPending
 		job.HolisticReviewRunID = ""
 		job.HolisticReviewSHA = ""
@@ -505,23 +507,6 @@ func (s *Store) updateTask(jobID, taskKey string, update func(*Job, *Task) error
 		}
 	}
 	return nil, fmt.Errorf("%w: task %q", ErrNotFound, taskKey)
-}
-
-// IncrementHolisticRounds counts holistic changes-requested rounds and returns
-// the new count so applyHolistic can bound remediation loops.
-func (s *Store) IncrementHolisticRounds(jobID string) (int, *Job, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	job, ok := s.jobs[jobID]
-	if !ok {
-		return 0, nil, ErrNotFound
-	}
-	job.HolisticRounds++
-	updated, err := s.saveAndCloneLocked(job)
-	if err != nil {
-		return 0, nil, err
-	}
-	return job.HolisticRounds, updated, nil
 }
 
 // ReopenIncompleteTasks returns tasks whose work the holistic review found

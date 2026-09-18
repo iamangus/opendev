@@ -23,7 +23,7 @@ func ObservePendingCI(ctx context.Context, config Config) error {
 			continue
 		}
 		if job.Status == pipeline.JobHolisticReviewing && job.CI != nil && job.CI.State == pipeline.CIPassed &&
-			(job.HolisticReviewRunID == "" || job.HolisticReviewVerdict != pipeline.ReviewPending) {
+			(job.HolisticReviewRunID == "" || job.HolisticReviewVerdict != pipeline.ReviewPending || job.HolisticReviewSHA != job.IntegrationSHA) {
 			// A restart, a failed dispatch, or a pre-fix stale verdict stranded the
 			// holistic round: CI has passed and the round must run again.
 			updated, err := config.Controller.ResetHolisticRound(job.ID)
