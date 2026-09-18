@@ -171,7 +171,7 @@ func (c *HTTPClient) PromotePR(ctx context.Context, repo string, number int) err
 	// authoritative promotion path.
 	payload := map[string]any{
 		"query": `mutation($id: ID!) {
-			convertPullRequestToReadyForReview(input: {pullRequestId: $id}) {
+			markPullRequestReadyForReview(input: {pullRequestId: $id}) {
 				pullRequest { isDraft }
 			}
 		}`,
@@ -179,11 +179,11 @@ func (c *HTTPClient) PromotePR(ctx context.Context, repo string, number int) err
 	}
 	var result struct {
 		Data struct {
-			ConvertPullRequestToReadyForReview struct {
+			MarkPullRequestReadyForReview struct {
 				PullRequest struct {
 					IsDraft bool `json:"isDraft"`
 				} `json:"pullRequest"`
-			} `json:"convertPullRequestToReadyForReview"`
+			} `json:"markPullRequestReadyForReview"`
 		} `json:"data"`
 		Errors []struct {
 			Message string `json:"message"`

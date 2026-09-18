@@ -294,7 +294,7 @@ func TestHTTPClient_PromotePR(t *testing.T) {
 				} `json:"variables"`
 			}
 			json.NewDecoder(r.Body).Decode(&body)
-			if !strings.Contains(body.Query, "convertPullRequestToReadyForReview") {
+			if !strings.Contains(body.Query, "markPullRequestReadyForReview") {
 				t.Errorf("expected ready-for-review mutation, got %q", body.Query)
 			}
 			if body.Variables.ID != "PR_nodeid42" {
