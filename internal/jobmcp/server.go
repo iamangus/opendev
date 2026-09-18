@@ -590,11 +590,24 @@ func ensureIntegrationWorktree(job *pipeline.Job, config Config) error {
 	return nil
 }
 
+// maxWriterAttempts bounds automatic Writer dispatches per task. retry_code_task
+// bypasses the cap because the operator explicitly asked for another attempt.
+const maxWriterAttempts = 10
+
 func startReadyWriters(ctx context.Context, job *pipeline.Job, config Config) ([]string, error) {
 	var runs []string
 	for i := range job.Plan.Tasks {
 		task := &job.Plan.Tasks[i]
 		if task.Status != pipeline.TaskPlanned || !taskDependenciesIntegrated(job, task) {
+			continue
+		}
+		if task.WriterAttempts >= maxWriterAttempts {
+			reason := fmt.Sprintf("writer attempt limit reached (%d automatic attempts); resume explicitly with retry_code_task if further work is justified", task.WriterAttempts)
+			job, err := config.Controller.BlockTask(job.ID, task.Key, reason)
+			if err != nil {
+				return nil, err
+			}
+			notify(config, job, outbox.EventBlocked+":"+task.Key, task.Title, reason)
 			continue
 		}
 		run, err := startWriter(ctx, job, task, config)

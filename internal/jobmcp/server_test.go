@@ -336,7 +336,11 @@ func TestVerifiedWriterBlockerBlocksTask(t *testing.T) {
 	worktrees := &fakeWorktrees{hasChanges: true}
 	config := Config{Store: store, Controller: pipeline.NewController(store), Dispatcher: dispatch, Worktrees: worktrees, Registrar: &fakeRegistrar{},
 		WorktreeToolFailures: func(path string, since time.Time) []ToolFailureInfo {
-			return []ToolFailureInfo{{Time: time.Now().UTC(), Tool: "search_and_replace", Error: "revision mismatch"}}
+			return []ToolFailureInfo{
+				{Time: time.Now().UTC(), Tool: "search_and_replace", Error: "revision mismatch"},
+				{Time: time.Now().UTC(), Tool: "search_and_replace", Error: "revision mismatch again"},
+				{Time: time.Now().UTC(), Tool: "read_file", Error: "unreadable"},
+			}
 		}}
 	if _, err := startReadyWriters(context.Background(), job, config); err != nil {
 		t.Fatal(err)
