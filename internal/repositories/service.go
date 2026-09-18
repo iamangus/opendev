@@ -19,6 +19,9 @@ type repositoryManager interface {
 	RepoDir(repo string) string
 	CreateFoundationBranch(repo, branch, base string) (string, string, error)
 }
+type requiredCheckConfigurer interface {
+	EnsureRequiredCheck(context.Context, string, string, string) error
+}
 
 // ErrFoundationPending indicates that a repository foundation PR is awaiting CI.
 var ErrFoundationPending = errors.New("repository foundation is pending")
@@ -86,6 +89,11 @@ func (s *Service) EnsureFoundation(ctx context.Context, name string) (*repositor
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create foundation pull request: %w", err)
+	}
+	if rules, ok := s.github.(requiredCheckConfigurer); ok {
+		if err := rules.EnsureRequiredCheck(ctx, name, repo.DefaultBranch, "OpenDev CI"); err != nil {
+			return nil, fmt.Errorf("configure foundation required check: %w", err)
+		}
 	}
 	record.Foundation = &repositorycatalog.Foundation{Version: foundation.Version, Branch: branch, PRNumber: pr.Number, PRURL: pr.HTMLURL, SHA: sha, Status: "pending", UpdatedAt: time.Now().UTC()}
 	if _, err := s.catalog.Save(*record); err != nil {

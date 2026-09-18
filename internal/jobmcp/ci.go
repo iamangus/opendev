@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/iamangus/code-mcp/internal/ciobserver"
+	"github.com/iamangus/code-mcp/internal/outbox"
 	"github.com/iamangus/code-mcp/internal/pipeline"
 )
 
@@ -37,7 +38,10 @@ func ObservePendingCI(ctx context.Context, config Config) error {
 			return fmt.Errorf("record CI state for job %s: %w", job.ID, err)
 		}
 		switch state {
+		case pipeline.CIPending:
+			notify(config, updated, outbox.EventCIPending, "Required GitHub Actions checks are pending", "")
 		case pipeline.CIPassed:
+			notify(config, updated, outbox.EventCIPassed, "Required GitHub Actions checks passed", "")
 			run, err := config.Dispatcher.StartHolistic(ctx, updated)
 			if err != nil {
 				return fmt.Errorf("start holistic review after CI for job %s: %w", job.ID, err)
@@ -46,14 +50,17 @@ func ObservePendingCI(ctx context.Context, config Config) error {
 				return fmt.Errorf("record holistic review after CI for job %s: %w", job.ID, err)
 			}
 		case pipeline.CIFailed:
+			notify(config, updated, outbox.EventCIFailed, "Required GitHub Actions check failed", fingerprint)
 			var task *pipeline.Task
 			updated, task, err = config.Controller.StartCIRemediation(updated.ID, fingerprint, results)
 			if err != nil {
 				return fmt.Errorf("start CI remediation for job %s: %w", job.ID, err)
 			}
 			if task == nil {
+				notify(config, updated, outbox.EventCIBlocked, "Repeated identical CI failure", fingerprint)
 				continue
 			}
+			notify(config, updated, outbox.EventCIRemediating, "Started remediation for failed required CI", fingerprint)
 			if _, err := startReadyWriters(ctx, updated, config); err != nil {
 				return fmt.Errorf("start CI remediation writer for job %s: %w", job.ID, err)
 			}

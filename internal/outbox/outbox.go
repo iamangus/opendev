@@ -21,12 +21,17 @@ import (
 )
 
 const (
-	EventStarted   = "started"
-	EventBlocked   = "blocked"
-	EventPROpened  = "pr_opened"
-	EventMerged    = "merged"
-	EventFailed    = "failed"
-	EventCancelled = "cancelled"
+	EventStarted       = "started"
+	EventBlocked       = "blocked"
+	EventPROpened      = "pr_opened"
+	EventMerged        = "merged"
+	EventFailed        = "failed"
+	EventCancelled     = "cancelled"
+	EventCIPending     = "ci_pending"
+	EventCIFailed      = "ci_failed"
+	EventCIRemediating = "ci_remediating"
+	EventCIPassed      = "ci_passed"
+	EventCIBlocked     = "ci_blocked"
 )
 
 type Event struct {

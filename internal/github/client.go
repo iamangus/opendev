@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -210,6 +211,32 @@ func (c *HTTPClient) MergePR(ctx context.Context, repo string, number int) error
 	}
 	c.logger.Info("github: PR merged", "repo", repo, "number", number, "duration_ms", time.Since(start).Milliseconds())
 	return nil
+}
+
+// EnsureRequiredCheck protects an otherwise unprotected default branch with the
+// named required check. Existing protection is never overwritten implicitly.
+func (c *HTTPClient) EnsureRequiredCheck(ctx context.Context, repo, branch, check string) error {
+	var current struct {
+		RequiredStatusChecks *struct {
+			Contexts []string `json:"contexts"`
+		} `json:"required_status_checks"`
+	}
+	err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s/branches/%s/protection", c.owner, repo, branch), nil, &current)
+	if err == nil {
+		if current.RequiredStatusChecks != nil {
+			for _, context := range current.RequiredStatusChecks.Contexts {
+				if context == check {
+					return nil
+				}
+			}
+		}
+		return fmt.Errorf("existing branch protection for %s requires an explicit update to add %q", branch, check)
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	payload := map[string]any{"required_status_checks": map[string]any{"strict": true, "contexts": []string{check}}, "enforce_admins": false, "required_pull_request_reviews": nil, "restrictions": nil, "required_linear_history": false, "allow_force_pushes": false, "allow_deletions": false, "block_creations": false, "required_conversation_resolution": false, "lock_branch": false, "allow_fork_syncing": false}
+	return c.do(ctx, http.MethodPut, fmt.Sprintf("/repos/%s/%s/branches/%s/protection", c.owner, repo, branch), payload, nil)
 }
 
 func (c *HTTPClient) do(ctx context.Context, method, path string, reqBody any, out any) error {
