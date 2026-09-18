@@ -48,6 +48,12 @@ func ObservePendingCI(ctx context.Context, config Config) error {
 			notify(config, updated, outbox.EventCIPending, "Required GitHub Actions checks are pending", "")
 		case pipeline.CIPassed:
 			notify(config, updated, outbox.EventCIPassed, "Required GitHub Actions checks passed", "")
+			// A new head invalidates the previous holistic round. Clear stale verdict
+			// and run ownership so the fresh review can be dispatched and recorded.
+			updated, err = config.Controller.ResetHolisticRound(updated.ID)
+			if err != nil {
+				return fmt.Errorf("reset holistic round after CI for job %s: %w", job.ID, err)
+			}
 			run, err := config.Dispatcher.StartHolistic(ctx, updated)
 			if err != nil {
 				return fmt.Errorf("start holistic review after CI for job %s: %w", job.ID, err)

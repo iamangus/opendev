@@ -187,8 +187,9 @@ func (d *Dispatcher) StartHolistic(ctx context.Context, job *pipeline.Job) (*Dis
 	}
 	// Holistic review is the Reviewer's final job-level pass. Keeping a single
 	// reviewer identity prevents a model-provided optional ID from stranding a
-	// completed job after integration.
-	return d.start(ctx, job, RoleHolistic, "job", 1, job.ReviewerAgentID, fmt.Sprintf("Perform the holistic review for coding job %s at integration SHA %s. Your final structured response is authoritative; do not use a reporting or completion MCP tool.", job.ID, job.IntegrationSHA))
+	// completed job after integration. The attempt number is the holistic round
+	// so each review cycle owns a distinct durable dispatch.
+	return d.start(ctx, job, RoleHolistic, "job", job.HolisticRounds+1, job.ReviewerAgentID, fmt.Sprintf("Perform the holistic review for coding job %s at integration SHA %s. Your final structured response is authoritative; do not use a reporting or completion MCP tool.", job.ID, job.IntegrationSHA))
 }
 
 func taskMessage(action string, job *pipeline.Job, task *pipeline.Task) string {

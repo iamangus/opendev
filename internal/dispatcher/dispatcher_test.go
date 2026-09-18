@@ -140,7 +140,7 @@ func TestReconcileRetriesPersistedStartIntent(t *testing.T) {
 
 func TestReconcileContinuesAfterFailedStartIntent(t *testing.T) {
 	store := &memoryRunStore{runs: map[string]DispatchRun{
-		"a-stale": {TaskID: "a-stale", JobID: "job-1", Role: RoleHolistic, TaskKey: "job", AgentID: "missing", Status: "starting"},
+		"a-stale":    {TaskID: "a-stale", JobID: "job-1", Role: RoleHolistic, TaskKey: "job", AgentID: "missing", Status: "starting"},
 		"z-terminal": {TaskID: "z-terminal", JobID: "job-1", Role: RoleWriter, TaskKey: "task", AgentID: "writer", RunID: "run-1", Status: "completed", Response: `{"status":"completed"}`},
 	}}
 	var applied int

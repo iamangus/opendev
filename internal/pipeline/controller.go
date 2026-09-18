@@ -379,6 +379,21 @@ func (s *Store) recordHolisticReview(jobID, runID, integrationSHA string, verdic
 	return s.saveAndCloneLocked(job)
 }
 
+// ResetHolisticRound clears a stale holistic verdict and run ownership after
+// CI passed for a new integration head, so a fresh holistic round can be
+// dispatched and recorded.
+func (c *Controller) ResetHolisticRound(jobID string) (*Job, error) {
+	return c.store.updateJob(jobID, func(job *Job) error {
+		if job.Status != JobHolisticReviewing {
+			return transition(job.Status, "reset holistic round")
+		}
+		job.HolisticReviewVerdict = ReviewPending
+		job.HolisticReviewRunID = ""
+		job.HolisticReviewSHA = ""
+		return nil
+	})
+}
+
 func (s *Store) startHolisticReviewer(jobID, runID, integrationSHA string) (*Job, error) {
 	if strings.TrimSpace(runID) == "" || strings.TrimSpace(integrationSHA) == "" {
 		return nil, fmt.Errorf("%w: holistic reviewer run ID and integration SHA are required", ErrInvalidTransition)
@@ -454,6 +469,20 @@ func (s *Store) recordMerge(jobID string) (*Job, error) {
 		return nil, transition(job.Status, "record merge")
 	}
 	job.MergeState, job.Status = MergeMerged, JobPublished
+	return s.saveAndCloneLocked(job)
+}
+
+// updateJob mutates job-level state under the store lock.
+func (s *Store) updateJob(jobID string, update func(*Job) error) (*Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[jobID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if err := update(job); err != nil {
+		return nil, err
+	}
 	return s.saveAndCloneLocked(job)
 }
 
