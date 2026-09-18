@@ -289,6 +289,9 @@ func applyReview(ctx context.Context, run dispatcher.DispatchRun, config Config)
 			notify(config, job, outbox.EventBlocked+":"+run.TaskKey, "OpenDev stopped repeated review feedback", reason)
 			return err
 		}
+		if stop, err := enforceWriterAttemptLimit(job, task, config); stop || err != nil {
+			return err
+		}
 		_, err := startWriter(ctx, job, task, config)
 		return err
 	}

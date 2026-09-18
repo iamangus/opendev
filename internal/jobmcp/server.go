@@ -594,6 +594,21 @@ func ensureIntegrationWorktree(job *pipeline.Job, config Config) error {
 // bypasses the cap because the operator explicitly asked for another attempt.
 const maxWriterAttempts = 10
 
+// enforceWriterAttemptLimit blocks a task that has consumed its automatic
+// Writer attempts. It returns true when the task was blocked.
+func enforceWriterAttemptLimit(job *pipeline.Job, task *pipeline.Task, config Config) (bool, error) {
+	if task.WriterAttempts < maxWriterAttempts {
+		return false, nil
+	}
+	reason := fmt.Sprintf("writer attempt limit reached (%d automatic attempts); resume explicitly with retry_code_task if further work is justified", task.WriterAttempts)
+	blocked, err := config.Controller.BlockTask(job.ID, task.Key, reason)
+	if err != nil {
+		return false, err
+	}
+	notify(config, blocked, outbox.EventBlocked+":"+task.Key, task.Title, reason)
+	return true, nil
+}
+
 func startReadyWriters(ctx context.Context, job *pipeline.Job, config Config) ([]string, error) {
 	var runs []string
 	for i := range job.Plan.Tasks {
@@ -601,13 +616,10 @@ func startReadyWriters(ctx context.Context, job *pipeline.Job, config Config) ([
 		if task.Status != pipeline.TaskPlanned || !taskDependenciesIntegrated(job, task) {
 			continue
 		}
-		if task.WriterAttempts >= maxWriterAttempts {
-			reason := fmt.Sprintf("writer attempt limit reached (%d automatic attempts); resume explicitly with retry_code_task if further work is justified", task.WriterAttempts)
-			job, err := config.Controller.BlockTask(job.ID, task.Key, reason)
+		if stop, err := enforceWriterAttemptLimit(job, task, config); stop || err != nil {
 			if err != nil {
 				return nil, err
 			}
-			notify(config, job, outbox.EventBlocked+":"+task.Key, task.Title, reason)
 			continue
 		}
 		run, err := startWriter(ctx, job, task, config)
