@@ -102,8 +102,8 @@ func TestControllerResumesWriterBlockedTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := job.Plan.Tasks[0]; got.Status != TaskPlanned || got.WriterRunID != "" || got.WriterAttempts != 1 || got.BlockReason == "" {
-		t.Fatalf("blocked task not resumed with history preserved: %+v", got)
+	if got := job.Plan.Tasks[0]; got.Status != TaskPlanned || got.WriterRunID != "" || got.WriterAttempts != 1 || got.BlockReason != "" {
+		t.Fatalf("blocked task not resumed cleanly: %+v", got)
 	}
 	job, err = controller.StartTaskWork(job.ID, "one", "branch", "/work", "writer-2")
 	if err != nil {
