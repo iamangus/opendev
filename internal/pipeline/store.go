@@ -615,6 +615,15 @@ func (s *Store) load() error {
 		if job == nil || job.ID == "" {
 			return fmt.Errorf("decode pipeline state: invalid job")
 		}
+		// Block reasons describe only the current blocked state. Records saved
+		// before a resume may still carry a stale reason on a resumed task.
+		if job.Plan != nil {
+			for i := range job.Plan.Tasks {
+				if job.Plan.Tasks[i].Status != TaskBlocked {
+					job.Plan.Tasks[i].BlockReason = ""
+				}
+			}
+		}
 		s.jobs[job.ID] = job
 	}
 	return nil
