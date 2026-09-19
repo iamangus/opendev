@@ -132,6 +132,7 @@ func (c *Controller) ResumeBlockedWriter(jobID, taskKey string) (*Job, error) {
 			return transition(task.Status, "resume blocked writer")
 		}
 		task.WriterRunID = ""
+		task.BlockReason = ""
 		task.Status = TaskPlanned
 		job.Status = JobPlanned
 		return nil
@@ -146,6 +147,7 @@ func (c *Controller) ReopenNoChangesTask(jobID, taskKey string) (*Job, error) {
 			return transition(task.Status, "reopen no-changes task")
 		}
 		task.WriterRunID = ""
+		task.BlockReason = ""
 		task.Status = TaskPlanned
 		job.Status = JobPlanned
 		return nil
@@ -534,6 +536,7 @@ func (s *Store) ReopenIncompleteTasks(jobID string) (*Job, error) {
 			if task.WriterRunID != "" {
 				task.Status = TaskPlanned
 				task.WriterRunID = ""
+				task.BlockReason = ""
 				reopened++
 			}
 		}
