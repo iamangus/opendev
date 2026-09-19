@@ -105,6 +105,16 @@ func (c *Controller) StartCIRemediation(jobID, fingerprint string, checks []Chec
 	return c.store.startCIRemediation(jobID, fingerprint, checks)
 }
 
+// BeginCIReplan escalates a repeated identical CI failure to plan revision.
+func (c *Controller) BeginCIReplan(jobID, fingerprint string) (*Job, error) {
+	return c.store.BeginCIReplan(jobID, fingerprint)
+}
+
+// RevisePlan appends a planner revision's tasks to the job.
+func (c *Controller) RevisePlan(jobID string, plan Plan) (*Job, error) {
+	return c.store.RevisePlan(jobID, plan)
+}
+
 func (c *Controller) RecordMerge(jobID string) (*Job, error) { return c.store.recordMerge(jobID) }
 
 func (c *Controller) BlockTask(jobID, taskKey, reason string) (*Job, error) {

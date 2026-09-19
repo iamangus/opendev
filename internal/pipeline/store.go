@@ -27,6 +27,7 @@ const (
 	JobIntegrating       JobStatus = "integrating"
 	JobAwaitingCI        JobStatus = "awaiting_ci"
 	JobCIRemediating     JobStatus = "ci_remediating"
+	JobCIReplanning      JobStatus = "ci_replanning"
 	JobHolisticReviewing JobStatus = "holistic_reviewing"
 	JobReadyToPublish    JobStatus = "ready_to_publish"
 	JobPublished         JobStatus = "published"
@@ -215,6 +216,7 @@ type Job struct {
 	PullRequestBody       string              `json:"pull_request_body,omitempty"`
 	CI                    *CIRecord           `json:"ci,omitempty"`
 	CIFailureFingerprints []string            `json:"ci_failure_fingerprints,omitempty"`
+	CIReplanRounds        int                 `json:"ci_replan_rounds,omitempty"`
 	FoundationPending     bool                `json:"foundation_pending,omitempty"`
 	HolisticRounds        int                 `json:"holistic_rounds,omitempty"`
 	MergeState            MergeState          `json:"merge_state"`
@@ -316,18 +318,6 @@ func (s *Store) startCIRemediation(jobID, fingerprint string, checks []CheckResu
 	if job.Status != JobAwaitingCI || job.CI == nil || job.CI.State != CIFailed || job.CI.FailureFingerprint != fingerprint {
 		return nil, nil, transition(job.Status, "start CI remediation")
 	}
-	identical := 0
-	for _, prior := range job.CIFailureFingerprints {
-		if prior == fingerprint {
-			identical++
-		}
-	}
-	if identical >= 3 {
-		job.Status = JobFailed
-		job.Failure = "required CI returned the same failure three times; remediation stopped"
-		updated, err := s.saveAndCloneLocked(job)
-		return updated, nil, err
-	}
 	for i := range job.Plan.Tasks {
 		task := &job.Plan.Tasks[i]
 		if task.Kind == TaskRemediation && task.BaseSHA == job.CI.HeadSHA && task.BlockReason == fingerprint {
@@ -336,7 +326,7 @@ func (s *Store) startCIRemediation(jobID, fingerprint string, checks []CheckResu
 		}
 	}
 	key := fmt.Sprintf("ci-remediation-%d", len(job.Plan.Tasks)+1)
-	task := Task{Key: key, Kind: TaskRemediation, Title: "Fix failed required CI", Description: ciFailureDescription(checks), AcceptanceCriteria: []string{"The required CI failure is resolved", "The draft PR is updated with a reviewed fix"}, Status: TaskPlanned, Branch: job.IntegrationBranch, BaseSHA: job.CI.HeadSHA, ReviewVerdict: ReviewPending, BlockReason: fingerprint}
+	task := Task{Key: key, Kind: TaskRemediation, Title: "Fix failed required CI", Description: ciRemediationContext(job, checks), AcceptanceCriteria: []string{"The required CI failure is resolved", "The draft PR is updated with a reviewed fix"}, Status: TaskPlanned, Branch: job.IntegrationBranch, BaseSHA: job.CI.HeadSHA, ReviewVerdict: ReviewPending, BlockReason: fingerprint}
 	job.Plan.Tasks = append(job.Plan.Tasks, task)
 	job.Plan.IntegrationOrder = append(job.Plan.IntegrationOrder, key)
 	job.Status = JobCIRemediating
@@ -345,6 +335,115 @@ func (s *Store) startCIRemediation(jobID, fingerprint string, checks []CheckResu
 		return nil, nil, err
 	}
 	return updated, &task, nil
+}
+
+// BeginCIReplan escalates a repeated identical CI failure to the Planner for a
+// plan revision instead of dispatching another remediation Writer.
+func (s *Store) BeginCIReplan(jobID, fingerprint string) (*Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[jobID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if job.Status != JobAwaitingCI || job.CI == nil || job.CI.State != CIFailed || job.CI.FailureFingerprint != fingerprint {
+		return nil, transition(job.Status, "begin CI replan")
+	}
+	if job.CIReplanRounds >= maxCIReplanRounds {
+		job.Status = JobFailed
+		job.Failure = fmt.Sprintf("required CI returned the same failure %d times and %d planner revisions did not resolve it; remediation stopped", len(job.CIFailureFingerprints), job.CIReplanRounds)
+		return s.saveAndCloneLocked(job)
+	}
+	job.CIReplanRounds++
+	job.Status = JobCIReplanning
+	return s.saveAndCloneLocked(job)
+}
+
+const maxCIReplanRounds = 2
+
+// RevisePlan appends a Planner revision's tasks to the existing plan. Tasks
+// already integrated or in progress are preserved; new keys are namespaced so
+// revisions never collide with earlier work.
+func (s *Store) RevisePlan(id string, plan Plan) (*Job, error) {
+	if strings.TrimSpace(plan.Summary) == "" || len(plan.Tasks) == 0 {
+		return nil, fmt.Errorf("%w: summary and at least one task are required", ErrInvalidPlan)
+	}
+	keys := make(map[string]struct{}, len(plan.Tasks))
+	for _, task := range plan.Tasks {
+		if task.Kind == TaskValidation {
+			return nil, fmt.Errorf("task %q uses obsolete validation kind; testing runs through GitHub Actions after the draft PR", task.Key)
+		}
+		if task.Kind != "" && task.Kind != TaskImplementation {
+			return nil, fmt.Errorf("%w: task %q has invalid kind %q", ErrInvalidPlan, task.Key, task.Kind)
+		}
+		if task.Key == "" || task.Title == "" || task.Description == "" || len(task.AcceptanceCriteria) == 0 {
+			return nil, fmt.Errorf("%w: each task needs key, title, description, and acceptance criteria", ErrInvalidPlan)
+		}
+		if _, exists := keys[task.Key]; exists {
+			return nil, fmt.Errorf("%w: duplicate task key %q", ErrInvalidPlan, task.Key)
+		}
+		keys[task.Key] = struct{}{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if job.Plan == nil || job.Status != JobCIReplanning {
+		return nil, fmt.Errorf("%w: job is %s, expected %s", ErrInvalidJob, job.Status, JobCIReplanning)
+	}
+	round := job.CIReplanRounds
+	added := 0
+	for i := range plan.Tasks {
+		task := plan.Tasks[i]
+		task.Key = fmt.Sprintf("rev%d-%s", round, task.Key)
+		task.Status = TaskPlanned
+		task.ReviewVerdict = ReviewPending
+		job.Plan.Tasks = append(job.Plan.Tasks, task)
+		job.Plan.IntegrationOrder = append(job.Plan.IntegrationOrder, task.Key)
+		added++
+	}
+	if added == 0 {
+		return nil, fmt.Errorf("%w: plan revision added no tasks", ErrInvalidJob)
+	}
+	job.Status = JobPlanned
+	if err := s.saveLocked(); err != nil {
+		return nil, err
+	}
+	return cloneJob(job), nil
+}
+
+// ciRemediationContext gives the remediation Writer both the CI failure
+// evidence and the provenance of the integrated diff, so the fix addresses the
+// task-level intent rather than only the symptom.
+func ciRemediationContext(job *Job, checks []CheckResult) string {
+	var b strings.Builder
+	b.WriteString("Required CI failure evidence:\n")
+	b.WriteString(ciFailureDescription(checks))
+	b.WriteString("\n\nContext of the integrated tasks that produced this PR head:\n")
+	for i := range job.Plan.Tasks {
+		task := &job.Plan.Tasks[i]
+		if task.Status != TaskIntegrated && task.Status != TaskNoChanges {
+			continue
+		}
+		fmt.Fprintf(&b, "\n- %s (%s): %s\n", task.Key, task.Status, task.Title)
+		if task.LatestReview != nil && strings.TrimSpace(task.LatestReview.Summary) != "" {
+			summary := task.LatestReview.Summary
+			if len(summary) > 400 {
+				summary = summary[:400]
+			}
+			fmt.Fprintf(&b, "  Reviewer: %s — %s\n", task.LatestReview.Verdict, summary)
+		}
+		if len(task.AcceptanceCriteria) > 0 {
+			fmt.Fprintf(&b, "  Acceptance criteria: %s\n", strings.Join(task.AcceptanceCriteria, "; "))
+		}
+	}
+	context := b.String()
+	if len(context) > 6144 {
+		context = context[:6144]
+	}
+	return context
 }
 
 func ciFailureDescription(checks []CheckResult) string {

@@ -92,12 +92,17 @@ func listTools(t *testing.T, url string) map[string]bool {
 }
 
 type fakeDispatcher struct {
-	writerTasks   []pipeline.Task
-	reviewerTasks []pipeline.Task
+	writerTasks      []pipeline.Task
+	reviewerTasks    []pipeline.Task
+	plannerRevisions int
 }
 
 func (f *fakeDispatcher) StartPlanner(context.Context, *pipeline.Job) (*dispatcher.DispatchRun, error) {
 	return nil, fmt.Errorf("unexpected planner dispatch")
+}
+func (f *fakeDispatcher) StartPlannerRevision(_ context.Context, _ *pipeline.Job) (*dispatcher.DispatchRun, error) {
+	f.plannerRevisions++
+	return &dispatcher.DispatchRun{RunID: fmt.Sprintf("planner-rev-%d", f.plannerRevisions), TaskKey: "revision"}, nil
 }
 func (f *fakeDispatcher) StartWriter(_ context.Context, _ *pipeline.Job, task *pipeline.Task) (*dispatcher.DispatchRun, error) {
 	f.writerTasks = append(f.writerTasks, *task)
@@ -118,6 +123,7 @@ func (*fakeDispatcher) InspectJob(context.Context, string) ([]dispatcher.Dispatc
 type fakeWorktrees struct {
 	created    []string
 	hasChanges bool
+	headCommit string
 }
 
 func (f *fakeWorktrees) CreateWorktree(_, branch, _ string) (string, error) {
@@ -129,8 +135,13 @@ func (f *fakeWorktrees) HasChanges(string) (bool, error) { return f.hasChanges, 
 func (*fakeWorktrees) MergeTask(string, string, string) (string, error) {
 	return "integration-sha", nil
 }
-func (*fakeWorktrees) PushBranch(string, string) error                  { return nil }
-func (*fakeWorktrees) HeadCommit(string) (string, error)                { return "base-sha", nil }
+func (*fakeWorktrees) PushBranch(string, string) error { return nil }
+func (f *fakeWorktrees) HeadCommit(string) (string, error) {
+	if f.headCommit != "" {
+		return f.headCommit, nil
+	}
+	return "base-sha", nil
+}
 func (*fakeWorktrees) DiffRange(string, string, string) (string, error) { return "diff", nil }
 
 type fakeRegistrar struct{ branches []string }
@@ -401,6 +412,98 @@ func TestWriterAndReviewerOutcomesAdvanceStages(t *testing.T) {
 		t.Fatalf("integrated task did not enter draft PR CI: %+v", current)
 	}
 }
+
+func TestRepeatedIdenticalCIFailureEscalatesToPlanner(t *testing.T) {
+	store, err := pipeline.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.Create("repo", "directive", "main", "", "planner", "writer", "reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartPlanning(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	job, err = store.SubmitPlan(job.ID, pipeline.Plan{Summary: "plan", Tasks: []pipeline.Task{{Key: "one", Title: "One", Description: "Work", AcceptanceCriteria: []string{"works"}}}, IntegrationOrder: []string{"one"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch := &fakeDispatcher{}
+	github := githubpkg.NewFakeClient()
+	github.CreatePRResult = &githubpkg.PR{Number: 4, HTMLURL: "https://example.test/pr/4"}
+	github.GetPRResult = &githubpkg.PR{Number: 4, State: "open", Draft: true, Head: githubpkg.PRHead{SHA: "integration-sha"}}
+	github.GetPRChecksResult = &githubpkg.PRChecks{CheckRuns: []githubpkg.CheckRun{{Name: "ci / OpenDev CI", Status: "completed", Conclusion: "failure", Output: struct {
+		Title   string `json:"title,omitempty"`
+		Summary string `json:"summary,omitempty"`
+	}{Summary: "npm test failed: module not found"}}}}
+	worktrees := &fakeWorktrees{hasChanges: true}
+	config := Config{Store: store, Controller: pipeline.NewController(store), Dispatcher: dispatch, Worktrees: worktrees, Registrar: &fakeRegistrar{}, GitHub: github}
+	if _, err := startReadyWriters(context.Background(), job, config); err != nil {
+		t.Fatal(err)
+	}
+	handler := OutcomeHandler(config)
+	// First writer run integrates.
+	if err := handler(context.Background(), dispatcher.DispatchRun{JobID: job.ID, Role: dispatcher.RoleWriter, TaskKey: "one", RunID: "writer-one", Status: "completed", Response: `{"status":"completed","summary":"work done","changed_files":["a.go"],"validation_evidence":[]}`}); err != nil {
+		t.Fatal(err)
+	}
+	// Review approves; integrate.
+	if err := handler(context.Background(), dispatcher.DispatchRun{JobID: job.ID, Role: dispatcher.RoleReviewer, TaskKey: "one", RunID: "reviewer-one", Status: "completed", Response: `{"verdict":"approved","summary":"good","findings":[],"acceptance_criteria":[],"reason":""}`}); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := store.Get(job.ID)
+	if _, _, err := config.Controller.StartCIRemediation(current.ID, "fp-1", nil); err == nil {
+		t.Fatal("remediation requires awaiting CI state")
+	}
+	// First identical failure: remediation writer.
+	if err := ObservePendingCI(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+	current, _ = store.Get(job.ID)
+	remediationStarted := false
+	for i := range current.Plan.Tasks {
+		if current.Plan.Tasks[i].Kind == pipeline.TaskRemediation {
+			remediationStarted = true
+		}
+	}
+	if !remediationStarted {
+		t.Fatalf("first failure should start remediation: %+v", current.Plan.Tasks)
+	}
+	// Complete remediation and integrate a new head; same fingerprint again.
+	if err := handler(context.Background(), dispatcher.DispatchRun{JobID: job.ID, Role: dispatcher.RoleWriter, TaskKey: "ci-remediation-2", RunID: "writer-ci-remediation-2", Status: "completed", Response: `{"status":"completed","summary":"fixed","changed_files":["b.go"],"validation_evidence":[]}`}); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler(context.Background(), dispatcher.DispatchRun{JobID: job.ID, Role: dispatcher.RoleReviewer, TaskKey: "ci-remediation-2", RunID: "reviewer-ci-remediation-2", Status: "completed", Response: `{"verdict":"approved","summary":"good","findings":[],"acceptance_criteria":[],"reason":""}`}); err != nil {
+		t.Fatal(err)
+	}
+	// Second identical failure: planner revision, not another remediation task.
+	if err := ObservePendingCI(context.Background(), config); err != nil {
+		t.Fatal(err)
+	}
+	current, _ = store.Get(job.ID)
+	if current.Status != pipeline.JobCIReplanning || dispatch.plannerRevisions != 1 {
+		t.Fatalf("second identical failure should escalate to planner: status=%s revisions=%d", current.Status, dispatch.plannerRevisions)
+	}
+	// Planner revision appends namespaced tasks and dispatches their writers.
+	if err := handler(context.Background(), dispatcher.DispatchRun{JobID: job.ID, Role: dispatcher.RolePlanner, TaskKey: "revision", RunID: "planner-rev-1", Status: "completed", Response: `{"summary":"revised","tasks":[{"key":"root-cause","title":"Root cause","description":"fix root cause","acceptance_criteria":["CI passes"]}]}`}); err != nil {
+		t.Fatal(err)
+	}
+	current, _ = store.Get(job.ID)
+	if current.Status != pipeline.JobWorking {
+		t.Fatalf("revision should dispatch its writers: %s", current.Status)
+	}
+	var revisionTask *pipeline.Task
+	for i := range current.Plan.Tasks {
+		if current.Plan.Tasks[i].Key == "rev1-root-cause" {
+			revisionTask = &current.Plan.Tasks[i]
+		}
+	}
+	if revisionTask == nil || revisionTask.Status != pipeline.TaskWorking || revisionTask.WriterAttempts != 1 {
+		t.Fatalf("revision task not dispatched: %+v", current.Plan.Tasks)
+	}
+}
+
+// The re-plan cap itself is covered in the pipeline store tests.
 
 func TestStartReadyWritersReleasesOnlyIntegratedDependencies(t *testing.T) {
 	_, _, job := approvedJob(t)

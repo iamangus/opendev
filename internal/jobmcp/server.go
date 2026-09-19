@@ -24,6 +24,7 @@ import (
 
 type Dispatcher interface {
 	StartPlanner(context.Context, *pipeline.Job) (*dispatcher.DispatchRun, error)
+	StartPlannerRevision(context.Context, *pipeline.Job) (*dispatcher.DispatchRun, error)
 	StartWriter(context.Context, *pipeline.Job, *pipeline.Task) (*dispatcher.DispatchRun, error)
 	StartReviewer(context.Context, *pipeline.Job, *pipeline.Task) (*dispatcher.DispatchRun, error)
 	StartHolistic(context.Context, *pipeline.Job) (*dispatcher.DispatchRun, error)

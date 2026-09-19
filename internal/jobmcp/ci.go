@@ -80,6 +80,29 @@ func ObservePendingCI(ctx context.Context, config Config) error {
 			}
 		case pipeline.CIFailed:
 			notify(config, updated, outbox.EventCIFailed, "Required GitHub Actions check failed", fingerprint)
+			identical := 0
+			for _, prior := range updated.CIFailureFingerprints {
+				if prior == fingerprint {
+					identical++
+				}
+			}
+			if identical >= 2 {
+				// The same failure survived a remediation Writer: escalate to the
+				// Planner for a plan revision instead of another patch attempt.
+				updated, err = config.Controller.BeginCIReplan(updated.ID, fingerprint)
+				if err != nil {
+					return fmt.Errorf("begin CI replan for job %s: %w", job.ID, err)
+				}
+				notify(config, updated, outbox.EventCIRemediating, "Repeated identical CI failure; escalating to planner revision", fingerprint)
+				if updated.Status == pipeline.JobFailed {
+					notify(config, updated, outbox.EventFailed, updated.Failure, fingerprint)
+					continue
+				}
+				if _, err := config.Dispatcher.StartPlannerRevision(ctx, updated); err != nil {
+					return fmt.Errorf("start planner revision for job %s: %w", job.ID, err)
+				}
+				continue
+			}
 			var task *pipeline.Task
 			updated, task, err = config.Controller.StartCIRemediation(updated.ID, fingerprint, results)
 			if err != nil {

@@ -157,6 +157,35 @@ func (d *Dispatcher) StartPlanner(ctx context.Context, job *pipeline.Job) (*Disp
 	return d.start(ctx, job, RolePlanner, "job", 1, job.PlannerAgentID, fmt.Sprintf("Plan coding job %s: %s. Your final structured response is authoritative; do not use a reporting or completion MCP tool.", job.ID, job.Directive))
 }
 
+// StartPlannerRevision asks the Planner to revise the plan after repeated
+// identical required-CI failures that remediation Writers could not resolve.
+func (d *Dispatcher) StartPlannerRevision(ctx context.Context, job *pipeline.Job) (*DispatchRun, error) {
+	if job == nil {
+		return nil, fmt.Errorf("job is required")
+	}
+	message := fmt.Sprintf("Revise the plan for coding job %s (%s). Required CI failed with the identical fingerprint after remediation Writers could not resolve it. Your final structured response is authoritative; do not use a reporting or completion MCP tool. Produce additional tasks (with focused descriptions and acceptance criteria) that fix the root cause of this CI failure on the existing integration branch: %s", job.ID, job.Directive, ciFailureEvidence(job))
+	return d.start(ctx, job, RolePlanner, "revision", job.CIReplanRounds+1, job.PlannerAgentID, message)
+}
+
+// ciFailureEvidence renders the durable CI failure for planner messages.
+func ciFailureEvidence(job *pipeline.Job) string {
+	if job == nil || job.CI == nil {
+		return "no CI record"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "head %s, state %s", job.CI.HeadSHA[:min(12, len(job.CI.HeadSHA))], job.CI.State)
+	if job.CI.FailureFingerprint != "" {
+		fmt.Fprintf(&b, ", fingerprint %s", job.CI.FailureFingerprint)
+	}
+	for _, check := range job.CI.Checks {
+		if strings.EqualFold(check.Conclusion, "success") {
+			continue
+		}
+		fmt.Fprintf(&b, "\n- %s: %s/%s %s", check.Name, check.Status, check.Conclusion, check.DetailsURL)
+	}
+	return b.String()
+}
+
 func (d *Dispatcher) StartWriter(ctx context.Context, job *pipeline.Job, task *pipeline.Task) (*DispatchRun, error) {
 	if job == nil {
 		return nil, fmt.Errorf("job is required")

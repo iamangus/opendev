@@ -525,6 +525,14 @@ func (d *lazyDispatcher) StartPlanner(ctx context.Context, job *pipeline.Job) (*
 	return inner.StartPlanner(ctx, job)
 }
 
+func (d *lazyDispatcher) StartPlannerRevision(ctx context.Context, job *pipeline.Job) (*dispatcher.DispatchRun, error) {
+	inner, err := d.withRoleServers(ctx, job, dispatcher.RolePlanner, "revision", job.CIReplanRounds+1, job.TargetBranch, false)
+	if err != nil {
+		return nil, err
+	}
+	return inner.StartPlannerRevision(ctx, job)
+}
+
 func (d *lazyDispatcher) StartWriter(ctx context.Context, job *pipeline.Job, task *pipeline.Task) (*dispatcher.DispatchRun, error) {
 	inner, err := d.withRoleServers(ctx, job, dispatcher.RoleWriter, task.Key, task.WriterAttempts+1, task.Branch, task.Kind != pipeline.TaskValidation)
 	if err != nil {

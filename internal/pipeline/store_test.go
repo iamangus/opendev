@@ -153,3 +153,54 @@ func TestSubmitPlanRejectsDependencyAfterDependent(t *testing.T) {
 		t.Fatalf("expected invalid plan, got %v", err)
 	}
 }
+
+func TestBeginCIReplanCapFailsJob(t *testing.T) {
+	store, controller, job := plannedController(t, t.TempDir(), []Task{task("one")}, []string{"one"})
+	if _, err := controller.StartTaskWork(job.ID, "one", "branch", "/work", "writer-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.RecordWriterCompletion(job.ID, "one", "writer-1", "commit-1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.RecordReview(job.ID, "one", "reviewer-1", ReviewApproved); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.StartIntegration(job.ID, "one"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.RecordIntegration(job.ID, "one", "integration-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.StartCI(job.ID, "head-1", []string{"ci"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.RecordCI(job.ID, "head-1", CIFailed, nil, "fp-x"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < maxCIReplanRounds; i++ {
+		updated, err := controller.BeginCIReplan(job.ID, "fp-x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if updated.Status != JobCIReplanning {
+			t.Fatalf("round %d should be replanning: %s", i+1, updated.Status)
+		}
+		// White-box: emulate the revision landing and a new identical failure.
+		store.mu.Lock()
+		store.jobs[job.ID].Status = JobAwaitingCI
+		store.mu.Unlock()
+		if _, err := controller.RecordCI(job.ID, "head-1", CIFailed, nil, "fp-x"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	updated, err := controller.BeginCIReplan(job.ID, "fp-x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != JobFailed {
+		t.Fatalf("re-plan cap should fail the job: %s", updated.Status)
+	}
+	if updated.CIReplanRounds != maxCIReplanRounds {
+		t.Fatalf("unexpected replan rounds: %d", updated.CIReplanRounds)
+	}
+}

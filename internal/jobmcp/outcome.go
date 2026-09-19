@@ -42,6 +42,18 @@ func applyPlan(ctx context.Context, run dispatcher.DispatchRun, config Config) e
 	if err := decodeResponse(run.Response, &plan); err != nil {
 		return fmt.Errorf("invalid planner response: %w", err)
 	}
+	if run.TaskKey == "revision" {
+		job, err := config.Store.RevisePlan(run.JobID, plan)
+		if err != nil {
+			return err
+		}
+		if err := ensureIntegrationWorktree(job, config); err != nil {
+			return err
+		}
+		notify(config, job, outbox.EventStarted+":revision", "Planner revised the plan after repeated CI failures", "")
+		_, err = startReadyWriters(ctx, job, config)
+		return err
+	}
 	job, err := config.Store.SubmitPlan(run.JobID, plan)
 	if err == pipeline.ErrPlanExists {
 		job, err = config.Store.Get(run.JobID)
