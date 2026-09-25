@@ -26,7 +26,7 @@ func TestRoleEndpointsExposeOnlyAssignedTools(t *testing.T) {
 		{RoleWriter, []string{"get_code_job", "get_task_diff"}},
 		{RoleReviewer, []string{"get_code_job", "get_task_diff"}},
 		{RoleHolistic, []string{"get_code_job"}},
-		{RoleAdmin, []string{"create_code_job", "fork_public_repository", "get_code_job", "get_code_job_inspection", "get_code_task_inspection", "get_task_diff", "lookup_repository", "provision_repository", "publish_approved_code_job", "reset_holistic_review", "retry_code_task", "start_holistic_rereview", "start_planning"}},
+		{RoleAdmin, []string{"create_code_job", "fork_public_repository", "get_code_job", "get_code_job_inspection", "get_code_task_inspection", "get_task_diff", "lookup_repository", "migrate_repository_foundation", "provision_repository", "publish_approved_code_job", "reset_holistic_review", "retry_code_task", "start_holistic_rereview", "start_planning"}},
 	} {
 		t.Run(string(tc.role), func(t *testing.T) {
 			ts := httptest.NewServer(NewRole(Config{}, tc.role))
@@ -89,6 +89,59 @@ func listTools(t *testing.T, url string) map[string]bool {
 		tools[tool.Name] = true
 	}
 	return tools
+}
+
+func callAdminTool(t *testing.T, config Config, name, args string) string {
+	t.Helper()
+	srv := httptest.NewServer(NewRole(config, RoleAdmin))
+	defer srv.Close()
+	post := func(body, session string) (*http.Response, string) {
+		req, err := http.NewRequest(http.MethodPost, srv.URL, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		if session != "" {
+			req.Header.Set("Mcp-Session-Id", session)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp, string(data)
+	}
+	initialized, _ := post(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}`, "")
+	_, result := post(fmt.Sprintf(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":%q,"arguments":%s}}`, name, args), initialized.Header.Get("Mcp-Session-Id"))
+	return result
+}
+
+func TestAdminRejectsUnstartableJobsBeforeChangingState(t *testing.T) {
+	store, err := pipeline.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := callAdminTool(t, Config{Store: store}, "create_code_job", `{"repository":"repo","directive":"work"}`)
+	if len(store.List()) != 0 || !strings.Contains(result, "planner_agent_id") {
+		t.Fatalf("job without roles was accepted: %s", result)
+	}
+	job, err := store.Create("repo", "directive", "main", "", "", "writer", "reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result = callAdminTool(t, Config{Store: store}, "start_planning", fmt.Sprintf(`{"job_id":%q}`, job.ID))
+	current, err := store.Get(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != pipeline.JobCreated || !strings.Contains(result, "no planner agent") {
+		t.Fatalf("unstartable job mutated: %+v, result=%s", current, result)
+	}
 }
 
 type fakeDispatcher struct {

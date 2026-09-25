@@ -13,7 +13,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /opendev ./cmd/opendev
 # ---- runtime ----
 FROM debian:bookworm-slim
 
-# git              – needed for clone/worktree operations via the management API
+# git              – needed for clone/worktree operations
 # ca-certificates  – needed for HTTPS clones
 # ripgrep          – fast ignore-aware search backend for the grep_search tool
 RUN apt-get update -qq \

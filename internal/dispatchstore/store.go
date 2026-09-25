@@ -54,8 +54,17 @@ func (s *Store) Save(_ context.Context, run dispatcher.DispatchRun) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previous, existed := s.runs[run.TaskID]
 	s.runs[run.TaskID] = run
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		if existed {
+			s.runs[run.TaskID] = previous
+		} else {
+			delete(s.runs, run.TaskID)
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) ListUnapplied(_ context.Context) ([]dispatcher.DispatchRun, error) {

@@ -25,7 +25,7 @@ type Client interface {
 	PromotePR(ctx context.Context, repo string, number int) error
 	GetPR(ctx context.Context, repo string, number int) (*PR, error)
 	GetPRChecks(ctx context.Context, repo, ref string) (*PRChecks, error)
-	MergePR(ctx context.Context, repo string, number int) error
+	MergePR(ctx context.Context, repo string, number int, expectedSHA ...string) error
 }
 
 // Repository contains the fields used to reconcile a GitHub repository.

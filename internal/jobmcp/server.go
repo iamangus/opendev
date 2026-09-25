@@ -300,7 +300,7 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 		})
 
 		s.AddTool(mcp.NewTool("provision_repository",
-			mcp.WithDescription("Create one new private owned GitHub repository, clone it locally, and catalog it. Call only after a semantic request clearly requires a new project."),
+			mcp.WithDescription("Create one new private owned GitHub repository, clone and catalog it, then start its one-time foundation PR. Call only after a semantic request clearly requires a new project."),
 			mcp.WithString("repository", mcp.Required(), mcp.Description("New repository name.")),
 			mcp.WithString("description", mcp.Description("Optional repository description.")),
 		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -312,7 +312,30 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 			repo, err := config.Repositories.ProvisionPrivate(ctx, name, req.GetString("description", ""))
+			if err != nil && !errors.Is(err, repositories.ErrFoundationPending) && !errors.Is(err, repositories.ErrFoundationBlocked) {
+				return toolError(err), nil
+			}
+			return toolJSON(repo), nil
+		})
+
+		s.AddTool(mcp.NewTool("migrate_repository_foundation",
+			mcp.WithDescription("Explicitly upgrade a ready owned non-fork repository to the current OpenDev foundation version. Creates a CI-gated PR; ordinary lookup and coding jobs never initiate migrations."),
+			mcp.WithString("repository", mcp.Required()),
+			mcp.WithString("target_version", mcp.Required(), mcp.Description("Current OpenDev foundation version.")),
+		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if config.Repositories == nil {
+				return toolError(fmt.Errorf("repository lifecycle is not configured; set GITHUB_TOKEN and GITHUB_OWNER")), nil
+			}
+			name, err := req.RequireString("repository")
 			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			version, err := req.RequireString("target_version")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			repo, err := config.Repositories.MigrateFoundation(ctx, name, version)
+			if err != nil && !errors.Is(err, repositories.ErrFoundationPending) && !errors.Is(err, repositories.ErrFoundationBlocked) {
 				return toolError(err), nil
 			}
 			return toolJSON(repo), nil
@@ -347,14 +370,14 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 		})
 
 		s.AddTool(mcp.NewTool("create_code_job",
-			mcp.WithDescription("Create a durable coding job and its integration branch record. This does not edit a repository or start an agent."),
+			mcp.WithDescription("Create a durable coding job and its integration branch record. For an owned non-fork repository, ensure its one-time foundation PR and hold the job until CI passes. This does not start an agent."),
 			mcp.WithString("repository", mcp.Required(), mcp.Description("Configured repository name.")),
 			mcp.WithString("directive", mcp.Required(), mcp.Description("High-level outcome to achieve.")),
 			mcp.WithString("target_branch", mcp.Description("Target branch. Defaults to main.")),
-			mcp.WithString("planner_agent_id", mcp.Description("AgentFoundry ID of the planner.")),
-			mcp.WithString("writer_agent_id", mcp.Description("AgentFoundry ID of the writer.")),
-			mcp.WithString("reviewer_agent_id", mcp.Description("AgentFoundry ID of the reviewer.")),
-		), func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			mcp.WithString("planner_agent_id", mcp.Required(), mcp.Description("AgentFoundry ID of the planner.")),
+			mcp.WithString("writer_agent_id", mcp.Required(), mcp.Description("AgentFoundry ID of the writer.")),
+			mcp.WithString("reviewer_agent_id", mcp.Required(), mcp.Description("AgentFoundry ID of the reviewer.")),
+		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			repository, err := req.RequireString("repository")
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
@@ -363,9 +386,34 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-			job, err := config.Store.Create(repository, directive, req.GetString("target_branch", "main"), "", req.GetString("planner_agent_id", ""), req.GetString("writer_agent_id", ""), req.GetString("reviewer_agent_id", ""))
+			plannerID, err := req.RequireString("planner_agent_id")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			writerID, err := req.RequireString("writer_agent_id")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			reviewerID, err := req.RequireString("reviewer_agent_id")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			var foundationErr error
+			if config.Repositories != nil {
+				_, foundationErr = config.Repositories.EnsureFoundation(ctx, repository)
+				if foundationErr != nil && !errors.Is(foundationErr, repositories.ErrFoundationPending) && !errors.Is(foundationErr, repositories.ErrFoundationBlocked) {
+					return toolError(fmt.Errorf("ensure repository foundation: %w", foundationErr)), nil
+				}
+			}
+			job, err := config.Store.Create(repository, directive, req.GetString("target_branch", "main"), "", plannerID, writerID, reviewerID)
 			if err != nil {
 				return toolError(err), nil
+			}
+			if foundationErr != nil {
+				job, err = config.Store.MarkFoundationPending(job.ID)
+				if err != nil {
+					return toolError(err), nil
+				}
 			}
 			return toolJSON(job), nil
 		})
@@ -413,6 +461,9 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 			if err != nil {
 				return toolError(err), nil
 			}
+			if job.PlannerAgentID == "" {
+				return toolError(fmt.Errorf("job %s has no planner agent; create the job with planner_agent_id", job.ID)), nil
+			}
 			if config.Repositories != nil {
 				repo, err := config.Repositories.Lookup(ctx, job.Repository)
 				if err != nil {
@@ -422,11 +473,15 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 					return toolError(fmt.Errorf("target repository %q is no longer available", job.Repository)), nil
 				}
 				if _, err := config.Repositories.EnsureFoundation(ctx, job.Repository); err != nil {
-					if errors.Is(err, repositories.ErrFoundationPending) {
+					if errors.Is(err, repositories.ErrFoundationPending) || errors.Is(err, repositories.ErrFoundationBlocked) {
 						if _, markErr := config.Store.MarkFoundationPending(job.ID); markErr != nil {
 							return toolError(markErr), nil
 						}
-						return toolJSON(map[string]any{"job_id": job.ID, "status": "foundation_pending"}), nil
+						status := "foundation_pending"
+						if errors.Is(err, repositories.ErrFoundationBlocked) {
+							status = "foundation_blocked"
+						}
+						return toolJSON(map[string]any{"job_id": job.ID, "status": status}), nil
 					}
 					return toolError(fmt.Errorf("ensure repository foundation before planning: %w", err)), nil
 				}
@@ -586,7 +641,7 @@ func publishApprovedJob(ctx context.Context, jobID string, config Config) (*pipe
 	if err := successfulChecks(checks, config.AllowNoChecks); err != nil {
 		return nil, fmt.Errorf("pull request #%d merge gate: %w", pr.Number, err)
 	}
-	if err := config.GitHub.MergePR(ctx, job.Repository, pr.Number); err != nil {
+	if err := config.GitHub.MergePR(ctx, job.Repository, pr.Number, pr.Head.SHA); err != nil {
 		return nil, fmt.Errorf("merge pull request #%d: %w", pr.Number, err)
 	}
 	merged, err := config.Controller.RecordMerge(job.ID)

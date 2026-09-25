@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -35,19 +36,22 @@ const (
 )
 
 type Event struct {
-	ID             string     `json:"id"`
-	Type           string     `json:"type"`
-	JobID          string     `json:"job_id"`
-	Status         string     `json:"status"`
-	Summary        string     `json:"summary"`
-	PullRequestURL string     `json:"pull_request_url,omitempty"`
-	Errors         string     `json:"errors,omitempty"`
-	CreatedAt      time.Time  `json:"created_at"`
-	Attempts       int        `json:"attempts"`
-	NextAttemptAt  time.Time  `json:"next_attempt_at"`
-	DeliveredAt    *time.Time `json:"delivered_at,omitempty"`
-	LastError      string     `json:"last_error,omitempty"`
+	ID              string     `json:"id"`
+	Type            string     `json:"type"`
+	JobID           string     `json:"job_id"`
+	Status          string     `json:"status"`
+	Summary         string     `json:"summary"`
+	PullRequestURL  string     `json:"pull_request_url,omitempty"`
+	Errors          string     `json:"errors,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	Attempts        int        `json:"attempts"`
+	NextAttemptAt   time.Time  `json:"next_attempt_at"`
+	DeliveredAt     *time.Time `json:"delivered_at,omitempty"`
+	LastError       string     `json:"last_error,omitempty"`
+	TerminalFailure bool       `json:"terminal_failure,omitempty"`
 }
+
+var errEventFailed = errors.New("Eve agent processing failed")
 
 type persisted struct {
 	Events []Event `json:"events"`
@@ -89,7 +93,11 @@ func (s *Store) Enqueue(event Event) error {
 	now := time.Now().UTC()
 	event.CreatedAt, event.NextAttemptAt = now, now
 	s.events[event.ID] = event
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		delete(s.events, event.ID)
+		return err
+	}
+	return nil
 }
 
 func (s *Store) due(now time.Time) []Event {
@@ -97,7 +105,7 @@ func (s *Store) due(now time.Time) []Event {
 	defer s.mu.Unlock()
 	var events []Event
 	for _, event := range s.events {
-		if event.DeliveredAt == nil && !event.NextAttemptAt.After(now) {
+		if event.DeliveredAt == nil && !event.TerminalFailure && !event.NextAttemptAt.After(now) {
 			events = append(events, event)
 		}
 	}
@@ -112,11 +120,16 @@ func (s *Store) delivered(id string) error {
 	if !ok {
 		return nil
 	}
+	previous := event
 	now := time.Now().UTC()
 	event.DeliveredAt = &now
 	event.LastError = ""
 	s.events[id] = event
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.events[id] = previous
+		return err
+	}
+	return nil
 }
 
 func (s *Store) failed(id string, err error) error {
@@ -126,12 +139,36 @@ func (s *Store) failed(id string, err error) error {
 	if !ok {
 		return nil
 	}
+	previous := event
 	event.Attempts++
 	event.LastError = err.Error()
 	delay := time.Second * time.Duration(1<<min(event.Attempts-1, 8))
 	event.NextAttemptAt = time.Now().UTC().Add(delay)
 	s.events[id] = event
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.events[id] = previous
+		return err
+	}
+	return nil
+}
+
+func (s *Store) failedTerminal(id string, reason error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	event, ok := s.events[id]
+	if !ok {
+		return nil
+	}
+	previous := event
+	event.Attempts++
+	event.TerminalFailure = true
+	event.LastError = reason.Error()
+	s.events[id] = event
+	if err := s.saveLocked(); err != nil {
+		s.events[id] = previous
+		return err
+	}
+	return nil
 }
 
 // Reconcile restores notifications whose state transition was persisted before a process crash.
@@ -197,13 +234,18 @@ func eventID(jobID, eventType string) string {
 
 type Deliverer struct {
 	store      *Store
+	jobs       *pipeline.Store
 	url, token string
 	client     *http.Client
 	logger     *slog.Logger
 }
 
-func NewDeliverer(store *Store, url, token string, logger *slog.Logger) *Deliverer {
-	return &Deliverer{store: store, url: strings.TrimSpace(url), token: strings.TrimSpace(token), client: &http.Client{Timeout: 10 * time.Second}, logger: logger}
+func NewDeliverer(store *Store, url, token string, logger *slog.Logger, jobs ...*pipeline.Store) *Deliverer {
+	d := &Deliverer{store: store, url: strings.TrimSpace(url), token: strings.TrimSpace(token), client: &http.Client{Timeout: 10 * time.Second}, logger: logger}
+	if len(jobs) > 0 {
+		d.jobs = jobs[0]
+	}
+	return d
 }
 
 // Start keeps delivery independent of request and agent execution paths.
@@ -214,20 +256,41 @@ func (d *Deliverer) Start(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
+		reconcileTicker := time.NewTicker(30 * time.Second)
+		defer reconcileTicker.Stop()
+		d.reconcile()
+		d.flush(ctx)
 		for {
-			d.flush(ctx)
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				d.flush(ctx)
+			case <-reconcileTicker.C:
+				d.reconcile()
 			}
 		}
 	}()
 }
 
+func (d *Deliverer) reconcile() {
+	if d.store == nil || d.jobs == nil {
+		return
+	}
+	if err := d.store.Reconcile(d.jobs.List()); err != nil && d.logger != nil {
+		d.logger.Warn("reconcile notification outbox", "error", err)
+	}
+}
+
 func (d *Deliverer) flush(ctx context.Context) {
 	for _, event := range d.store.due(time.Now().UTC()) {
 		if err := d.deliver(ctx, event); err != nil {
+			if errors.Is(err, errEventFailed) {
+				if saveErr := d.store.failedTerminal(event.ID, err); saveErr != nil && d.logger != nil {
+					d.logger.Warn("record terminal notification failure failed", "event_id", event.ID, "error", saveErr)
+				}
+				continue
+			}
 			if saveErr := d.store.failed(event.ID, err); saveErr != nil && d.logger != nil {
 				d.logger.Warn("record notification delivery failure failed", "event_id", event.ID, "error", saveErr)
 			}
@@ -263,7 +326,37 @@ func (d *Deliverer) deliver(ctx context.Context, event Event) error {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("webhook returned %s", resp.Status)
 	}
-	return nil
+	statusURL := strings.TrimSuffix(d.url, "/") + "/events/" + url.PathEscape(event.ID)
+	statusRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)
+	if err != nil {
+		return err
+	}
+	statusRequest.Header.Set("Authorization", "Bearer "+d.token)
+	statusResponse, err := d.client.Do(statusRequest)
+	if err != nil {
+		return err
+	}
+	defer statusResponse.Body.Close()
+	if statusResponse.StatusCode != http.StatusOK {
+		return fmt.Errorf("Eve event status returned %s", statusResponse.Status)
+	}
+	var status struct {
+		State     string `json:"state"`
+		LastError string `json:"last_error"`
+	}
+	if err := json.NewDecoder(statusResponse.Body).Decode(&status); err != nil {
+		return fmt.Errorf("decode Eve event status: %w", err)
+	}
+	switch status.State {
+	case "done":
+		return nil
+	case "failed":
+		return fmt.Errorf("%w: %s", errEventFailed, status.LastError)
+	case "pending", "leased":
+		return fmt.Errorf("Eve event is %s", status.State)
+	default:
+		return fmt.Errorf("unknown Eve event state %q", status.State)
+	}
 }
 
 func (s *Store) load() error {

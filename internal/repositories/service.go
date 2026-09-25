@@ -26,6 +26,9 @@ type requiredCheckConfigurer interface {
 // ErrFoundationPending indicates that a repository foundation PR is awaiting CI.
 var ErrFoundationPending = errors.New("repository foundation is pending")
 
+// ErrFoundationBlocked indicates that the foundation PR did not pass CI.
+var ErrFoundationBlocked = errors.New("repository foundation is blocked")
+
 // Service reconciles GitHub-owned repositories with local clones and the catalog.
 type Service struct {
 	manager repositoryManager
@@ -51,6 +54,9 @@ func New(manager repositoryManager, catalog *repositorycatalog.Catalog, githubCl
 			owners[owner] = struct{}{}
 		}
 	}
+	if len(owners) == 0 {
+		return nil, fmt.Errorf("at least one owned GitHub account is required")
+	}
 	return &Service{manager: manager, catalog: catalog, github: githubClient, owners: owners}, nil
 }
 
@@ -65,19 +71,81 @@ func (s *Service) EnsureFoundation(ctx context.Context, name string) (*repositor
 	if err != nil {
 		return nil, err
 	}
+	record, err := s.syncAndRefresh(ctx, name, repo)
+	if err != nil {
+		return nil, err
+	}
+	return s.ensureFoundation(ctx, name, repo, record)
+}
+
+func (s *Service) MigrateFoundation(ctx context.Context, name, targetVersion string) (*repositorycatalog.Record, error) {
+	if targetVersion != foundation.Version {
+		return nil, fmt.Errorf("target foundation version must be %s", foundation.Version)
+	}
+	name, err := repositoryName(name)
+	if err != nil {
+		return nil, err
+	}
+	repo, err := s.github.GetRepository(ctx, name)
+	if err != nil {
+		return nil, err
+	}
 	if !s.managed(repo) {
-		return nil, fmt.Errorf("repository %q is not an owned non-fork repository", name)
+		return nil, fmt.Errorf("foundation migration requires an owned non-fork repository")
 	}
 	record, err := s.syncAndRefresh(ctx, name, repo)
 	if err != nil {
 		return nil, err
 	}
+	if record.Foundation == nil {
+		return nil, fmt.Errorf("repository has no prior foundation; use provisioning or a coding job")
+	}
+	if record.Foundation.Version == targetVersion {
+		return s.ensureFoundation(ctx, name, repo, record)
+	}
+	if record.Foundation.Status != "ready" {
+		return nil, fmt.Errorf("prior foundation must be ready before migration")
+	}
+	migrating := *record
+	migrating.Foundation = nil
+	return s.beginFoundation(ctx, name, repo, &migrating)
+}
+
+func (s *Service) ReconcilePendingFoundations(ctx context.Context) error {
+	var firstErr error
+	for _, record := range s.catalog.List() {
+		if record.Foundation == nil || record.Foundation.PRNumber == 0 || record.Foundation.Status == "ready" {
+			continue
+		}
+		if _, err := s.EnsureFoundation(ctx, record.Name); err != nil && !errors.Is(err, ErrFoundationPending) && !errors.Is(err, ErrFoundationBlocked) && firstErr == nil {
+			firstErr = fmt.Errorf("reconcile repository %s foundation: %w", record.Name, err)
+		}
+	}
+	return firstErr
+}
+
+func (s *Service) ensureFoundation(ctx context.Context, name string, repo *github.Repository, record *repositorycatalog.Record) (*repositorycatalog.Record, error) {
+	if !s.managed(repo) {
+		return record, nil
+	}
 	if ready(record) {
+		return record, nil
+	}
+	if record.Foundation != nil && record.Foundation.Status == "ready" {
+		// A future foundation version requires an explicit migration, never an
+		// incidental job or catalog lookup.
 		return record, nil
 	}
 	if record.Foundation != nil && record.Foundation.PRNumber > 0 {
 		return s.reconcileFoundation(ctx, name, repo, record)
 	}
+	if record.Foundation != nil && record.Foundation.Version != "" && record.Foundation.Version != foundation.Version {
+		return record, ErrFoundationBlocked
+	}
+	return s.beginFoundation(ctx, name, repo, record)
+}
+
+func (s *Service) beginFoundation(ctx context.Context, name string, repo *github.Repository, record *repositorycatalog.Record) (*repositorycatalog.Record, error) {
 	branch := "opendev/foundation-" + foundation.Version
 	_, sha, err := s.manager.CreateFoundationBranch(name, branch, repo.DefaultBranch)
 	if err != nil {
@@ -120,13 +188,16 @@ func (s *Service) reconcileFoundation(ctx context.Context, name string, repo *gi
 	if err != nil {
 		return nil, err
 	}
-	if pr.Merged {
-		refreshed, err := s.syncAndRefresh(ctx, name, repo)
-		if err != nil {
+	if strings.EqualFold(pr.State, "closed") && !pr.Merged {
+		record.Foundation.Status = "blocked"
+		record.Foundation.UpdatedAt = time.Now().UTC()
+		if _, err := s.catalog.Save(*record); err != nil {
 			return nil, err
 		}
-		refreshed.Foundation = &repositorycatalog.Foundation{Version: foundation.Version, Branch: record.Foundation.Branch, PRNumber: pr.Number, PRURL: pr.HTMLURL, SHA: pr.Head.SHA, Status: "ready", UpdatedAt: time.Now().UTC()}
-		return s.catalog.Save(*refreshed)
+		return record, ErrFoundationBlocked
+	}
+	if pr.Head.SHA == "" {
+		return record, ErrFoundationPending
 	}
 	checks, err := s.github.GetPRChecks(ctx, name, pr.Head.SHA)
 	if err != nil {
@@ -135,11 +206,17 @@ func (s *Service) reconcileFoundation(ctx context.Context, name string, repo *gi
 	if foundationChecksFailed(checks) {
 		record.Foundation.Status = "blocked"
 		record.Foundation.UpdatedAt = time.Now().UTC()
-		_, saveErr := s.catalog.Save(*record)
-		return record, saveErr
+		if _, err := s.catalog.Save(*record); err != nil {
+			return nil, err
+		}
+		return record, ErrFoundationBlocked
 	}
 	if !foundationChecksSucceeded(checks) {
 		return record, ErrFoundationPending
+	}
+	verifiedSHA := pr.Head.SHA
+	if pr.Merged {
+		return s.markFoundationReady(ctx, name, repo, record, pr)
 	}
 	if err := s.github.PromotePR(ctx, name, pr.Number); err != nil {
 		return nil, err
@@ -152,26 +229,61 @@ func (s *Service) reconcileFoundation(ctx context.Context, name string, repo *gi
 		if err != nil {
 			return nil, err
 		}
+		if pr.Head.SHA != verifiedSHA {
+			return record, ErrFoundationPending
+		}
 		if !pr.Draft {
 			break
 		}
 		if attempt == 9 {
 			return record, ErrFoundationPending
 		}
-		time.Sleep(500 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
-	if err := s.github.MergePR(ctx, name, pr.Number); err != nil {
+	if err := s.github.MergePR(ctx, name, pr.Number, verifiedSHA); err != nil {
 		return nil, err
 	}
-	return s.reconcileFoundation(ctx, name, repo, record)
+	for attempt := 0; attempt < 10; attempt++ {
+		merged, err := s.github.GetPR(ctx, name, pr.Number)
+		if err != nil {
+			return nil, err
+		}
+		if merged.Merged {
+			if merged.Head.SHA != verifiedSHA {
+				record.Foundation.Status = "blocked"
+				record.Foundation.UpdatedAt = time.Now().UTC()
+				if _, err := s.catalog.Save(*record); err != nil {
+					return nil, err
+				}
+				return record, ErrFoundationBlocked
+			}
+			return s.markFoundationReady(ctx, name, repo, record, merged)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return record, ErrFoundationPending
+}
+
+func (s *Service) markFoundationReady(ctx context.Context, name string, repo *github.Repository, record *repositorycatalog.Record, pr *github.PR) (*repositorycatalog.Record, error) {
+	refreshed, err := s.syncAndRefresh(ctx, name, repo)
+	if err != nil {
+		return nil, err
+	}
+	refreshed.Foundation = &repositorycatalog.Foundation{Version: record.Foundation.Version, Branch: record.Foundation.Branch, PRNumber: pr.Number, PRURL: pr.HTMLURL, SHA: pr.Head.SHA, Status: "ready", UpdatedAt: time.Now().UTC()}
+	return s.catalog.Save(*refreshed)
 }
 
 func (s *Service) managed(repo *github.Repository) bool {
 	if repo == nil || repo.Fork {
 		return false
-	}
-	if len(s.owners) == 0 {
-		return true
 	}
 	owner, _, found := strings.Cut(strings.ToLower(repo.FullName), "/")
 	if !found {
@@ -182,7 +294,7 @@ func (s *Service) managed(repo *github.Repository) bool {
 }
 
 func ready(record *repositorycatalog.Record) bool {
-	return record != nil && record.Foundation != nil && record.Foundation.Version == foundation.Version && record.Foundation.Status == "ready"
+	return record != nil && record.Foundation != nil && record.Foundation.Status == "ready"
 }
 
 func foundationChecksSucceeded(checks *github.PRChecks) bool {
@@ -229,14 +341,20 @@ func (s *Service) Lookup(ctx context.Context, name string) (*repositorycatalog.R
 	return s.syncAndRefresh(ctx, name, repo)
 }
 
-// ProvisionPrivate creates a private repository when absent, then syncs and catalogs it.
+// ProvisionPrivate creates, catalogs, and starts the foundation for a new owned repository.
 func (s *Service) ProvisionPrivate(ctx context.Context, name, description string) (*repositorycatalog.Record, error) {
 	name, err := repositoryName(name)
 	if err != nil {
 		return nil, err
 	}
-	if record, err := s.Lookup(ctx, name); err != nil || record != nil {
-		return record, err
+	if existing, err := s.github.GetRepository(ctx, name); err == nil {
+		record, err := s.syncAndRefresh(ctx, name, existing)
+		if err != nil {
+			return nil, err
+		}
+		return s.ensureFoundation(ctx, name, existing, record)
+	} else if !errors.Is(err, github.ErrNotFound) {
+		return nil, fmt.Errorf("lookup GitHub repository %q: %w", name, err)
 	}
 
 	repo, err := s.github.CreateRepository(ctx, name, description, true)
@@ -244,14 +362,22 @@ func (s *Service) ProvisionPrivate(ctx context.Context, name, description string
 		createErr := err
 		repo, recheckErr := s.github.GetRepository(ctx, name)
 		if recheckErr == nil {
-			return s.syncAndRefresh(ctx, name, repo)
+			record, err := s.syncAndRefresh(ctx, name, repo)
+			if err != nil {
+				return nil, err
+			}
+			return s.ensureFoundation(ctx, name, repo, record)
 		}
 		if errors.Is(recheckErr, github.ErrNotFound) {
 			return nil, fmt.Errorf("create private GitHub repository %q: %w", name, createErr)
 		}
 		return nil, fmt.Errorf("recheck GitHub repository %q after create: %w", name, recheckErr)
 	}
-	return s.syncAndRefresh(ctx, name, repo)
+	record, err := s.syncAndRefresh(ctx, name, repo)
+	if err != nil {
+		return nil, err
+	}
+	return s.ensureFoundation(ctx, name, repo, record)
 }
 
 // ForkPublic forks the named public upstream only when the target repository is absent.

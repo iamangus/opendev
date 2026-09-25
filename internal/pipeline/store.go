@@ -202,7 +202,6 @@ type Job struct {
 	PlannerAgentID        string              `json:"planner_agent_id"`
 	WriterAgentID         string              `json:"writer_agent_id"`
 	ReviewerAgentID       string              `json:"reviewer_agent_id"`
-	HolisticAgentID       string              `json:"holistic_agent_id"`
 	Status                JobStatus           `json:"status"`
 	Plan                  *Plan               `json:"plan,omitempty"`
 	ReferenceSnapshots    []ReferenceSnapshot `json:"reference_snapshots,omitempty"`
@@ -462,9 +461,10 @@ type persisted struct {
 }
 
 type Store struct {
-	path string
-	mu   sync.RWMutex
-	jobs map[string]*Job
+	path      string
+	mu        sync.RWMutex
+	jobs      map[string]*Job
+	committed map[string]*Job
 }
 
 var (
@@ -487,15 +487,13 @@ func NewStore(dataDir string) (*Store, error) {
 	if err := s.load(); err != nil {
 		return nil, err
 	}
+	s.committed = snapshotJobs(s.jobs)
 	return s, nil
 }
 
-func (s *Store) Create(repository, directive, targetBranch, orchestratorID, plannerID, writerID, reviewerID string, holisticAgentID ...string) (*Job, error) {
+func (s *Store) Create(repository, directive, targetBranch, orchestratorID, plannerID, writerID, reviewerID string) (*Job, error) {
 	if strings.TrimSpace(repository) == "" || strings.TrimSpace(directive) == "" {
 		return nil, fmt.Errorf("%w: repository and directive are required", ErrInvalidJob)
-	}
-	if len(holisticAgentID) > 1 {
-		return nil, fmt.Errorf("%w: at most one holistic agent ID is allowed", ErrInvalidJob)
 	}
 	if targetBranch == "" {
 		targetBranch = "main"
@@ -511,9 +509,6 @@ func (s *Store) Create(repository, directive, targetBranch, orchestratorID, plan
 		PlannerAgentID: plannerID, WriterAgentID: writerID, ReviewerAgentID: reviewerID,
 		Status: JobCreated, CreatedAt: now, UpdatedAt: now,
 		HolisticReviewVerdict: ReviewPending, MergeState: MergeNotRequested,
-	}
-	if len(holisticAgentID) == 1 {
-		job.HolisticAgentID = holisticAgentID[0]
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -728,7 +723,12 @@ func (s *Store) load() error {
 	return nil
 }
 
-func (s *Store) saveLocked() error {
+func (s *Store) saveLocked() (saveErr error) {
+	defer func() {
+		if saveErr != nil {
+			s.jobs = snapshotJobs(s.committed)
+		}
+	}()
 	jobs := make([]*Job, 0, len(s.jobs))
 	for _, job := range s.jobs {
 		jobs = append(jobs, job)
@@ -761,7 +761,16 @@ func (s *Store) saveLocked() error {
 	if err := os.Rename(tmpName, s.path); err != nil {
 		return fmt.Errorf("replace pipeline state: %w", err)
 	}
+	s.committed = snapshotJobs(s.jobs)
 	return nil
+}
+
+func snapshotJobs(jobs map[string]*Job) map[string]*Job {
+	copy := make(map[string]*Job, len(jobs))
+	for id, job := range jobs {
+		copy[id] = cloneJob(job)
+	}
+	return copy
 }
 
 func newID() (string, error) {

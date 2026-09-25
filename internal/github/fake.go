@@ -120,7 +120,7 @@ func (f *FakeClient) GetPRChecks(_ context.Context, repo, ref string) (*PRChecks
 	return f.GetPRChecksResult, f.GetPRChecksError
 }
 
-func (f *FakeClient) MergePR(_ context.Context, repo string, number int) error {
+func (f *FakeClient) MergePR(_ context.Context, repo string, number int, expectedSHA ...string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.Calls = append(f.Calls, FakeCall{Method: "MergePR", Args: []any{repo, number}})

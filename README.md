@@ -77,23 +77,23 @@ http://localhost:8080/myrepo/main/read/mcp
 http://localhost:8080/myrepo/my-feature/write/mcp
 ```
 
-Management API endpoints:
+The job control plane is exposed through MCP at `/mcp`. Role-scoped
+endpoints are `/mcp/planner`, `/mcp/writer`, `/mcp/reviewer`, and
+`/mcp/holistic`. Use `lookup_repository`, `provision_repository`,
+`fork_public_repository`, `create_code_job`, and `start_planning` on the
+admin endpoint. Repository lookups and startup catalog sync do not create
+foundation changes. Provisioning an owned, non-fork repository or creating
+its first coding job starts a versioned foundation PR; jobs wait for its
+CI to pass and the PR to merge before planning starts. Later foundation
+  migrations require the admin-only `migrate_repository_foundation` tool with
+  the current target version; catalog refresh and ordinary coding jobs do not
+  initiate upgrades.
+  If a planner launch fails after the job enters planning, reconciliation
+  retries that same durable dispatch rather than leaving the job stranded.
 
-```
-GET    /api/repos
-POST   /api/repos
-DELETE /api/repos/{repo}
-GET    /api/repos/{repo}/branches
-POST   /api/repos/{repo}/branches
-DELETE /api/repos/{repo}/branches/{branch}
-POST   /api/repos/{repo}/branches/{branch}/push
-POST   /api/repos/{repo}/branches/{branch}/merge
-GET    /api/repos/{repo}/branches/{branch}/commits
-POST   /api/repos/{repo}/branches/{branch}/test/run
-POST   /api/repos/{repo}/pulls
-PATCH  /api/repos/{repo}/pulls/{number}
-POST   /api/repos/{repo}/pulls/{number}/ready
-```
+The active validation contract is `.opendev/validations.yml` in the
+target repository. The previous `.opendev/config.yaml` test-command API
+is no longer served.
 
 ## Docker
 
@@ -111,13 +111,8 @@ docker build -t ghcr.io/iamangus/opendev .
 docker run --rm -p 8080:8080 ghcr.io/iamangus/opendev
 ```
 
-Use the management API to add repositories after startup:
-
-```sh
-curl -X POST http://localhost:8080/api/repos \
-  -H 'Content-Type: application/json' \
-  -d '{"url":"https://github.com/owner/repo.git","name":"myrepo"}'
-```
+Configure the GitHub integration to discover owned repositories or use
+the provisioning and fork tools on `/mcp`.
 
 ### Environment variables
 
@@ -131,4 +126,4 @@ curl -X POST http://localhost:8080/api/repos \
 | `EVE_URL` | no | | Eve authenticated notification webhook URL. When unset, events remain durably queued in `/data/notification-outbox.json`. |
 | `EVE_WEBHOOK_TOKEN` | no | | Bearer token sent to `EVE_URL`; required with `EVE_URL` to enable delivery. |
 
-> **Private repositories** — set `GIT_TOKEN` on the clone request body or embed it in the URL (`https://TOKEN@host/…`).
+Private repository access uses the configured GitHub credentials.

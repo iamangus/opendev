@@ -1,6 +1,10 @@
 name: OpenDev Reusable CI
 
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_call:
     inputs:
       profile:
@@ -51,6 +55,7 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y libolm-dev
             go test ./...
+            go vet ./...
           fi
           if [ -f pyproject.toml ] || [ -f requirements.txt ]; then
             python -m pip install --upgrade pip

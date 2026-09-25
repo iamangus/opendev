@@ -134,7 +134,7 @@ func runSingleServer(mode, addr, dir string, logger *slog.Logger) {
 // runMultiServer starts the multi-repo HTTP server.
 //
 // MCP endpoint layout:  http://host:port/{repo}/{branch}/{profile}/mcp
-// Management API:       http://host:port/api/repos[/...]
+// Job control MCP:      http://host:port/mcp
 func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githubpkg.Client, logger *slog.Logger) {
 	mcpToken := strings.TrimSpace(os.Getenv("OPENDEV_TOKEN"))
 	if mcpToken == "" {
@@ -226,7 +226,7 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 	if eventURL == "" || eventToken == "" {
 		logger.Info("Eve notifications disabled; set EVE_URL and EVE_WEBHOOK_TOKEN to enable delivery")
 	} else {
-		outbox.NewDeliverer(notificationOutbox, eventURL, eventToken, logger).Start(context.Background())
+		outbox.NewDeliverer(notificationOutbox, eventURL, eventToken, logger, jobStore).Start(context.Background())
 	}
 	runStore, err := dispatchstore.New(stateDir)
 	if err != nil {
@@ -309,8 +309,7 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 		h.ServeHTTP(w, r)
 	})
 
-	// Repository lifecycle is MCP-only. The legacy unauthenticated REST API is
-	// intentionally left unregistered.
+	// Repository lifecycle is exposed through the authenticated MCP endpoint.
 	top := requireMCPToken(mcpToken, mcpMux)
 
 	// Reconciliation can launch agent runs with MCP attachments. Accept those
@@ -331,6 +330,11 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 	}
 	resumePendingHolisticReviews(context.Background(), jobStore, jobController, jobDispatcher, logger)
 	observeCI := func() {
+		if repositoryService != nil {
+			if err := repositoryService.ReconcilePendingFoundations(context.Background()); err != nil {
+				logger.Error("reconcile repository foundations", "error", err)
+			}
+		}
 		if err := jobmcp.ResumeFoundationPlanning(context.Background(), jobMCPConfig); err != nil {
 			logger.Error("resume foundation planning", "error", err)
 		}

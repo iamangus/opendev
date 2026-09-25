@@ -481,29 +481,6 @@ func SearchAndReplace(ctx context.Context, worktreeRoot, filePath, searchBlock, 
 	return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: search_block not found in %s (best match similarity: %.2f). Closest match:\n%s", filePath, bestRatio, snippet)}
 }
 
-// buildContext returns up to ±5 lines of context around the replaced area.
-func buildContext(content string, idx int, replaceBlock, filePath string) string {
-	if idx < 0 {
-		return fmt.Sprintf("Successfully replaced in %s", filePath)
-	}
-	lines := strings.Split(content, "\n")
-	before := content[:idx]
-	startLine := strings.Count(before, "\n")
-	replaceLines := strings.Count(replaceBlock, "\n") + 1
-	endLine := startLine + replaceLines
-
-	ctxStart := startLine - 5
-	if ctxStart < 0 {
-		ctxStart = 0
-	}
-	ctxEnd := endLine + 5
-	if ctxEnd > len(lines) {
-		ctxEnd = len(lines)
-	}
-
-	return fmt.Sprintf("Successfully replaced in %s\n%s", filePath, strings.Join(lines[ctxStart:ctxEnd], "\n"))
-}
-
 // similarity computes 2*LCS_chars / (len(a)+len(b)).
 func similarity(a, b string) float64 {
 	if len(a) == 0 && len(b) == 0 {

@@ -245,10 +245,13 @@ func (c *HTTPClient) GetPRChecks(ctx context.Context, repo, ref string) (*PRChec
 	return &checks, nil
 }
 
-func (c *HTTPClient) MergePR(ctx context.Context, repo string, number int) error {
+func (c *HTTPClient) MergePR(ctx context.Context, repo string, number int, expectedSHA ...string) error {
 	start := time.Now()
 	path := fmt.Sprintf("/repos/%s/%s/pulls/%d/merge", c.owner, repo, number)
 	payload := map[string]any{"merge_method": "squash"}
+	if len(expectedSHA) > 0 && expectedSHA[0] != "" {
+		payload["sha"] = expectedSHA[0]
+	}
 	var result struct {
 		Merged  bool   `json:"merged"`
 		Message string `json:"message"`

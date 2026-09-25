@@ -398,12 +398,15 @@ func TestHTTPClient_MergePR(t *testing.T) {
 		if body["merge_method"] != "squash" {
 			t.Errorf("unexpected merge method: %v", body["merge_method"])
 		}
+		if body["sha"] != "checked-head" {
+			t.Errorf("merge was not bound to checked PR head: %v", body["sha"])
+		}
 		json.NewEncoder(w).Encode(map[string]any{"merged": true, "message": "Pull Request successfully merged"})
 	}))
 	defer srv.Close()
 
 	c := NewHTTPClient("test-token", "owner", slog.Default(), WithBaseURL(srv.URL))
-	if err := c.MergePR(context.Background(), "myrepo", 42); err != nil {
+	if err := c.MergePR(context.Background(), "myrepo", 42, "checked-head"); err != nil {
 		t.Fatalf("MergePR: %v", err)
 	}
 }

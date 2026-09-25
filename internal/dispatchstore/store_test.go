@@ -33,3 +33,31 @@ func TestStorePersistsTerminalUnappliedRuns(t *testing.T) {
 		t.Fatalf("ListUnapplied = %+v, %v", pending, err)
 	}
 }
+
+func TestFailedDispatchSaveDoesNotAppearAccepted(t *testing.T) {
+	dir := t.TempDir()
+	store, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := store.path
+	store.path = filepath.Join(dir, "missing", "dispatch-runs.json")
+	run := dispatcher.DispatchRun{TaskID: "attempt-1", Status: "starting"}
+	if err := store.Save(context.Background(), run); err == nil {
+		t.Fatal("save succeeded without durable file")
+	}
+	if stored, err := store.Get(context.Background(), run.TaskID); err != nil || stored != nil {
+		t.Fatalf("failed dispatch remained in memory: %+v %v", stored, err)
+	}
+	store.path = original
+	if err := store.Save(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored, err := reloaded.Get(context.Background(), run.TaskID); err != nil || stored == nil {
+		t.Fatalf("retried dispatch not persisted: %+v %v", stored, err)
+	}
+}

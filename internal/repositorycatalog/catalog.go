@@ -132,7 +132,26 @@ func (c *Catalog) Get(name string) (*Record, error) {
 	if !ok {
 		return nil, nil
 	}
+	if record.Foundation != nil {
+		foundation := *record.Foundation
+		record.Foundation = &foundation
+	}
 	return &record, nil
+}
+
+func (c *Catalog) List() []Record {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	records := make([]Record, 0, len(c.records))
+	for _, record := range c.records {
+		if record.Foundation != nil {
+			foundation := *record.Foundation
+			record.Foundation = &foundation
+		}
+		records = append(records, record)
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].Name < records[j].Name })
+	return records
 }
 
 // Save records an entry and atomically replaces the persisted catalog.
@@ -159,6 +178,10 @@ func (c *Catalog) Save(record Record) (*Record, error) {
 		}
 	} else if record.CreatedAt.IsZero() {
 		record.CreatedAt = now
+	}
+	if record.Foundation != nil {
+		foundation := *record.Foundation
+		record.Foundation = &foundation
 	}
 	record.UpdatedAt = now
 	if err := c.saveLocked(record); err != nil {

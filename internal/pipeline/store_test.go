@@ -2,8 +2,42 @@ package pipeline
 
 import (
 	"errors"
+	"path/filepath"
 	"testing"
 )
+
+func TestFailedPipelineWriteRollsBackInMemoryTransitions(t *testing.T) {
+	dir := t.TempDir()
+	store, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.Create("repo", "directive", "main", "", "planner", "writer", "reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalPath := store.path
+	store.path = filepath.Join(dir, "nonexistent", "jobs.json")
+	if _, err := store.StartPlanning(job.ID); err == nil {
+		t.Fatal("expected failed state write")
+	}
+	current, err := store.Get(job.ID)
+	if err != nil || current.Status != JobCreated {
+		t.Fatalf("failed transition remained in memory: %+v %v", current, err)
+	}
+	store.path = originalPath
+	if _, err := store.StartPlanning(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err = reloaded.Get(job.ID)
+	if err != nil || current.Status != JobPlanning {
+		t.Fatalf("retry was not persisted: %+v %v", current, err)
+	}
+}
 
 func TestPlanPersistsAndRejectsInvalidDependencies(t *testing.T) {
 	dir := t.TempDir()
@@ -86,32 +120,6 @@ func TestSubmitPlanRejectsInvalidReferenceRepositories(t *testing.T) {
 				t.Fatalf("expected invalid plan, got %v", err)
 			}
 		})
-	}
-}
-
-func TestCreatePersistsHolisticAgentID(t *testing.T) {
-	dir := t.TempDir()
-	store, err := NewStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	job, err := store.Create("repo", "Fix", "main", "orchestrator", "planner", "writer", "reviewer", "holistic-reviewer")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if job.HolisticAgentID != "holistic-reviewer" || job.HolisticAgentID == job.ReviewerAgentID {
-		t.Fatalf("unexpected holistic agent ID: %+v", job)
-	}
-	reopened, err := NewStore(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	persisted, err := reopened.Get(job.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if persisted.HolisticAgentID != "holistic-reviewer" {
-		t.Fatalf("holistic agent ID was not persisted: %+v", persisted)
 	}
 }
 
