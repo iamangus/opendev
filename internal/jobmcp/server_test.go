@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -340,6 +342,99 @@ func TestWriterCompletedWithoutChangesIsRecordedWithoutCommit(t *testing.T) {
 	current, _ := store.Get(job.ID)
 	if task := findTask(current, "one"); task.Status != pipeline.TaskNoChanges || current.Status != pipeline.JobNoChanges {
 		t.Fatalf("completed clean worktree was not recorded as no changes: job=%+v task=%+v", current, task)
+	}
+}
+
+func TestWriterCleanWorktreeRecoversCommittedHead(t *testing.T) {
+	store, err := pipeline.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.Create("repo", "directive", "main", "", "planner", "writer", "reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartPlanning(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	job, err = store.SubmitPlan(job.ID, pipeline.Plan{Summary: "plan", Tasks: []pipeline.Task{{Key: "one", Title: "One", Description: "Implement", AcceptanceCriteria: []string{"works"}}}, IntegrationOrder: []string{"one"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktrees := &fakeWorktrees{}
+	dispatch := &fakeDispatcher{}
+	config := Config{Store: store, Controller: pipeline.NewController(store), Dispatcher: dispatch, Worktrees: worktrees, Registrar: &fakeRegistrar{}}
+	if _, err := startReadyWriters(context.Background(), job, config); err != nil {
+		t.Fatal(err)
+	}
+	worktrees.headCommit = "committed-sha"
+	run := dispatcher.DispatchRun{JobID: job.ID, Role: dispatcher.RoleWriter, TaskKey: "one", RunID: "writer-one", Status: "completed", Response: `{"status":"completed","summary":"Implemented","changed_files":["one.go"],"validation_evidence":[]}`}
+	if err := OutcomeHandler(config)(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := store.Get(job.ID)
+	task := findTask(current, "one")
+	if task.Status != pipeline.TaskReviewing || task.CommitSHA != "committed-sha" || len(dispatch.reviewerTasks) != 1 {
+		t.Fatalf("committed writer result was not recovered: task=%+v reviews=%d", task, len(dispatch.reviewerTasks))
+	}
+}
+
+func TestWriterClaimingChangesInCleanUncommittedWorktreeBlocksForRetry(t *testing.T) {
+	store, err := pipeline.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.Create("repo", "directive", "main", "", "planner", "writer", "reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartPlanning(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	job, err = store.SubmitPlan(job.ID, pipeline.Plan{Summary: "plan", Tasks: []pipeline.Task{{Key: "one", Title: "One", Description: "Implement", AcceptanceCriteria: []string{"works"}}}, IntegrationOrder: []string{"one"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch := &fakeDispatcher{}
+	config := Config{Store: store, Controller: pipeline.NewController(store), Dispatcher: dispatch, Worktrees: &fakeWorktrees{}, Registrar: &fakeRegistrar{}}
+	if _, err := startReadyWriters(context.Background(), job, config); err != nil {
+		t.Fatal(err)
+	}
+	run := dispatcher.DispatchRun{JobID: job.ID, Role: dispatcher.RoleWriter, TaskKey: "one", RunID: "writer-one", Status: "completed", Response: `{"status":"completed","summary":"Implemented","changed_files":["one.go"],"validation_evidence":[]}`}
+	if err := OutcomeHandler(config)(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	if err := OutcomeHandler(config)(context.Background(), run); err != nil {
+		t.Fatalf("replayed blocked outcome: %v", err)
+	}
+	current, _ := store.Get(job.ID)
+	task := findTask(current, "one")
+	if task.Status != pipeline.TaskBlocked || !strings.Contains(task.BlockReason, "retry_code_task") || len(dispatch.reviewerTasks) != 0 {
+		t.Fatalf("inconsistent writer result was not blocked: task=%+v reviews=%d", task, len(dispatch.reviewerTasks))
+	}
+}
+
+func TestPublishedJobIgnoresSupersededHolisticOutcome(t *testing.T) {
+	dir := t.TempDir()
+	job := &pipeline.Job{ID: "published-job", Status: pipeline.JobPublished, HolisticReviewRunID: "later-run", IntegrationSHA: "later-sha"}
+	data, err := json.Marshal(map[string]any{"jobs": []*pipeline.Job{job}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "jobs.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := pipeline.NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := dispatcher.DispatchRun{JobID: job.ID, Role: dispatcher.RoleHolistic, RunID: "old-run", Status: "completed", Response: `{"verdict":"approved"}`}
+	if err := OutcomeHandler(Config{Store: store})(context.Background(), run); err != nil {
+		t.Fatalf("superseded holistic outcome: %v", err)
+	}
+	current, _ := store.Get(job.ID)
+	if current.Status != pipeline.JobPublished || current.HolisticReviewRunID != "later-run" {
+		t.Fatalf("published job was changed: %+v", current)
 	}
 }
 

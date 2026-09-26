@@ -19,6 +19,13 @@ import (
 // supply the StructuredOutput schema presented to the model.
 func OutcomeHandler(config Config) dispatcher.OutcomeHandler {
 	return func(ctx context.Context, run dispatcher.DispatchRun) error {
+		job, err := config.Store.Get(run.JobID)
+		if err != nil {
+			return err
+		}
+		if job.Status == pipeline.JobPublished || job.Status == pipeline.JobNoChanges || job.Status == pipeline.JobFailed {
+			return nil
+		}
 		if run.Status != "completed" {
 			return recordTerminalFailure(run, config)
 		}
@@ -141,7 +148,22 @@ func applyWriter(ctx context.Context, run dispatcher.DispatchRun, config Config)
 	}
 	if !hasChanges {
 		if len(response.ChangedFiles) > 0 {
-			return fmt.Errorf("writer reported changed_files but the task worktree is clean")
+			if response.Status == "completed" && task.BaseSHA != "" {
+				head, err := config.Worktrees.HeadCommit(task.WorktreePath)
+				if err != nil {
+					return err
+				}
+				if head != task.BaseSHA {
+					return recordWriterCommitAndReview(ctx, run, config, job, task, head, *response.ValidationEvidence)
+				}
+			}
+			reason := "writer reported changed_files but the task worktree is clean; inspect and resume with retry_code_task"
+			blocked, err := config.Controller.BlockTask(job.ID, task.Key, reason)
+			if err != nil {
+				return err
+			}
+			notify(config, blocked, outbox.EventBlocked+":"+task.Key, response.Summary, reason)
+			return nil
 		}
 		reason := strings.TrimSpace(response.Reason)
 		if reason == "" {
@@ -164,7 +186,11 @@ func applyWriter(ctx context.Context, run dispatcher.DispatchRun, config Config)
 	if err != nil {
 		return err
 	}
-	job, err = config.Controller.RecordWriterCompletion(job.ID, task.Key, run.RunID, sha, *response.ValidationEvidence)
+	return recordWriterCommitAndReview(ctx, run, config, job, task, sha, *response.ValidationEvidence)
+}
+
+func recordWriterCommitAndReview(ctx context.Context, run dispatcher.DispatchRun, config Config, job *pipeline.Job, task *pipeline.Task, sha string, evidence []pipeline.ValidationEvidence) error {
+	job, err := config.Controller.RecordWriterCompletion(job.ID, task.Key, run.RunID, sha, evidence)
 	if err != nil {
 		return err
 	}
