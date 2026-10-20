@@ -10,6 +10,7 @@ import (
 
 	"github.com/iamangus/code-mcp/internal/foundation"
 	"github.com/iamangus/code-mcp/internal/github"
+	"github.com/iamangus/code-mcp/internal/identity"
 	"github.com/iamangus/code-mcp/internal/manager"
 	"github.com/iamangus/code-mcp/internal/repositorycatalog"
 )
@@ -428,8 +429,8 @@ func (s *Service) syncAndRefresh(ctx context.Context, name string, repo *github.
 
 func repositoryName(name string) (string, error) {
 	name = strings.ToLower(strings.TrimSpace(name))
-	if name == "" {
-		return "", fmt.Errorf("repository name is required")
+	if err := identity.Repository(name); err != nil {
+		return "", err
 	}
 	return name, nil
 }

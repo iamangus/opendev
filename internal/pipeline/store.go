@@ -3,17 +3,23 @@
 package pipeline
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/iamangus/code-mcp/internal/durable"
+	"github.com/iamangus/code-mcp/internal/identity"
+	"github.com/iamangus/code-mcp/internal/locks"
 )
 
 type JobStatus string
@@ -33,6 +39,8 @@ const (
 	JobPublished         JobStatus = "published"
 	JobNoChanges         JobStatus = "no_changes"
 	JobFailed            JobStatus = "failed"
+	JobPaused            JobStatus = "paused"
+	JobCancelled         JobStatus = "cancelled"
 )
 
 type TaskStatus string
@@ -102,6 +110,7 @@ type CIRecord struct {
 	Checks             []CheckResult `json:"checks,omitempty"`
 	FailureFingerprint string        `json:"failure_fingerprint,omitempty"`
 	UpdatedAt          time.Time     `json:"updated_at"`
+	StartedAt          time.Time     `json:"started_at,omitempty"`
 }
 
 // ValidationEvidence is an immutable record of validation reported for a task.
@@ -216,12 +225,28 @@ type Job struct {
 	CI                    *CIRecord           `json:"ci,omitempty"`
 	CIFailureFingerprints []string            `json:"ci_failure_fingerprints,omitempty"`
 	CIReplanRounds        int                 `json:"ci_replan_rounds,omitempty"`
+	AppliedCIReplanRound  int                 `json:"applied_ci_replan_round,omitempty"`
 	FoundationPending     bool                `json:"foundation_pending,omitempty"`
 	HolisticRounds        int                 `json:"holistic_rounds,omitempty"`
 	MergeState            MergeState          `json:"merge_state"`
 	Failure               string              `json:"failure,omitempty"`
 	CreatedAt             time.Time           `json:"created_at"`
 	UpdatedAt             time.Time           `json:"updated_at"`
+	Events                []Event             `json:"events,omitempty"`
+	MergePolicy           string              `json:"merge_policy,omitempty"`
+	PausedFrom            JobStatus           `json:"paused_from,omitempty"`
+	PausedAt              time.Time           `json:"paused_at,omitempty"`
+	PlannerRetry          int                 `json:"planner_retry,omitempty"`
+}
+
+// Event is committed with the transition it describes, not in a second store.
+type Event struct {
+	ID        string    `json:"id"`
+	Type      string    `json:"type"`
+	Status    JobStatus `json:"status"`
+	Summary   string    `json:"summary"`
+	Error     string    `json:"error,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // BlockTask records a terminal agent failure without executing another pipeline side effect.
@@ -273,7 +298,7 @@ func (s *Store) startCI(jobID, sha string, required []string) (*Job, error) {
 		return nil, transition(job.Status, "start CI")
 	}
 	job.Status = JobAwaitingCI
-	job.CI = &CIRecord{HeadSHA: sha, RequiredChecks: append([]string(nil), required...), State: CIPending, UpdatedAt: time.Now().UTC()}
+	job.CI = &CIRecord{HeadSHA: sha, RequiredChecks: append([]string(nil), required...), State: CIPending, UpdatedAt: time.Now().UTC(), StartedAt: time.Now().UTC()}
 	return s.saveAndCloneLocked(job)
 }
 
@@ -290,6 +315,7 @@ func (s *Store) recordCI(jobID, sha string, state CIState, checks []CheckResult,
 	if job.CI == nil || job.CI.HeadSHA != sha {
 		return cloneJob(job), nil
 	}
+	previousState, previousFingerprint := job.CI.State, job.CI.FailureFingerprint
 	job.CI.State = state
 	job.CI.Checks = append([]CheckResult(nil), checks...)
 	job.CI.FailureFingerprint = fingerprint
@@ -299,7 +325,7 @@ func (s *Store) recordCI(jobID, sha string, state CIState, checks []CheckResult,
 	} else if state == CIBlocked {
 		job.Status = JobFailed
 		job.Failure = "required GitHub Actions checks could not run"
-	} else if state == CIFailed && fingerprint != "" {
+	} else if state == CIFailed && fingerprint != "" && (previousState != CIFailed || previousFingerprint != fingerprint) {
 		job.CIFailureFingerprints = append(job.CIFailureFingerprints, fingerprint)
 	}
 	return s.saveAndCloneLocked(job)
@@ -354,6 +380,7 @@ func (s *Store) BeginCIReplan(jobID, fingerprint string) (*Job, error) {
 		return s.saveAndCloneLocked(job)
 	}
 	job.CIReplanRounds++
+	job.PlannerRetry = 0
 	job.Status = JobCIReplanning
 	return s.saveAndCloneLocked(job)
 }
@@ -369,6 +396,9 @@ func (s *Store) RevisePlan(id string, plan Plan) (*Job, error) {
 	}
 	keys := make(map[string]struct{}, len(plan.Tasks))
 	for _, task := range plan.Tasks {
+		if len(task.Key) > 100 {
+			return nil, fmt.Errorf("%w: task key exceeds 100 bytes", ErrInvalidPlan)
+		}
 		if task.Kind == TaskValidation {
 			return nil, fmt.Errorf("task %q uses obsolete validation kind; testing runs through GitHub Actions after the draft PR", task.Key)
 		}
@@ -390,23 +420,45 @@ func (s *Store) RevisePlan(id string, plan Plan) (*Job, error) {
 		return nil, ErrNotFound
 	}
 	if job.Plan == nil || job.Status != JobCIReplanning {
+		if job.Plan != nil && job.CIReplanRounds > 0 && job.AppliedCIReplanRound == job.CIReplanRounds {
+			return cloneJob(job), nil
+		}
 		return nil, fmt.Errorf("%w: job is %s, expected %s", ErrInvalidJob, job.Status, JobCIReplanning)
 	}
 	round := job.CIReplanRounds
-	added := 0
+	if len(plan.IntegrationOrder) == 0 {
+		for _, task := range plan.Tasks {
+			plan.IntegrationOrder = append(plan.IntegrationOrder, task.Key)
+		}
+	}
+	combined := *job.Plan
+	combined.Tasks = append([]Task(nil), job.Plan.Tasks...)
+	combined.IntegrationOrder = append([]string(nil), job.Plan.IntegrationOrder...)
 	for i := range plan.Tasks {
-		task := plan.Tasks[i]
+		task := plannedTask(plan.Tasks[i])
 		task.Key = fmt.Sprintf("rev%d-%s", round, task.Key)
-		task.Status = TaskPlanned
-		task.ReviewVerdict = ReviewPending
-		job.Plan.Tasks = append(job.Plan.Tasks, task)
-		job.Plan.IntegrationOrder = append(job.Plan.IntegrationOrder, task.Key)
-		added++
+		for n, dependency := range task.DependsOn {
+			if _, ok := keys[dependency]; ok {
+				task.DependsOn[n] = fmt.Sprintf("rev%d-%s", round, dependency)
+			}
+		}
+		combined.Tasks = append(combined.Tasks, task)
 	}
-	if added == 0 {
-		return nil, fmt.Errorf("%w: plan revision added no tasks", ErrInvalidJob)
+	for _, key := range plan.IntegrationOrder {
+		combined.IntegrationOrder = append(combined.IntegrationOrder, fmt.Sprintf("rev%d-%s", round, key))
 	}
+	validationPlan := combined
+	validationPlan.Tasks = append([]Task(nil), combined.Tasks...)
+	for n := range validationPlan.Tasks {
+		validationPlan.Tasks[n].Kind = TaskImplementation
+	}
+	if err := validatePlan(validationPlan); err != nil {
+		return nil, err
+	}
+	job.Plan = &combined
+	job.AppliedCIReplanRound = round
 	job.Status = JobPlanned
+	job.UpdatedAt = time.Now().UTC()
 	if err := s.saveLocked(); err != nil {
 		return nil, err
 	}
@@ -465,6 +517,13 @@ type Store struct {
 	mu        sync.RWMutex
 	jobs      map[string]*Job
 	committed map[string]*Job
+	lifecycle *locks.Manager
+}
+
+// LockJob serializes orchestration side effects, separately from state IO locks.
+func (s *Store) LockJob(id string) func() {
+	_ = s.lifecycle.Lock(context.Background(), id)
+	return func() { s.lifecycle.Unlock(id) }
 }
 
 var (
@@ -483,7 +542,7 @@ func NewStore(dataDir string) (*Store, error) {
 	if err := os.MkdirAll(dataDir, 0750); err != nil {
 		return nil, fmt.Errorf("create pipeline data directory: %w", err)
 	}
-	s := &Store{path: filepath.Join(dataDir, "jobs.json"), jobs: make(map[string]*Job)}
+	s := &Store{path: filepath.Join(dataDir, "jobs.json"), jobs: make(map[string]*Job), lifecycle: locks.NewManager(slog.Default())}
 	if err := s.load(); err != nil {
 		return nil, err
 	}
@@ -492,6 +551,15 @@ func NewStore(dataDir string) (*Store, error) {
 }
 
 func (s *Store) Create(repository, directive, targetBranch, orchestratorID, plannerID, writerID, reviewerID string) (*Job, error) {
+	repository = strings.ToLower(strings.TrimSpace(repository))
+	if err := identity.Repository(repository); err != nil {
+		return nil, err
+	}
+	if targetBranch != "" {
+		if err := identity.Branch(targetBranch); err != nil {
+			return nil, err
+		}
+	}
 	if strings.TrimSpace(repository) == "" || strings.TrimSpace(directive) == "" {
 		return nil, fmt.Errorf("%w: repository and directive are required", ErrInvalidJob)
 	}
@@ -525,7 +593,52 @@ func (s *Store) Get(id string) (*Job, error) {
 	defer s.mu.RUnlock()
 	job, ok := s.jobs[id]
 	if !ok {
+		return s.readArchive(id)
+	}
+	return cloneJob(job), nil
+}
+
+func (s *Store) readArchive(id string) (*Job, error) {
+	path, err := durable.ArchivePath(s.path, "jobs", id)
+	if err != nil {
 		return nil, ErrNotFound
+	}
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	var job Job
+	if err := json.Unmarshal(data, &job); err != nil {
+		return nil, err
+	}
+	return &job, nil
+}
+
+// Archive removes terminal jobs from active snapshots without deleting history
+// or touching their source worktrees. A crash between files leaves a safe copy.
+func (s *Store) Archive(id string) (*Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	job, ok := s.jobs[id]
+	if !ok {
+		return s.readArchive(id)
+	}
+	if !Terminal(job.Status) {
+		return nil, transition(job.Status, "archive")
+	}
+	path, err := durable.ArchivePath(s.path, "jobs", id)
+	if err != nil {
+		return nil, err
+	}
+	if err := durable.WriteJSON(path, job); err != nil {
+		return nil, err
+	}
+	delete(s.jobs, id)
+	if err := s.saveLocked(); err != nil {
+		return nil, err
 	}
 	return cloneJob(job), nil
 }
@@ -539,6 +652,16 @@ func (s *Store) List() []*Job {
 	}
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].CreatedAt.After(jobs[j].CreatedAt) })
 	return jobs
+}
+
+func (s *Store) StatusCounts() map[JobStatus]int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make(map[JobStatus]int)
+	for _, job := range s.jobs {
+		result[job.Status]++
+	}
+	return result
 }
 
 func (s *Store) StartPlanning(id string) (*Job, error) {
@@ -576,6 +699,7 @@ func (s *Store) MarkFoundationPending(id string) (*Job, error) {
 }
 
 func (s *Store) SubmitPlan(id string, plan Plan) (*Job, error) {
+	plan = clonePlan(plan)
 	if err := validatePlan(plan); err != nil {
 		return nil, err
 	}
@@ -592,8 +716,7 @@ func (s *Store) SubmitPlan(id string, plan Plan) (*Job, error) {
 		return nil, fmt.Errorf("%w: job is %s, expected %s", ErrInvalidJob, job.Status, JobPlanning)
 	}
 	for i := range plan.Tasks {
-		plan.Tasks[i].Status = TaskPlanned
-		plan.Tasks[i].ReviewVerdict = ReviewPending
+		plan.Tasks[i] = plannedTask(plan.Tasks[i])
 	}
 	job.Plan, job.Status, job.UpdatedAt = &plan, JobPlanned, time.Now().UTC()
 	if err := s.saveLocked(); err != nil {
@@ -633,6 +756,9 @@ func validatePlan(plan Plan) error {
 	}
 	keys := make(map[string]struct{}, len(plan.Tasks))
 	for _, task := range plan.Tasks {
+		if len(task.Key) > 100 {
+			return fmt.Errorf("%w: task key exceeds 100 bytes", ErrInvalidPlan)
+		}
 		if task.Kind == TaskValidation {
 			return fmt.Errorf("task %q uses obsolete validation kind; testing runs through GitHub Actions after the draft PR", task.Key)
 		}
@@ -693,6 +819,20 @@ func validatePlan(plan Plan) error {
 	return nil
 }
 
+// Only declarative planner fields cross into controller-owned task state.
+func plannedTask(task Task) Task {
+	return Task{Key: task.Key, Kind: task.Kind, Title: task.Title, Description: task.Description, AcceptanceCriteria: append([]string(nil), task.AcceptanceCriteria...), DependsOn: append([]string(nil), task.DependsOn...), Validation: append([]string(nil), task.Validation...), Status: TaskPlanned, ReviewVerdict: ReviewPending}
+}
+
+func clonePlan(plan Plan) Plan {
+	plan.Tasks = append([]Task(nil), plan.Tasks...)
+	plan.AcceptanceCriteria = append([]string(nil), plan.AcceptanceCriteria...)
+	plan.IntegrationOrder = append([]string(nil), plan.IntegrationOrder...)
+	plan.Risks = append([]string(nil), plan.Risks...)
+	plan.ReferenceRepositories = append([]ReferenceRepository(nil), plan.ReferenceRepositories...)
+	return plan
+}
+
 func (s *Store) load() error {
 	data, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -708,6 +848,12 @@ func (s *Store) load() error {
 	for _, job := range saved.Jobs {
 		if job == nil || job.ID == "" {
 			return fmt.Errorf("decode pipeline state: invalid job")
+		}
+		if job.CI != nil && job.CI.StartedAt.IsZero() {
+			job.CI.StartedAt = job.CI.UpdatedAt
+			if job.CI.StartedAt.IsZero() {
+				job.CI.StartedAt = job.UpdatedAt
+			}
 		}
 		// Block reasons describe only the current blocked state. Records saved
 		// before a resume may still carry a stale reason on a resumed task.
@@ -731,6 +877,7 @@ func (s *Store) saveLocked() (saveErr error) {
 	}()
 	jobs := make([]*Job, 0, len(s.jobs))
 	for _, job := range s.jobs {
+		recordEvents(job, s.committed[job.ID])
 		jobs = append(jobs, job)
 	}
 	data, err := json.MarshalIndent(persisted{Jobs: jobs}, "", "  ")
@@ -761,8 +908,62 @@ func (s *Store) saveLocked() (saveErr error) {
 	if err := os.Rename(tmpName, s.path); err != nil {
 		return fmt.Errorf("replace pipeline state: %w", err)
 	}
+	if err := durable.SyncDirectory(s.path); err != nil {
+		return err
+	}
 	s.committed = snapshotJobs(s.jobs)
 	return nil
+}
+
+func recordEvents(job, previous *Job) {
+	if previous == nil {
+		return
+	}
+	appendEvent := func(kind, summary, reason string) {
+		job.Events = append(job.Events, Event{ID: fmt.Sprintf("%s:%d", job.ID, len(job.Events)+1), Type: kind, Status: job.Status, Summary: summary, Error: reason, CreatedAt: time.Now().UTC()})
+	}
+	if previous.Status == JobCreated && job.Status == JobPlanning {
+		appendEvent("started", job.Directive, "")
+	}
+	if previous.PullRequestNumber == 0 && job.PullRequestNumber > 0 {
+		appendEvent("pr_opened", job.Directive, "")
+	}
+	if previous.MergeState != MergeMerged && job.MergeState == MergeMerged {
+		appendEvent("merged", job.Directive, "")
+	}
+	if previous.Status != JobFailed && job.Status == JobFailed {
+		appendEvent("failed", job.Directive, job.Failure)
+	}
+	if previous.Status != JobCancelled && job.Status == JobCancelled {
+		appendEvent("cancelled", job.Directive, job.Failure)
+	}
+	if previous.Status != JobNoChanges && job.Status == JobNoChanges {
+		appendEvent("no_changes", job.Directive, "")
+	}
+	if job.CI != nil && (previous.CI == nil || previous.CI.HeadSHA != job.CI.HeadSHA || previous.CI.State != job.CI.State) {
+		appendEvent("ci_"+string(job.CI.State), job.Directive, job.CI.FailureFingerprint)
+	}
+	if previous.Status != JobCIRemediating && job.Status == JobCIRemediating {
+		appendEvent("ci_remediating", job.Directive, "")
+	}
+	if job.Plan != nil {
+		for _, task := range job.Plan.Tasks {
+			if task.Status != TaskBlocked {
+				continue
+			}
+			wasBlocked := false
+			if previous.Plan != nil {
+				for _, old := range previous.Plan.Tasks {
+					if old.Key == task.Key && old.Status == TaskBlocked && old.WriterAttempts == task.WriterAttempts && old.ReviewerAttempts == task.ReviewerAttempts {
+						wasBlocked = true
+					}
+				}
+			}
+			if !wasBlocked {
+				appendEvent("blocked:"+task.Key, task.Title, task.BlockReason)
+			}
+		}
+	}
 }
 
 func snapshotJobs(jobs map[string]*Job) map[string]*Job {

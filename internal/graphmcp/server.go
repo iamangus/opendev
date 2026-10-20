@@ -27,7 +27,7 @@ func New(config Config) *server.StreamableHTTPServer {
 	s := server.NewMCPServer("opendev", "1.0.0", server.WithToolCapabilities(true))
 	s.AddTool(mcp.NewTool("search_repository_graph",
 		mcp.WithDescription("Search read-only Graphiti repository knowledge."),
-		mcp.WithString("repository", mcp.Description("Optional repository name to narrow the search.")),
+		mcp.WithString("repository", mcp.Description("Optional repository-name search hint; not an access-control or exact-match filter.")),
 		mcp.WithString("query", mcp.Required(), mcp.Description("Question or search terms.")),
 		mcp.WithNumber("max_results", mcp.Description("Optional maximum number of results.")),
 	), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -41,7 +41,11 @@ func New(config Config) *server.StreamableHTTPServer {
 		if repository := req.GetString("repository", ""); repository != "" {
 			query = repository + ": " + query
 		}
-		result, err := config.Searcher.Search(ctx, query, graphiti.SearchOptions{MaxResults: req.GetInt("max_results", 0)})
+		limit := req.GetInt("max_results", 10)
+		if limit < 1 || limit > 100 {
+			return mcp.NewToolResultError("max_results must be between 1 and 100"), nil
+		}
+		result, err := config.Searcher.Search(ctx, query, graphiti.SearchOptions{MaxResults: limit})
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -49,7 +53,7 @@ func New(config Config) *server.StreamableHTTPServer {
 	})
 	s.AddTool(mcp.NewTool("get_repository_index_state",
 		mcp.WithDescription("Get durable, read-only repository graph indexing state."),
-		mcp.WithString("repository", mcp.Required(), mcp.Description("Repository name, for example owner/repository.")),
+		mcp.WithString("repository", mcp.Required(), mcp.Description("Canonical local repository name, for example myrepo.")),
 	), func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		if config.State == nil {
 			return mcp.NewToolResultError("repository index state is not configured"), nil

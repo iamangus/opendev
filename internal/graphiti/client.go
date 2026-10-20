@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // Message is one item to add to a Graphiti group.
@@ -41,7 +42,7 @@ type Client struct {
 }
 
 func NewClient(baseURL, groupID string) (*Client, error) {
-	return NewClientWithHTTPClient(baseURL, groupID, http.DefaultClient)
+	return NewClientWithHTTPClient(baseURL, groupID, &http.Client{Timeout: 30 * time.Second})
 }
 
 func NewClientWithHTTPClient(baseURL, groupID string, httpClient *http.Client) (*Client, error) {
@@ -50,10 +51,10 @@ func NewClientWithHTTPClient(baseURL, groupID string, httpClient *http.Client) (
 		return nil, fmt.Errorf("invalid Graphiti URL")
 	}
 	if strings.TrimSpace(groupID) == "" {
-		return nil, fmt.Errorf("Graphiti group ID is required")
+		return nil, fmt.Errorf("graphiti group ID is required")
 	}
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
 	return &Client{baseURL: u, groupID: groupID, httpClient: httpClient}, nil
 }
@@ -65,10 +66,10 @@ func (c *Client) AddMessages(ctx context.Context, messages []Message) error {
 	}
 	for i, message := range messages {
 		if strings.TrimSpace(message.Content) == "" {
-			return fmt.Errorf("Graphiti message %d content is required", i)
+			return fmt.Errorf("graphiti message %d content is required", i)
 		}
 		if strings.TrimSpace(message.Role) == "" || strings.TrimSpace(message.RoleType) == "" || strings.TrimSpace(message.Name) == "" || strings.TrimSpace(message.SourceDescription) == "" || strings.TrimSpace(message.Timestamp) == "" {
-			return fmt.Errorf("Graphiti message %d role, role type, name, source description, and timestamp are required", i)
+			return fmt.Errorf("graphiti message %d role, role type, name, source description, and timestamp are required", i)
 		}
 	}
 	return c.doJSON(ctx, "/messages", map[string]any{"group_id": c.groupID, "messages": messages}, nil)
@@ -78,7 +79,7 @@ func (c *Client) AddMessages(ctx context.Context, messages []Message) error {
 // preserved because Graphiti search result schemas may evolve independently.
 func (c *Client) Search(ctx context.Context, query string, options SearchOptions) (json.RawMessage, error) {
 	if strings.TrimSpace(query) == "" {
-		return nil, fmt.Errorf("Graphiti search query is required")
+		return nil, fmt.Errorf("graphiti search query is required")
 	}
 	payload := map[string]any{"query": query, "group_ids": []string{c.groupID}}
 	if options.MaxResults > 0 {
@@ -111,12 +112,12 @@ func (c *Client) doJSON(ctx context.Context, path string, input, output any) err
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if detail := strings.TrimSpace(string(body)); detail != "" {
-			return fmt.Errorf("Graphiti request failed: %s: %s", resp.Status, detail)
+			return fmt.Errorf("graphiti request failed: %s: %s", resp.Status, detail)
 		}
-		return fmt.Errorf("Graphiti request failed: %s", resp.Status)
+		return fmt.Errorf("graphiti request failed: %s", resp.Status)
 	}
 	if output != nil {
-		if err := json.NewDecoder(resp.Body).Decode(output); err != nil {
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(output); err != nil {
 			return fmt.Errorf("decode Graphiti response: %w", err)
 		}
 	}

@@ -2,13 +2,17 @@ package gitops
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/iamangus/code-mcp/internal/limits"
 )
 
 type Exec struct {
@@ -21,11 +25,14 @@ func NewExec(logger *slog.Logger, token string) *Exec {
 }
 
 func (e *Exec) Clone(ctx context.Context, url, dir string) error {
-	_, err := e.run(ctx, "", "git", "clone", e.authURL(url), dir)
+	_, err := e.run(ctx, "", "git", "clone", "--", cleanURL(url), dir)
 	return err
 }
 
 func (e *Exec) Fetch(ctx context.Context, dir string) error {
+	if err := e.cleanOrigin(ctx, dir); err != nil {
+		return err
+	}
 	_, err := e.run(ctx, dir, "git", "fetch", "--prune", "origin")
 	return err
 }
@@ -48,7 +55,7 @@ func (e *Exec) WorktreeAdd(ctx context.Context, repoDir, wtDir, branch string) e
 }
 
 func (e *Exec) WorktreeRemove(ctx context.Context, repoDir, wtDir string) error {
-	_, err := e.run(ctx, repoDir, "git", "worktree", "remove", "--force", wtDir)
+	_, err := e.run(ctx, repoDir, "git", "worktree", "remove", wtDir)
 	return err
 }
 
@@ -106,11 +113,31 @@ func containsLine(contents, line string) bool {
 }
 
 func (e *Exec) Merge(ctx context.Context, dir, branch string) error {
-	_, err := e.run(ctx, dir, "git", "merge", branch)
+	if _, err := e.runProbe(ctx, dir, "git", "rev-parse", "--verify", "MERGE_HEAD"); err == nil {
+		return fmt.Errorf("target has a pre-existing merge in progress; manual inspection is required")
+	}
+	status, err := e.Status(ctx, dir)
+	if err != nil {
+		return err
+	}
+	if status != "" {
+		return fmt.Errorf("integration worktree must be clean before merging")
+	}
+	_, err = e.run(ctx, dir, "git", "merge", "--no-edit", "--", branch)
+	if err != nil && strings.Contains(err.Error(), "CONFLICT") {
+		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, abortErr := e.run(cleanup, dir, "git", "merge", "--abort"); abortErr != nil {
+			return fmt.Errorf("%w; abort failed: %v", err, abortErr)
+		}
+	}
 	return err
 }
 
 func (e *Exec) Push(ctx context.Context, dir, branch string) error {
+	if err := e.cleanOrigin(ctx, dir); err != nil {
+		return err
+	}
 	_, err := e.run(ctx, dir, "git", "push", "origin", branch)
 	return err
 }
@@ -128,7 +155,8 @@ func (e *Exec) HeadCommit(ctx context.Context, dir string) (string, error) {
 }
 
 func (e *Exec) OriginURL(ctx context.Context, dir string) (string, error) {
-	return e.run(ctx, dir, "git", "remote", "get-url", "origin")
+	value, err := e.run(ctx, dir, "git", "remote", "get-url", "origin")
+	return cleanURL(value), err
 }
 
 func (e *Exec) CherryPick(ctx context.Context, dir, commit string) error {
@@ -142,6 +170,13 @@ func (e *Exec) Diff(ctx context.Context, dir string) (string, error) {
 
 func (e *Exec) DiffRange(ctx context.Context, dir, base, target string) (string, error) {
 	return e.run(ctx, dir, "git", "diff", base+".."+target)
+}
+
+func (e *Exec) ReadFileAt(ctx context.Context, dir, sha, path string) (string, error) {
+	if !filepath.IsLocal(path) || strings.ContainsAny(sha, ": \t\r\n") || strings.HasPrefix(sha, "-") {
+		return "", fmt.Errorf("invalid committed evidence path or revision")
+	}
+	return e.runProbe(ctx, dir, "git", "show", "--no-ext-diff", "--no-textconv", sha+":"+filepath.ToSlash(path))
 }
 
 func (e *Exec) CommitLog(ctx context.Context, dir string, args ...string) (string, error) {
@@ -195,26 +230,54 @@ func (e *Exec) WorktreeAddDetached(ctx context.Context, repoDir, wtDir, revision
 	return err
 }
 
-func (e *Exec) authURL(rawURL string) string {
-	if e.token == "" {
-		return rawURL
-	}
-	if strings.HasPrefix(rawURL, "https://") {
-		return strings.Replace(rawURL, "https://", "https://x-access-token:"+e.token+"@", 1)
+func cleanURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err == nil && u.User != nil && (u.Scheme == "https" || u.Scheme == "http") {
+		u.User = nil
+		return u.String()
 	}
 	return rawURL
 }
 
+func (e *Exec) cleanOrigin(ctx context.Context, dir string) error {
+	value, err := e.run(ctx, dir, "git", "remote", "get-url", "origin")
+	if err != nil {
+		return err
+	}
+	if cleaned := cleanURL(value); cleaned != value {
+		_, err = e.run(ctx, dir, "git", "remote", "set-url", "origin", cleaned)
+	}
+	return err
+}
+
+func (e *Exec) command(ctx context.Context, dir, name string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	// Credentials never enter argv, remotes, or logs. Limit the authorization
+	// header to GitHub HTTPS and disable repository-controlled Git hooks.
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_COUNT=2", "GIT_CONFIG_KEY_0=core.hooksPath", "GIT_CONFIG_VALUE_0=/dev/null", "GIT_CONFIG_KEY_1=http.https://github.com/.extraHeader", "GIT_CONFIG_VALUE_1=Authorization: Basic "+base64.StdEncoding.EncodeToString([]byte("x-access-token:"+e.token)))
+	if e.token == "" {
+		cmd.Env = append(cmd.Env, "GIT_CONFIG_VALUE_1=")
+	}
+	cmd.WaitDelay = 2 * time.Second
+	return cmd
+}
+
 func (e *Exec) run(ctx context.Context, dir, name string, args ...string) (string, error) {
 	start := time.Now()
-	cmd := exec.CommandContext(ctx, name, args...)
-	if dir != "" {
-		cmd.Dir = dir
-	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	cmd := e.command(ctx, dir, name, args...)
 
-	out, err := cmd.CombinedOutput()
+	output := &limits.Buffer{Limit: 128 << 10}
+	cmd.Stdout, cmd.Stderr = output, output
+	err := cmd.Run()
 	elapsed := time.Since(start)
-	result := strings.TrimSpace(string(out))
+	result := strings.TrimSpace(output.String())
+	if e.token != "" {
+		result = strings.ReplaceAll(result, e.token, "[redacted]")
+		result = strings.ReplaceAll(result, base64.StdEncoding.EncodeToString([]byte("x-access-token:"+e.token)), "[redacted]")
+	}
 
 	if err != nil {
 		e.logger.Error("git command failed",
@@ -240,12 +303,13 @@ func (e *Exec) run(ctx context.Context, dir, name string, args ...string) (strin
 // runProbe is for expected existence checks where a non-zero status is data,
 // not an operational failure worth emitting at error level.
 func (e *Exec) runProbe(ctx context.Context, dir, name string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	out, err := cmd.CombinedOutput()
-	result := strings.TrimSpace(string(out))
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := e.command(ctx, dir, name, args...)
+	output := &limits.Buffer{Limit: 32 << 10}
+	cmd.Stdout, cmd.Stderr = output, output
+	err := cmd.Run()
+	result := strings.TrimSpace(output.String())
 	if err != nil {
 		e.logger.Debug("git probe did not match", "cmd", name, "args", args, "dir", dir)
 		return result, err

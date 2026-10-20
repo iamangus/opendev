@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/iamangus/code-mcp/internal/durable"
 	"github.com/iamangus/code-mcp/internal/manager"
 )
 
@@ -114,9 +115,8 @@ func (c *Catalog) Refresh(ctx context.Context, repo manager.RepoInfo) (*Record, 
 		Domains:       normalizedStrings(metadata.Domains),
 		Topics:        normalizedStrings(metadata.Topics),
 	}
-	if previous, getErr := c.Get(name); getErr == nil && previous != nil {
-		record.Foundation = previous.Foundation
-	}
+	// Save preserves the latest foundation under the same lock as the metadata
+	// write; a background refresh must not restore an older lifecycle snapshot.
 	return c.Save(record)
 }
 
@@ -132,10 +132,7 @@ func (c *Catalog) Get(name string) (*Record, error) {
 	if !ok {
 		return nil, nil
 	}
-	if record.Foundation != nil {
-		foundation := *record.Foundation
-		record.Foundation = &foundation
-	}
+	record = cloneRecord(record)
 	return &record, nil
 }
 
@@ -144,11 +141,7 @@ func (c *Catalog) List() []Record {
 	defer c.mu.RUnlock()
 	records := make([]Record, 0, len(c.records))
 	for _, record := range c.records {
-		if record.Foundation != nil {
-			foundation := *record.Foundation
-			record.Foundation = &foundation
-		}
-		records = append(records, record)
+		records = append(records, cloneRecord(record))
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].Name < records[j].Name })
 	return records
@@ -188,7 +181,19 @@ func (c *Catalog) Save(record Record) (*Record, error) {
 		return nil, err
 	}
 	c.records[name] = record
-	return &record, nil
+	result := cloneRecord(record)
+	return &result, nil
+}
+
+func cloneRecord(record Record) Record {
+	if record.Foundation != nil {
+		foundation := *record.Foundation
+		record.Foundation = &foundation
+	}
+	record.Aliases = append([]string(nil), record.Aliases...)
+	record.Domains = append([]string(nil), record.Domains...)
+	record.Topics = append([]string(nil), record.Topics...)
+	return record
 }
 
 func (c *Catalog) load() error {
@@ -251,7 +256,7 @@ func (c *Catalog) saveLocked(next Record) error {
 	if err := os.Rename(tmpName, c.path); err != nil {
 		return fmt.Errorf("replace repository catalog: %w", err)
 	}
-	return nil
+	return durable.SyncDirectory(c.path)
 }
 
 func canonicalName(name string) (string, error) {

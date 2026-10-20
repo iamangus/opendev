@@ -118,6 +118,10 @@ func TestHTTPClient_CreateRepository(t *testing.T) {
 
 func TestHTTPClient_ForkPublicRepository(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/upstream/source" {
+			json.NewEncoder(w).Encode(map[string]any{"private": false})
+			return
+		}
 		if r.Method != http.MethodPost {
 			t.Errorf("expected POST, got %s", r.Method)
 		}
@@ -128,7 +132,7 @@ func TestHTTPClient_ForkPublicRepository(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
-		if body["owner"] != "owner" || body["name"] != "myfork" || body["private"] != false {
+		if body["owner"] != nil || body["name"] != "myfork" || body["private"] != nil {
 			t.Errorf("unexpected body: %+v", body)
 		}
 		w.WriteHeader(http.StatusAccepted)

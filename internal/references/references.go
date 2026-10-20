@@ -2,7 +2,9 @@
 package references
 
 import (
+	"crypto/rand"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/iamangus/code-mcp/internal/pipeline"
 	"github.com/iamangus/code-mcp/internal/repositorycatalog"
+	"github.com/iamangus/code-mcp/internal/worktree"
 )
 
 var validJobID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
@@ -92,6 +95,13 @@ func (s *Service) ValidateAndSnapshot(jobID string, references []pipeline.Refere
 		}
 
 		path := filepath.Join(record.Path, ".opendev", "references", jobID, safeName(record.Name))
+		if _, err := worktree.ResolveManaged(record.Path, path); err != nil {
+			return nil, err
+		}
+		sha, err = pinRevision(record.Path, path, sha, strings.TrimSpace(reference.Revision) != "")
+		if err != nil {
+			return nil, fmt.Errorf("pin reference repository %q: %w", record.Name, err)
+		}
 		if _, duplicate := paths[path]; duplicate {
 			return nil, fmt.Errorf("reference repositories resolve to the same snapshot path %q", path)
 		}
@@ -102,6 +112,85 @@ func (s *Service) ValidateAndSnapshot(jobID string, references []pipeline.Refere
 		snapshots = append(snapshots, Snapshot{Repository: record.Name, SHA: sha, Path: path, Purpose: reference.Purpose})
 	}
 	return snapshots, nil
+}
+
+// Persist the selected branch head before creating its worktree. If a process
+// crashes between the filesystem side effect and the job write, a moved source
+// branch must not silently select a different snapshot on retry.
+func pinRevision(root, path, sha string, explicit bool) (string, error) {
+	if sha == "" || len(sha) > 128 {
+		return "", fmt.Errorf("invalid reference revision")
+	}
+	pin := path + ".revision"
+	if _, err := worktree.ResolveManaged(root, pin); err != nil {
+		return "", err
+	}
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+	rel, err := filepath.Rel(root, pin)
+	if err != nil {
+		return "", err
+	}
+	if err := r.MkdirAll(filepath.Dir(rel), 0750); err != nil {
+		return "", err
+	}
+	readPinned := func() (string, error) {
+		f, err := r.Open(rel)
+		if err != nil {
+			return "", err
+		}
+		defer f.Close()
+		data, err := io.ReadAll(io.LimitReader(f, 129))
+		if err != nil {
+			return "", err
+		}
+		stored := strings.TrimSpace(string(data))
+		if stored == "" || len(data) > 128 {
+			return "", fmt.Errorf("invalid pinned revision")
+		}
+		if explicit && stored != sha {
+			return "", fmt.Errorf("requested revision differs from the immutable job snapshot")
+		}
+		return stored, nil
+	}
+	if _, err := r.Lstat(rel); err == nil {
+		return readPinned()
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	temporary := rel + "." + rand.Text() + ".tmp"
+	f, err := r.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return "", err
+	}
+	defer r.Remove(temporary)
+	if _, err = f.WriteString(sha); err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return "", err
+	}
+	if closeErr != nil {
+		return "", closeErr
+	}
+	if err := r.Link(temporary, rel); os.IsExist(err) {
+		return readPinned()
+	} else if err != nil {
+		return "", err
+	}
+	dir, err := r.Open(filepath.Dir(rel))
+	if err != nil {
+		return "", err
+	}
+	defer dir.Close()
+	if err := dir.Sync(); err != nil {
+		return "", err
+	}
+	return sha, nil
 }
 
 func (s *Service) ensureSnapshot(sourcePath, snapshotPath, sha string) error {

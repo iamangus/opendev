@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -178,10 +177,10 @@ func registerReadTools(s *server.MCPServer, lm *locks.Manager, revisions *tools.
 			directory := req.GetString("directory", "")
 			results, toolErr := tools.GrepSearch(ctx, worktreeRoot, query, directory, lm)
 			if toolErr != nil {
-				logger.Error("tool call failed", "tool", "grep_search", "query", query, "directory", directory, "error", toolErr, "duration_ms", time.Since(start).Milliseconds())
+				logger.Error("tool call failed", "tool", "grep_search", "query_bytes", len(query), "directory", directory, "error", toolErr, "duration_ms", time.Since(start).Milliseconds())
 				return mcp.NewToolResultError(toolErr.Error()), nil
 			}
-			logger.Info("tool call completed", "tool", "grep_search", "query", query, "directory", directory, "duration_ms", time.Since(start).Milliseconds())
+			logger.Info("tool call completed", "tool", "grep_search", "query_bytes", len(query), "directory", directory, "duration_ms", time.Since(start).Milliseconds())
 			return mcp.NewToolResultText(results), nil
 		},
 	)
@@ -256,11 +255,10 @@ func registerWriteTools(s *server.MCPServer, lm *locks.Manager, revisions *tools
 				logger.Error("tool call failed", "tool", "search_and_replace", "filepath", fp, "error", resolveErr, "duration_ms", time.Since(start).Milliseconds())
 				return mcp.NewToolResultError(resolveErr.Error()), nil
 			}
-			if lm.RLock(ctx, abs) == nil {
-				current, readErr := os.ReadFile(abs)
-				lm.RUnlock(abs)
+			{
+				current, readErr := tools.ReadFile(ctx, worktreeRoot, fp, lm)
 				if readErr == nil {
-					if authErr := revisions.VerifyOrAdopt(abs, expectedRevision, tools.RevisionToken(string(current))); authErr != nil {
+					if authErr := revisions.VerifyOrAdopt(abs, expectedRevision, tools.RevisionToken(current)); authErr != nil {
 						logger.Error("tool call failed", "tool", "search_and_replace", "filepath", fp, "error", authErr, "duration_ms", time.Since(start).Milliseconds())
 						return mcp.NewToolResultError(authErr.Error()), nil
 					}

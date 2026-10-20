@@ -19,50 +19,101 @@ jobs:
   ci:
     name: OpenDev CI
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         if: hashFiles('**/go.mod') != ''
         with:
           go-version: stable
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         if: hashFiles('**/package.json') != ''
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: '**/package-lock.json'
-      - uses: actions/setup-python@v5
-        if: hashFiles('**/pyproject.toml', '**/requirements*.txt') != ''
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.13'
+      - name: Install policy parser
+        if: hashFiles('.opendev/validations.yml') != ''
+        run: python -m pip install 'PyYAML==6.0.3'
       - name: Run OpenDev CI contract
-        shell: bash
+        shell: python
+        env:
+          OPENDEV_CI_PROFILE: ${{ inputs.profile || 'auto' }}
         run: |
-          set -euo pipefail
-          if [ -f frontend/package.json ]; then
-            (cd frontend && npm ci && npm test --if-present && npm run build --if-present)
-          fi
-          if [ -f package.json ]; then
-            npm ci
-            npm test --if-present
-            npm run build --if-present
-          fi
-          if [ -f go.mod ]; then
-            sudo apt-get update
-            sudo apt-get install -y libolm-dev
-            go test ./...
-            go vet ./...
-          fi
-          if [ -f pyproject.toml ] || [ -f requirements.txt ]; then
-            python -m pip install --upgrade pip
-            if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-            if [ -f pyproject.toml ]; then pip install -e .; fi
-            python -m pytest
-          fi
-          if [ -f Makefile ]; then
-            make test
-          fi
+          import json, os, pathlib, subprocess, sys
+
+          root = pathlib.Path.cwd().resolve()
+          count = 0
+          def run(command, directory=root, timeout=600):
+              print(f"::group::{directory.relative_to(root)}: {command}", flush=True)
+              subprocess.run(["bash", "-euo", "pipefail", "-c", command], cwd=directory, check=True, timeout=timeout)
+              print("::endgroup::", flush=True)
+
+          policy = root / ".opendev/validations.yml"
+          if policy.exists():
+              import yaml
+              if not policy.resolve().is_relative_to(root):
+                  sys.exit("Validation policy escapes the repository")
+              document = yaml.safe_load(policy.read_text())
+              validations = document.get("validations") if isinstance(document, dict) else None
+              if not isinstance(validations, dict) or not validations:
+                  sys.exit("Validation policy must declare at least one validation")
+              for name, definition in validations.items():
+                  if not isinstance(definition, dict):
+                      sys.exit(f"Invalid validation: {name}")
+                  command = definition.get("command")
+                  directory = (root / definition.get("directory", ".")).resolve()
+                  timeout = definition.get("timeout_seconds", 300)
+                  if not isinstance(command, str) or not command.strip() or not directory.is_relative_to(root):
+                      sys.exit(f"Invalid validation: {name}")
+                  if not isinstance(timeout, int) or not 1 <= timeout <= 1800:
+                      sys.exit(f"Invalid timeout: {name}")
+                  run(command, directory, timeout)
+                  count += 1
+          else:
+              profile = os.environ.get("OPENDEV_CI_PROFILE", "auto")
+              if profile not in {"auto", "go", "node", "python", "rust", "make"}:
+                  sys.exit(f"Unsupported CI profile: {profile}")
+              ignored = {".git", ".opendev", "node_modules", "vendor", ".venv", "venv", "target", "dist", "build"}
+              directories = []
+              for path, children, files in os.walk(root, followlinks=False):
+                  children[:] = sorted(c for c in children if c not in ignored and not pathlib.Path(path, c).is_symlink())
+                  directories.append((pathlib.Path(path), set(files)))
+              node_roots = []
+              for directory, files in directories:
+                  if profile in {"auto", "go"} and "go.mod" in files:
+                      run("go test -race ./... && go vet ./...", directory)
+                      count += 1
+                  if profile in {"auto", "node"} and "package.json" in files:
+                      if any(parent in directory.parents for parent in node_roots) and "package-lock.json" not in files:
+                          continue  # npm workspaces are validated at their lockfile root
+                      scripts = json.loads((directory / "package.json").read_text()).get("scripts", {})
+                      commands = [f"npm run {name}" for name in ("test", "build") if name in scripts]
+                      if "package-lock.json" not in files or not commands:
+                          sys.exit(f"{directory}: declare a validation policy or provide a lockfile and test/build script")
+                      run("npm ci && " + " && ".join(commands), directory)
+                      node_roots.append(directory)
+                      count += 1
+                  if profile in {"auto", "python"} and ({"pyproject.toml", "requirements.txt"} & files):
+                      commands = ["python -m pip install pytest"]
+                      if "requirements.txt" in files: commands.append("python -m pip install -r requirements.txt")
+                      if "pyproject.toml" in files: commands.append("python -m pip install -e .")
+                      run(" && ".join(commands + ["python -m pytest"]), directory)
+                      count += 1
+                  if profile in {"auto", "rust"} and "Cargo.toml" in files:
+                      run("cargo test --locked --workspace", directory)
+                      count += 1
+              if profile == "make" or (count == 0 and profile == "auto" and (root / "Makefile").exists()):
+                  run("make test")
+                  count += 1
+          if count == 0:
+              sys.exit("No supported validations found; declare .opendev/validations.yml")
+          print(f"Executed {count} validation group(s)")
+      - name: Test real Git integration
+        if: github.repository == 'iamangus/opendev'
+        run: go test -race -tags=integration ./...

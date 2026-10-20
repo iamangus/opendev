@@ -141,3 +141,25 @@ func TestValidateAndSnapshotRejectsUnknownDirtyAndAmbiguousReferences(t *testing
 		t.Fatal("ValidateAndSnapshot succeeded after Git error")
 	}
 }
+
+func TestReferencePinSurvivesSourceBranchMoving(t *testing.T) {
+	source := t.TempDir()
+	path := filepath.Join(source, ".opendev", "references", "job-1", "reference")
+	os.MkdirAll(path, 0755)
+	manager := &fakeWorktreeManager{status: map[string]string{}, detached: map[string]bool{path: true}, revisions: map[string]string{source + ":HEAD": "first", path + ":HEAD": "first"}}
+	service, _ := New(&fakeCatalog{records: map[string]*repositorycatalog.Record{"reference": {Name: "reference", Path: source}}}, manager)
+	request := []pipeline.ReferenceRepository{{Repository: "reference", Purpose: "context"}}
+	if _, err := service.ValidateAndSnapshot("job-1", request); err != nil {
+		t.Fatal(err)
+	}
+	manager.revisions[source+":HEAD"] = "second"
+	snapshots, err := service.ValidateAndSnapshot("job-1", request)
+	if err != nil || snapshots[0].SHA != "first" {
+		t.Fatalf("snapshot moved on retry: %+v %v", snapshots, err)
+	}
+	manager.revisions[source+":new-revision"] = "second"
+	request[0].Revision = "new-revision"
+	if _, err := service.ValidateAndSnapshot("job-1", request); err == nil {
+		t.Fatal("explicit revision silently rebound an immutable snapshot")
+	}
+}

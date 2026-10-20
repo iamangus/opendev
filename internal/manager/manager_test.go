@@ -63,7 +63,7 @@ func TestBranchWorktreeDir(t *testing.T) {
 func TestBranchWorktreeDirKeepsSlashBranchesSingleSegment(t *testing.T) {
 	mgr, _ := newTestManager(t)
 	got := mgr.BranchWorktreeDir("myapp", "opendev/job-1")
-	want := filepath.Join(mgr.ReposDir(), "myapp", ".opendev", "worktrees", "opendev-job-1")
+	want := filepath.Join(mgr.ReposDir(), "myapp", ".opendev", "worktrees", "ref-b3BlbmRldi9qb2ItMQ")
 	if got != want {
 		t.Errorf("BranchWorktreeDir = %q, want %q", got, want)
 	}
@@ -72,7 +72,10 @@ func TestBranchWorktreeDirKeepsSlashBranchesSingleSegment(t *testing.T) {
 func TestCommitReturnsHeadSHA(t *testing.T) {
 	mgr, fake := newTestManager(t)
 	fake.StringReturns["HeadCommit"] = "abc123"
-	sha, err := mgr.Commit("/work/task")
+	createFakeRepo(t, mgr, "repo")
+	path := mgr.BranchWorktreeDir("repo", "task")
+	os.MkdirAll(path, 0755)
+	sha, err := mgr.Commit(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,10 +296,11 @@ func TestCreateWorktree_InvalidBranch(t *testing.T) {
 }
 
 func TestCreateWorktree_AlreadyExists(t *testing.T) {
-	mgr, _ := newTestManager(t)
+	mgr, git := newTestManager(t)
 	createFakeRepo(t, mgr, "repo")
 	wtDir := mgr.BranchWorktreeDir("repo", "feat")
 	os.MkdirAll(wtDir, 0755)
+	git.Worktrees = []gitops.Worktree{{Path: wtDir, Branch: "feat"}}
 
 	dir, err := mgr.CreateWorktree("repo", "feat", "")
 	if err != nil {

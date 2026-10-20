@@ -1,6 +1,6 @@
 module github.com/iamangus/code-mcp
 
-go 1.24
+go 1.26.9
 
 require (
 	github.com/mark3labs/mcp-go v0.45.0

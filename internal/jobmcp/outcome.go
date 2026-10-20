@@ -2,7 +2,6 @@ package jobmcp
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,11 +18,22 @@ import (
 // supply the StructuredOutput schema presented to the model.
 func OutcomeHandler(config Config) dispatcher.OutcomeHandler {
 	return func(ctx context.Context, run dispatcher.DispatchRun) error {
+		unlock := config.Store.LockJob(run.JobID)
+		defer unlock()
 		job, err := config.Store.Get(run.JobID)
 		if err != nil {
 			return err
 		}
-		if job.Status == pipeline.JobPublished || job.Status == pipeline.JobNoChanges || job.Status == pipeline.JobFailed {
+		if pipeline.Terminal(job.Status) {
+			return nil
+		}
+		if job.Status == pipeline.JobPaused {
+			return fmt.Errorf("job is paused; outcome retained until resume")
+		}
+		if !ownsOutcome(job, run) {
+			if awaitingOwnership(job, run) {
+				return fmt.Errorf("dispatch ownership has not been recorded yet")
+			}
 			return nil
 		}
 		if run.Status != "completed" {
@@ -68,7 +78,7 @@ func applyPlan(ctx context.Context, run dispatcher.DispatchRun, config Config) e
 	if err != nil {
 		return err
 	}
-	if len(job.Plan.ReferenceRepositories) > 0 {
+	if len(job.Plan.ReferenceRepositories) > 0 && len(job.ReferenceSnapshots) == 0 {
 		if config.References == nil {
 			return fmt.Errorf("reference repository snapshots are not configured")
 		}
@@ -147,6 +157,15 @@ func applyWriter(ctx context.Context, run dispatcher.DispatchRun, config Config)
 		return fmt.Errorf("writer reported no_changes but the task worktree is dirty")
 	}
 	if !hasChanges {
+		if task.BaseSHA != "" {
+			head, err := config.Worktrees.HeadCommit(task.WorktreePath)
+			if err != nil {
+				return err
+			}
+			if head != task.BaseSHA {
+				return recordWriterCommitAndReview(ctx, run, config, job, task, head, *response.ValidationEvidence)
+			}
+		}
 		if len(response.ChangedFiles) > 0 {
 			if response.Status == "completed" && task.BaseSHA != "" {
 				head, err := config.Worktrees.HeadCommit(task.WorktreePath)
@@ -203,10 +222,8 @@ func recordWriterCommitAndReview(ctx context.Context, run dispatcher.DispatchRun
 	return err
 }
 
-// applyWriterBlocked verifies a Writer's blocker claim against recorded
-// workspace tool failures before the claim may block the task. A claim with no
-// recorded tool failures in the run window is treated as fabricated: real work
-// is committed and submitted to review, while an empty worktree fails honestly.
+// applyWriterBlocked preserves partial work for operator inspection. Missing
+// tool errors are not proof that a semantic or external blocker is fabricated.
 func applyWriterBlocked(ctx context.Context, run dispatcher.DispatchRun, config Config, job *pipeline.Job, task *pipeline.Task, response writerResponse) error {
 	if task.Status != pipeline.TaskWorking {
 		return nil
@@ -215,49 +232,18 @@ func applyWriterBlocked(ctx context.Context, run dispatcher.DispatchRun, config 
 	if config.WorktreeToolFailures != nil && task.WorktreePath != "" {
 		failures = config.WorktreeToolFailures(task.WorktreePath, run.StartedAt.Add(-time.Minute))
 	}
-	// A verified blocker needs a meaningful wall of failures, not one or two
-	// recoverable misses the Writer should have retried past.
-	if len(failures) >= 3 {
-		if config.Logger != nil {
-			config.Logger.Info("writer blocker verified by recorded tool failures", "job_id", run.JobID, "task", run.TaskKey, "failures", len(failures), "first", failures[0], "window_since", run.StartedAt.Add(-time.Minute))
-		}
-		blocked, err := config.Controller.BlockTask(run.JobID, run.TaskKey, response.Reason)
-		if err != nil {
-			return err
-		}
-		notify(config, blocked, outbox.EventBlocked+":"+run.TaskKey, response.Summary, response.Reason)
-		return nil
-	}
 	if config.Logger != nil {
-		config.Logger.Warn("writer blocker claim unverified; no tool failures recorded", "job_id", run.JobID, "task", run.TaskKey, "claim", response.Reason)
+		config.Logger.Info("writer reported a blocker", "job_id", run.JobID, "task", run.TaskKey, "recorded_failures", len(failures))
 	}
-	hasChanges, err := config.Worktrees.HasChanges(task.WorktreePath)
-	if err != nil {
-		return err
+	reason := strings.TrimSpace(response.Reason)
+	if reason == "" {
+		reason = strings.TrimSpace(response.Summary)
 	}
-	if !hasChanges {
-		reason := fmt.Sprintf("writer reported blocked with no recorded tool failures and no worktree changes: %s", response.Reason)
-		blocked, err := config.Controller.BlockTask(run.JobID, run.TaskKey, reason)
-		if err != nil {
-			return err
-		}
-		notify(config, blocked, outbox.EventBlocked+":"+run.TaskKey, response.Summary, reason)
-		return nil
+	if reason == "" {
+		return fmt.Errorf("blocked writer response requires a reason")
 	}
-	sha, err := config.Worktrees.Commit(task.WorktreePath)
-	if err != nil {
-		return err
-	}
-	job, err = config.Controller.RecordWriterCompletion(job.ID, task.Key, run.RunID, sha, append([]pipeline.ValidationEvidence(nil), *response.ValidationEvidence...))
-	if err != nil {
-		return err
-	}
-	task = findTask(job, task.Key)
-	review, err := config.Dispatcher.StartReviewer(ctx, job, task)
-	if err != nil {
-		return err
-	}
-	_, err = config.Controller.StartReviewer(job.ID, task.Key, review.RunID)
+	blocked, err := config.Controller.BlockTask(run.JobID, run.TaskKey, reason)
+	notify(config, blocked, outbox.EventBlocked+":"+run.TaskKey, response.Summary, reason)
 	return err
 }
 
@@ -427,20 +413,49 @@ const maxHolisticRemediationRounds = 3
 // already fully integrated diff to the PR-branch remediation machinery by
 // creating a synthetic remediation task keyed to the integration SHA.
 func remediateIntegratedDiff(ctx context.Context, job *pipeline.Job, config Config, response reviewResponse) error {
-	fingerprint := fmt.Sprintf("holistic:%x", sha256.Sum256([]byte(strings.Join(response.Findings, "\n"))))
-	checks := []pipeline.CheckResult(nil)
-	if job.CI != nil {
-		checks = job.CI.Checks
-	}
-	controller := pipeline.NewController(config.Store)
-	_, task, err := controller.StartCIRemediation(job.ID, fingerprint, checks)
+	description := response.Summary + "\n" + strings.Join(response.Findings, "\n") + "\n" + response.Reason
+	updated, err := config.Controller.StartReviewRemediation(job.ID, description)
 	if err != nil {
 		return err
 	}
-	if config.Logger != nil {
-		config.Logger.Info("holistic remediation dispatched", "job_id", job.ID, "task", task.Key)
+	_, err = startReadyWriters(ctx, updated, config)
+	return err
+}
+
+func ownsOutcome(job *pipeline.Job, run dispatcher.DispatchRun) bool {
+	switch run.Role {
+	case dispatcher.RolePlanner:
+		if run.TaskKey == "revision" {
+			return run.Attempt == 0 || run.Attempt == dispatcher.PlannerAttempt(job, true)
+		}
+		return (job.Status == pipeline.JobPlanning || job.Plan != nil) && (run.Attempt == 0 || run.Attempt == dispatcher.PlannerAttempt(job, false))
+	case dispatcher.RoleHolistic:
+		return job.HolisticReviewRunID == run.RunID && (run.Attempt == 0 || run.Attempt == job.HolisticRounds+1)
+	case dispatcher.RoleWriter, dispatcher.RoleReviewer:
+		task := findTask(job, run.TaskKey)
+		if task == nil {
+			return false
+		}
+		if run.Role == dispatcher.RoleWriter {
+			return task.WriterRunID == run.RunID
+		}
+		return task.ReviewerRunID == run.RunID
 	}
-	return nil
+	return false
+}
+
+func awaitingOwnership(job *pipeline.Job, run dispatcher.DispatchRun) bool {
+	if run.Role == dispatcher.RoleHolistic {
+		return job.Status == pipeline.JobHolisticReviewing && job.HolisticReviewRunID == "" && (run.Attempt == 0 || run.Attempt == job.HolisticRounds+1)
+	}
+	task := findTask(job, run.TaskKey)
+	if task == nil {
+		return false
+	}
+	if run.Role == dispatcher.RoleWriter {
+		return task.WriterRunID == "" && (task.Status == pipeline.TaskPlanned || task.Status == pipeline.TaskChangesRequested) && (run.Attempt == 0 || run.Attempt == task.WriterAttempts+1)
+	}
+	return run.Role == dispatcher.RoleReviewer && task.ReviewerRunID == "" && task.Status == pipeline.TaskReviewing && (run.Attempt == 0 || run.Attempt == task.ReviewerAttempts+1)
 }
 
 func recordTerminalFailure(run dispatcher.DispatchRun, config Config) error {

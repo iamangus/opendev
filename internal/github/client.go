@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -17,11 +18,12 @@ const defaultBaseURL = "https://api.github.com"
 
 // HTTPClient implements Client using the GitHub REST API.
 type HTTPClient struct {
-	token   string
-	owner   string
-	baseURL string
-	http    *http.Client
-	logger  *slog.Logger
+	token        string
+	owner        string
+	baseURL      string
+	http         *http.Client
+	logger       *slog.Logger
+	organization bool
 }
 
 // HTTPClientOption configures an HTTPClient.
@@ -32,13 +34,15 @@ func WithBaseURL(url string) HTTPClientOption {
 	return func(c *HTTPClient) { c.baseURL = url }
 }
 
+func WithOrganizationOwner() HTTPClientOption { return func(c *HTTPClient) { c.organization = true } }
+
 // NewHTTPClient creates a new GitHub API client.
 func NewHTTPClient(token, owner string, logger *slog.Logger, opts ...HTTPClientOption) *HTTPClient {
 	c := &HTTPClient{
 		token:   token,
 		owner:   owner,
 		baseURL: defaultBaseURL,
-		http:    &http.Client{},
+		http:    &http.Client{Timeout: 30 * time.Second},
 		logger:  logger,
 	}
 	for _, o := range opts {
@@ -53,15 +57,30 @@ func NewHTTPClient(token, owner string, logger *slog.Logger, opts ...HTTPClientO
 func (c *HTTPClient) ListOwnedRepositories(ctx context.Context) ([]Repository, error) {
 	start := time.Now()
 	var repos []Repository
-	if err := c.do(ctx, http.MethodGet, "/user/repos?affiliation=owner&per_page=100", nil, &repos); err != nil {
-		c.logger.Error("github: ListOwnedRepositories failed", "owner", c.owner, "error", err, "duration_ms", time.Since(start).Milliseconds())
-		return nil, err
+	path := "/user/repos?affiliation=owner&per_page=100"
+	if c.organization {
+		path = "/orgs/" + url.PathEscape(c.owner) + "/repos?per_page=100"
+	}
+	for page := 1; ; page++ {
+		pagePath := path
+		if page > 1 {
+			pagePath += fmt.Sprintf("&page=%d", page)
+		}
+		var batch []Repository
+		if err := c.do(ctx, http.MethodGet, pagePath, nil, &batch); err != nil {
+			c.logger.Error("github: ListOwnedRepositories failed", "owner", c.owner, "error", err, "duration_ms", time.Since(start).Milliseconds())
+			return nil, err
+		}
+		repos = append(repos, batch...)
+		if len(batch) < 100 {
+			break
+		}
 	}
 
 	prefix := c.owner + "/"
 	owned := repos[:0]
 	for _, repo := range repos {
-		if repo.FullName == "" || repo.FullName == prefix[:len(prefix)-1] || len(repo.FullName) <= len(prefix) || repo.FullName[:len(prefix)] != prefix {
+		if len(repo.FullName) <= len(prefix) || !strings.EqualFold(repo.FullName[:len(prefix)], prefix) {
 			continue
 		}
 		owned = append(owned, repo)
@@ -86,6 +105,9 @@ func (c *HTTPClient) GetRepository(ctx context.Context, name string) (*Repositor
 func (c *HTTPClient) CreateRepository(ctx context.Context, name, description string, private bool) (*Repository, error) {
 	start := time.Now()
 	path := "/user/repos"
+	if c.organization {
+		path = "/orgs/" + url.PathEscape(c.owner) + "/repos"
+	}
 	payload := map[string]any{
 		"name":        name,
 		"description": description,
@@ -108,9 +130,17 @@ func (c *HTTPClient) ForkPublicRepository(ctx context.Context, upstreamOwner, up
 	start := time.Now()
 	path := fmt.Sprintf("/repos/%s/%s/forks", upstreamOwner, upstreamRepo)
 	payload := map[string]any{
-		"owner":   c.owner,
-		"name":    name,
-		"private": private,
+		"name": name,
+	}
+	if c.organization {
+		payload["organization"] = c.owner
+	}
+	var upstream Repository
+	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s", url.PathEscape(upstreamOwner), url.PathEscape(upstreamRepo)), nil, &upstream); err != nil {
+		return nil, err
+	}
+	if upstream.Private || private {
+		return nil, fmt.Errorf("fork_public_repository only accepts public repositories")
 	}
 
 	var repo Repository
@@ -144,7 +174,7 @@ func (c *HTTPClient) CreatePR(ctx context.Context, opts CreatePROptions) (*PR, e
 
 func (c *HTTPClient) FindPR(ctx context.Context, repo, headBranch string) (*PR, error) {
 	start := time.Now()
-	path := fmt.Sprintf("/repos/%s/%s/pulls?head=%s:%s&state=open", c.owner, repo, c.owner, headBranch)
+	path := fmt.Sprintf("/repos/%s/%s/pulls?head=%s&state=open", c.owner, repo, url.QueryEscape(c.owner+":"+headBranch))
 
 	var prs []PR
 	if err := c.do(ctx, http.MethodGet, path, nil, &prs); err != nil {
@@ -234,12 +264,26 @@ func (c *HTTPClient) GetPR(ctx context.Context, repo string, number int) (*PR, e
 
 func (c *HTTPClient) GetPRChecks(ctx context.Context, repo, ref string) (*PRChecks, error) {
 	start := time.Now()
-	path := fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs", c.owner, repo, ref)
-
+	path := fmt.Sprintf("/repos/%s/%s/commits/%s/check-runs?per_page=100", c.owner, repo, url.PathEscape(ref))
 	var checks PRChecks
-	if err := c.do(ctx, http.MethodGet, path, nil, &checks); err != nil {
-		c.logger.Error("github: GetPRChecks failed", "repo", repo, "ref", ref, "error", err, "duration_ms", time.Since(start).Milliseconds())
-		return nil, err
+	for page := 1; ; page++ {
+		pagePath := path
+		if page > 1 {
+			pagePath += fmt.Sprintf("&page=%d", page)
+		}
+		var batch PRChecks
+		if err := c.do(ctx, http.MethodGet, pagePath, nil, &batch); err != nil {
+			c.logger.Error("github: GetPRChecks failed", "repo", repo, "ref", ref, "error", err, "duration_ms", time.Since(start).Milliseconds())
+			return nil, err
+		}
+		checks.TotalCount = batch.TotalCount
+		checks.CheckRuns = append(checks.CheckRuns, batch.CheckRuns...)
+		if len(checks.CheckRuns) >= checks.TotalCount {
+			break
+		}
+		if len(batch.CheckRuns) == 0 {
+			return nil, fmt.Errorf("GitHub returned incomplete check pagination")
+		}
 	}
 	c.logger.Debug("github: PR checks retrieved", "repo", repo, "ref", ref, "duration_ms", time.Since(start).Milliseconds())
 	return &checks, nil
@@ -276,7 +320,7 @@ func (c *HTTPClient) EnsureRequiredCheck(ctx context.Context, repo, branch, chec
 			Contexts []string `json:"contexts"`
 		} `json:"required_status_checks"`
 	}
-	err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s/branches/%s/protection", c.owner, repo, branch), nil, &current)
+	err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s/branches/%s/protection", c.owner, repo, url.PathEscape(branch)), nil, &current)
 	if err == nil {
 		if current.RequiredStatusChecks != nil {
 			for _, context := range current.RequiredStatusChecks.Contexts {
@@ -289,7 +333,7 @@ func (c *HTTPClient) EnsureRequiredCheck(ctx context.Context, repo, branch, chec
 	}
 	if errors.Is(err, ErrNotFound) {
 		payload := map[string]any{"required_status_checks": map[string]any{"strict": true, "contexts": []string{check}}, "enforce_admins": false, "required_pull_request_reviews": nil, "restrictions": nil, "required_linear_history": false, "allow_force_pushes": false, "allow_deletions": false, "block_creations": false, "required_conversation_resolution": false, "lock_branch": false, "allow_fork_syncing": false}
-		return c.do(ctx, http.MethodPut, fmt.Sprintf("/repos/%s/%s/branches/%s/protection", c.owner, repo, branch), payload, nil)
+		return c.do(ctx, http.MethodPut, fmt.Sprintf("/repos/%s/%s/branches/%s/protection", c.owner, repo, url.PathEscape(branch)), payload, nil)
 	}
 	if strings.Contains(err.Error(), ": 403 ") {
 		return fmt.Errorf("%w: %v", ErrPlanLimited, err)
@@ -323,7 +367,16 @@ func (c *HTTPClient) do(ctx context.Context, method, path string, reqBody any, o
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, (8<<20)+1))
+	if readErr != nil {
+		return fmt.Errorf("read GitHub response: %w", readErr)
+	}
+	if len(respBody) > 8<<20 {
+		return fmt.Errorf("GitHub response exceeds 8 MiB")
+	}
+	if resp.StatusCode >= 400 && len(respBody) > 4096 {
+		respBody = respBody[:4096]
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		return fmt.Errorf("%w: github API %s %s: %d %s", ErrNotFound, method, path, resp.StatusCode, string(respBody))
 	}

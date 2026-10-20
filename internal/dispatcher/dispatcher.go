@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/iamangus/code-mcp/internal/agentfoundry"
+	"github.com/iamangus/code-mcp/internal/locks"
 	"github.com/iamangus/code-mcp/internal/pipeline"
 )
 
@@ -90,25 +91,31 @@ type TraceRunner interface {
 }
 
 type Config struct {
-	MCPServers     []agentfoundry.MCPServer
-	PollInterval   time.Duration
-	Logger         *slog.Logger
-	OutcomeHandler OutcomeHandler
+	MCPServers       []agentfoundry.MCPServer
+	MCPServersForRun func(context.Context, DispatchRun) ([]agentfoundry.MCPServer, error)
+	PollInterval     time.Duration
+	Logger           *slog.Logger
+	OutcomeHandler   OutcomeHandler
 }
 
 // Dispatcher launches asynchronous runs, durably observes terminal responses,
 // then delegates their application to the configured outcome handler.
 type Dispatcher struct {
-	runner         Runner
-	store          RunStore
-	mcpServers     []agentfoundry.MCPServer
-	pollInterval   time.Duration
-	logger         *slog.Logger
-	outcomeHandler OutcomeHandler
-	ctx            context.Context
-	cancel         context.CancelFunc
-	mu             sync.Mutex
-	watching       map[string]struct{}
+	runner           Runner
+	store            RunStore
+	mcpServers       []agentfoundry.MCPServer
+	mcpServersForRun func(context.Context, DispatchRun) ([]agentfoundry.MCPServer, error)
+	pollInterval     time.Duration
+	logger           *slog.Logger
+	outcomeHandler   OutcomeHandler
+	ctx              context.Context
+	cancel           context.CancelFunc
+	mu               sync.Mutex
+	startLocks       *locks.Manager
+	applyLocks       *locks.Manager
+	closed           bool
+	watchers         sync.WaitGroup
+	watching         map[string]struct{}
 }
 
 func New(runner Runner, store RunStore, config Config) (*Dispatcher, error) {
@@ -122,10 +129,50 @@ func New(runner Runner, store RunStore, config Config) (*Dispatcher, error) {
 		config.Logger = slog.Default()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Dispatcher{runner: runner, store: store, mcpServers: config.MCPServers, pollInterval: config.PollInterval, logger: config.Logger, outcomeHandler: config.OutcomeHandler, ctx: ctx, cancel: cancel, watching: make(map[string]struct{})}, nil
+	return &Dispatcher{runner: runner, store: store, mcpServers: config.MCPServers, mcpServersForRun: config.MCPServersForRun, pollInterval: config.PollInterval, logger: config.Logger, outcomeHandler: config.OutcomeHandler, ctx: ctx, cancel: cancel, watching: make(map[string]struct{}), startLocks: locks.NewManager(config.Logger), applyLocks: locks.NewManager(config.Logger)}, nil
 }
 
-func (d *Dispatcher) Close() { d.cancel() }
+func (d *Dispatcher) Close() {
+	d.mu.Lock()
+	d.closed = true
+	d.cancel()
+	d.mu.Unlock()
+	d.watchers.Wait()
+}
+
+func (d *Dispatcher) CancelJob(ctx context.Context, jobID string) error {
+	runs, err := d.InspectJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	for _, run := range runs {
+		if terminal(run.Status) {
+			if !run.OutcomeApplied {
+				run.OutcomeApplied = true
+				if err := d.store.Save(ctx, run); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if run.RunID != "" {
+			canceller, ok := d.runner.(interface {
+				CancelRun(context.Context, string) error
+			})
+			if !ok {
+				return fmt.Errorf("runner does not support cancellation")
+			}
+			if err := canceller.CancelRun(ctx, run.RunID); err != nil {
+				return err
+			}
+		}
+		run.Status, run.OutcomeApplied, run.Error = "cancelled", true, "job cancelled by operator"
+		if err := d.store.Save(ctx, run); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // InspectJob returns the immutable dispatch records for an operator view.
 func (d *Dispatcher) InspectJob(ctx context.Context, jobID string) ([]DispatchRun, error) {
@@ -154,7 +201,7 @@ func (d *Dispatcher) StartPlanner(ctx context.Context, job *pipeline.Job) (*Disp
 	if job == nil {
 		return nil, fmt.Errorf("job is required")
 	}
-	return d.start(ctx, job, RolePlanner, "job", 1, job.PlannerAgentID, fmt.Sprintf("Plan coding job %s: %s. Your final structured response is authoritative; do not use a reporting or completion MCP tool.", job.ID, job.Directive))
+	return d.start(ctx, job, RolePlanner, "job", PlannerAttempt(job, false), job.PlannerAgentID, fmt.Sprintf("Plan coding job %s: %s. Your final structured response is authoritative; do not use a reporting or completion MCP tool.", job.ID, job.Directive))
 }
 
 // StartPlannerRevision asks the Planner to revise the plan after repeated
@@ -164,8 +211,17 @@ func (d *Dispatcher) StartPlannerRevision(ctx context.Context, job *pipeline.Job
 		return nil, fmt.Errorf("job is required")
 	}
 	message := fmt.Sprintf("Revise the plan for coding job %s (%s). Required CI failed with the identical fingerprint after remediation Writers could not resolve it. Your final structured response is authoritative; do not use a reporting or completion MCP tool. Produce additional tasks (with focused descriptions and acceptance criteria) that fix the root cause of this CI failure on the existing integration branch: %s", job.ID, job.Directive, ciFailureEvidence(job))
-	return d.start(ctx, job, RolePlanner, "revision", job.CIReplanRounds+1, job.PlannerAgentID, message)
+	return d.start(ctx, job, RolePlanner, "revision", PlannerAttempt(job, true), job.PlannerAgentID, message)
 }
+
+func PlannerAttempt(job *pipeline.Job, revision bool) int {
+	if revision {
+		return job.CIReplanRounds + 1 + job.PlannerRetry*100
+	}
+	return 1 + job.PlannerRetry
+}
+
+func IsTerminal(status string) bool { return terminal(status) }
 
 // ciFailureEvidence renders the durable CI failure for planner messages.
 func ciFailureEvidence(job *pipeline.Job) string {
@@ -238,6 +294,10 @@ func (d *Dispatcher) start(ctx context.Context, job *pipeline.Job, role, taskKey
 		return nil, fmt.Errorf("valid job, task, attempt, and agent ID are required")
 	}
 	taskID := TaskID(job.ID, role, taskKey, attempt)
+	if err := d.startLocks.Lock(ctx, taskID); err != nil {
+		return nil, err
+	}
+	defer d.startLocks.Unlock(taskID)
 	existing, err := d.store.Get(ctx, taskID)
 	if err != nil {
 		return nil, fmt.Errorf("load dispatch run: %w", err)
@@ -284,7 +344,24 @@ func (d *Dispatcher) Reconcile(ctx context.Context) error {
 	for i := range runs {
 		run := runs[i]
 		if run.RunID == "" {
-			if err := d.launch(ctx, &run); err != nil {
+			if err := d.startLocks.Lock(ctx, run.TaskID); err != nil {
+				return err
+			}
+			latest, loadErr := d.store.Get(ctx, run.TaskID)
+			var launchErr error
+			if loadErr != nil {
+				launchErr = loadErr
+			} else if latest != nil && latest.OutcomeApplied { /* operator superseded this intent */
+			} else if latest != nil && latest.RunID != "" {
+				d.watch(*latest)
+			} else {
+				if latest != nil {
+					run = *latest
+				}
+				launchErr = d.launch(ctx, &run)
+			}
+			d.startLocks.Unlock(run.TaskID)
+			if err := launchErr; err != nil {
 				// One stale launch intent must not prevent later terminal outcomes
 				// from reconciling and repairing its current dispatch selection.
 				d.logger.Warn("reconcile dispatch launch failed", "job_id", run.JobID, "role", run.Role, "task", run.TaskKey, "error", err)
@@ -292,7 +369,9 @@ func (d *Dispatcher) Reconcile(ctx context.Context) error {
 			continue
 		}
 		if terminal(run.Status) {
-			d.apply(run)
+			if !d.apply(run) {
+				d.watch(run)
+			}
 		} else {
 			d.watch(run)
 		}
@@ -308,14 +387,18 @@ func (d *Dispatcher) launch(ctx context.Context, run *DispatchRun) error {
 		if err := d.store.Save(ctx, *run); err != nil {
 			return fmt.Errorf("persist recovered AgentFoundry run: %w", err)
 		}
-		if terminal(run.Status) {
-			d.apply(*run)
-		} else {
-			d.watch(*run)
-		}
+		d.watch(*run)
 		return nil
 	}
-	options := agentfoundry.RunOptions{Message: run.Message, TaskID: run.TaskID, MCPServers: d.mcpServers}
+	servers := d.mcpServers
+	if d.mcpServersForRun != nil {
+		var err error
+		servers, err = d.mcpServersForRun(ctx, *run)
+		if err != nil {
+			return fmt.Errorf("resolve dispatch tools: %w", err)
+		}
+	}
+	options := agentfoundry.RunOptions{Message: run.Message, TaskID: run.TaskID, MCPServers: servers}
 	if detailed, ok := d.runner.(DetailedRunner); ok {
 		started, err := detailed.StartRunDetail(ctx, run.AgentID, options)
 		if err != nil {
@@ -338,54 +421,90 @@ func (d *Dispatcher) launch(ctx context.Context, run *DispatchRun) error {
 
 func (d *Dispatcher) watch(run DispatchRun) {
 	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		return
+	}
 	if _, exists := d.watching[run.TaskID]; exists {
 		d.mu.Unlock()
 		return
 	}
 	d.watching[run.TaskID] = struct{}{}
+	d.watchers.Add(1)
 	d.mu.Unlock()
 	go func() {
+		defer d.watchers.Done()
 		defer func() {
 			d.mu.Lock()
 			delete(d.watching, run.TaskID)
 			d.mu.Unlock()
 		}()
-		ticker := time.NewTicker(d.pollInterval)
-		defer ticker.Stop()
+		delay := d.pollInterval
 		for {
-			observed, err := d.runner.GetRun(d.ctx, run.RunID)
-			if err == nil && observed != nil && terminal(observed.Status) {
-				run.Status = observed.Status
-				run.Response = observed.Response
-				run.Error = observed.Error
-				run.CompletedAt = time.Now().UTC()
-				if err := d.store.Save(d.ctx, run); err == nil {
-					d.logger.Info("AgentFoundry run reached terminal state", "job_id", run.JobID, "role", run.Role, "task", run.TaskKey, "run_id", run.RunID, "status", observed.Status)
-					d.apply(run)
-				}
+			if saved, err := d.store.Get(d.ctx, run.TaskID); err == nil && saved != nil && saved.OutcomeApplied {
 				return
 			}
+			if terminal(run.Status) {
+				if d.apply(run) {
+					return
+				}
+				delay = min(delay*2, time.Minute)
+			} else {
+				observed, err := d.runner.GetRun(d.ctx, run.RunID)
+				if err != nil {
+					delay = min(delay*2, time.Minute)
+				} else {
+					delay = d.pollInterval
+				}
+				if err == nil && observed != nil && terminal(observed.Status) {
+					run.Status = observed.Status
+					run.Response = observed.Response
+					run.Error = observed.Error
+					run.CompletedAt = time.Now().UTC()
+					if err := d.store.Save(d.ctx, run); err == nil {
+						d.logger.Info("AgentFoundry run reached terminal state", "job_id", run.JobID, "role", run.Role, "task", run.TaskKey, "run_id", run.RunID, "status", observed.Status)
+						if d.apply(run) {
+							return
+						}
+					} else {
+						run.Status = "running"
+					}
+				}
+			}
+			timer := time.NewTimer(delay)
 			select {
 			case <-d.ctx.Done():
+				timer.Stop()
 				return
-			case <-ticker.C:
+			case <-timer.C:
 			}
 		}
 	}()
 }
 
-func (d *Dispatcher) apply(run DispatchRun) {
+func (d *Dispatcher) apply(run DispatchRun) bool {
+	if err := d.applyLocks.Lock(d.ctx, run.TaskID); err != nil {
+		return false
+	}
+	defer d.applyLocks.Unlock(run.TaskID)
+	if current, err := d.store.Get(d.ctx, run.TaskID); err != nil {
+		return false
+	} else if current != nil && current.OutcomeApplied {
+		return true
+	}
 	if run.OutcomeApplied || d.outcomeHandler == nil {
-		return
+		return true
 	}
 	if err := d.outcomeHandler(d.ctx, run); err != nil {
 		d.logger.Error("apply AgentFoundry terminal outcome", "job_id", run.JobID, "role", run.Role, "task", run.TaskKey, "run_id", run.RunID, "error", err)
-		return
+		return false
 	}
 	run.OutcomeApplied = true
 	if err := d.store.Save(d.ctx, run); err != nil {
 		d.logger.Error("persist AgentFoundry outcome marker", "run_id", run.RunID, "error", err)
+		return false
 	}
+	return true
 }
 
 func TaskID(jobID, role, taskKey string, attempt int) string {

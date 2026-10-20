@@ -3,6 +3,7 @@ package jobmcp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/iamangus/code-mcp/internal/ciobserver"
 	"github.com/iamangus/code-mcp/internal/dispatcher"
 	githubpkg "github.com/iamangus/code-mcp/internal/github"
 	"github.com/iamangus/code-mcp/internal/outbox"
@@ -70,6 +72,7 @@ type Config struct {
 	References    *references.Service
 	Validation    ValidationRunner
 	AllowNoChecks bool
+	ForceMerge    bool
 	Logger        *slog.Logger
 	Outbox        *outbox.Store
 	// WorktreeToolFailures reports tool failures recorded for a worktree at or
@@ -98,7 +101,17 @@ func New(config Config) *server.StreamableHTTPServer {
 
 // NewRole creates a job MCP endpoint exposing only the tools assigned to role.
 func NewRole(config Config, role Role) *server.StreamableHTTPServer {
-	s := server.NewMCPServer("opendev", "2.0.0", server.WithToolCapabilities(true))
+	s := server.NewMCPServer("opendev", "2.0.0", server.WithToolCapabilities(true), server.WithToolHandlerMiddleware(func(next server.ToolHandlerFunc) server.ToolHandlerFunc {
+		return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if role == RoleAdmin && !strings.HasPrefix(req.Params.Name, "get_") {
+				if id := req.GetString("job_id", ""); id != "" {
+					unlock := config.Store.LockJob(id)
+					defer unlock()
+				}
+			}
+			return next(ctx, req)
+		}
+	}))
 	registerJobs(s, config, role)
 	return server.NewStreamableHTTPServer(s)
 }
@@ -119,6 +132,7 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 		return false
 	}
 	if allowed() {
+		registerOperatorTools(s, config)
 		s.AddTool(mcp.NewTool("get_code_task_inspection",
 			mcp.WithDescription("Return the complete durable audit trail for one task, including review feedback and its AgentFoundry dispatch attempts. Read-only."),
 			mcp.WithString("job_id", mcp.Required()),
@@ -199,7 +213,7 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 		})
 
 		s.AddTool(mcp.NewTool("retry_code_task",
-			mcp.WithDescription("Retry a Writer task whose terminal result could not be applied, or resume a task its Writer reported blocked. Durable history is preserved."),
+			mcp.WithDescription("Retry an unapplied Writer or Reviewer result, or resume a blocked/no-changes task. Durable history is preserved."),
 			mcp.WithString("job_id", mcp.Required()),
 			mcp.WithString("task_key", mcp.Required()),
 			mcp.WithString("reason", mcp.Required()),
@@ -220,11 +234,30 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 			if err != nil {
 				return toolError(err), nil
 			}
+			if job.Status == pipeline.JobCancelled || job.Status == pipeline.JobPublished || job.Status == pipeline.JobFailed || job.Status == pipeline.JobPaused {
+				return toolError(fmt.Errorf("cannot retry a task while job is %s", job.Status)), nil
+			}
 			task := findTask(job, taskKey)
 			if task == nil {
 				return mcp.NewToolResultError("task not found"), nil
 			}
 			switch {
+			case task.Status == pipeline.TaskReviewing && task.ReviewerRunID != "":
+				if err := config.Dispatcher.Supersede(ctx, dispatcher.TaskID(job.ID, dispatcher.RoleReviewer, task.Key, task.ReviewerAttempts), reason); err != nil {
+					return toolError(err), nil
+				}
+				job, err = config.Controller.RetryReview(job.ID, task.Key, task.ReviewerRunID)
+				if err != nil {
+					return toolError(err), nil
+				}
+				run, err := config.Dispatcher.StartReviewer(ctx, job, findTask(job, taskKey))
+				if err != nil {
+					return toolError(err), nil
+				}
+				if _, err := config.Controller.StartReviewer(job.ID, taskKey, run.RunID); err != nil {
+					return toolError(err), nil
+				}
+				return toolJSON(map[string]any{"job_id": job.ID, "task_key": taskKey, "run_id": run.RunID}), nil
 			case task.Status == pipeline.TaskWorking && task.WriterRunID != "":
 				if err := config.Dispatcher.Supersede(ctx, dispatcher.TaskID(job.ID, dispatcher.RoleWriter, task.Key, task.WriterAttempts), reason); err != nil {
 					return toolError(err), nil
@@ -261,11 +294,7 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-			job, err := config.Store.Get(jobID)
-			if err != nil {
-				return toolError(err), nil
-			}
-			job, err = config.Controller.ResetHolisticRound(jobID)
+			job, err := config.Controller.ResetHolisticRound(jobID)
 			if err != nil {
 				return toolError(err), nil
 			}
@@ -377,6 +406,7 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 			mcp.WithString("planner_agent_id", mcp.Required(), mcp.Description("AgentFoundry ID of the planner.")),
 			mcp.WithString("writer_agent_id", mcp.Required(), mcp.Description("AgentFoundry ID of the writer.")),
 			mcp.WithString("reviewer_agent_id", mcp.Required(), mcp.Description("AgentFoundry ID of the reviewer.")),
+			mcp.WithString("merge_policy", mcp.Description("auto (default) or manual: prepare the PR and wait for explicit merge approval.")),
 		), func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			repository, err := req.RequireString("repository")
 			if err != nil {
@@ -399,6 +429,10 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 			var foundationErr error
+			mergePolicy := req.GetString("merge_policy", "auto")
+			if mergePolicy != "auto" && mergePolicy != "manual" {
+				return toolError(fmt.Errorf("merge_policy must be auto or manual")), nil
+			}
 			if config.Repositories != nil {
 				_, foundationErr = config.Repositories.EnsureFoundation(ctx, repository)
 				if foundationErr != nil && !errors.Is(foundationErr, repositories.ErrFoundationPending) && !errors.Is(foundationErr, repositories.ErrFoundationBlocked) {
@@ -408,6 +442,12 @@ func registerJobs(s *server.MCPServer, config Config, role Role) {
 			job, err := config.Store.Create(repository, directive, req.GetString("target_branch", "main"), "", plannerID, writerID, reviewerID)
 			if err != nil {
 				return toolError(err), nil
+			}
+			if mergePolicy == "manual" {
+				job, err = config.Store.SetMergePolicy(job.ID, mergePolicy)
+				if err != nil {
+					return toolError(err), nil
+				}
 			}
 			if foundationErr != nil {
 				job, err = config.Store.MarkFoundationPending(job.ID)
@@ -572,7 +612,7 @@ func publishApprovedJob(ctx context.Context, jobID string, config Config) (*pipe
 	if job.MergeState == pipeline.MergeMerged && job.Status == pipeline.JobPublished {
 		return job, nil
 	}
-	if job.HolisticReviewVerdict != pipeline.ReviewApproved || (job.Status != pipeline.JobReadyToPublish && job.MergeState != pipeline.MergeOpen) {
+	if job.HolisticReviewVerdict != pipeline.ReviewApproved || job.Status != pipeline.JobReadyToPublish {
 		return nil, fmt.Errorf("job %s is not approved for publication", job.ID)
 	}
 
@@ -580,7 +620,7 @@ func publishApprovedJob(ctx context.Context, jobID string, config Config) (*pipe
 		if job.PullRequestTitle == "" || job.PullRequestBody == "" {
 			return nil, fmt.Errorf("job %s has no generated pull request presentation", job.ID)
 		}
-		pr, err := config.GitHub.CreatePR(ctx, githubpkg.CreatePROptions{
+		pr, err := findOrCreatePR(ctx, config.GitHub, githubpkg.CreatePROptions{
 			Repo: job.Repository, Title: truncateTitle(job.PullRequestTitle), Head: job.IntegrationBranch,
 			Base: job.TargetBranch, Body: job.PullRequestBody, Draft: false,
 		})
@@ -639,7 +679,18 @@ func publishApprovedJob(ctx context.Context, jobID string, config Config) (*pipe
 		return nil, fmt.Errorf("get pull request checks: %w", err)
 	}
 	if err := successfulChecks(checks, config.AllowNoChecks); err != nil {
-		return nil, fmt.Errorf("pull request #%d merge gate: %w", pr.Number, err)
+		if job.CI == nil {
+			return nil, fmt.Errorf("pull request #%d merge gate: %w", pr.Number, err)
+		}
+	}
+	if job.CI != nil {
+		state, _, _ := ciobserver.Evaluate(job.CI.RequiredChecks, checks)
+		if job.CI.HeadSHA != pr.Head.SHA || state != pipeline.CIPassed {
+			return nil, fmt.Errorf("required CI has not passed for the reviewed PR head")
+		}
+	}
+	if job.MergePolicy == "manual" && !config.ForceMerge {
+		return job, nil
 	}
 	if err := config.GitHub.MergePR(ctx, job.Repository, pr.Number, pr.Head.SHA); err != nil {
 		return nil, fmt.Errorf("merge pull request #%d: %w", pr.Number, err)
@@ -672,7 +723,7 @@ func ensureIntegrationWorktree(job *pipeline.Job, config Config) error {
 	if err != nil {
 		return fmt.Errorf("create integration worktree: %w", err)
 	}
-	config.Registrar.RegisterWorktree(job.Repository, safeBranch(job.IntegrationBranch), dir)
+	config.Registrar.RegisterWorktree(job.Repository, job.IntegrationBranch, dir)
 	return nil
 }
 
@@ -698,17 +749,18 @@ func enforceWriterAttemptLimit(job *pipeline.Job, task *pipeline.Task, config Co
 // truncateTitle clamps PR titles to GitHub's 256-character limit.
 func truncateTitle(title string) string {
 	title = strings.TrimSpace(title)
-	if len(title) <= 256 {
+	runes := []rune(title)
+	if len(runes) <= 256 {
 		return title
 	}
-	return strings.TrimSpace(title[:253]) + "..."
+	return strings.TrimSpace(string(runes[:253])) + "..."
 }
 
 func startReadyWriters(ctx context.Context, job *pipeline.Job, config Config) ([]string, error) {
 	var runs []string
 	for i := range job.Plan.Tasks {
 		task := &job.Plan.Tasks[i]
-		if task.Status != pipeline.TaskPlanned || !taskDependenciesIntegrated(job, task) {
+		if (task.Status != pipeline.TaskPlanned && task.Status != pipeline.TaskChangesRequested) || !taskDependenciesIntegrated(job, task) {
 			continue
 		}
 		if stop, err := enforceWriterAttemptLimit(job, task, config); stop || err != nil {
@@ -727,7 +779,7 @@ func startReadyWriters(ctx context.Context, job *pipeline.Job, config Config) ([
 }
 
 func startWriter(ctx context.Context, job *pipeline.Job, task *pipeline.Task, config Config) (*dispatcher.DispatchRun, error) {
-	branch := taskBranch(job.ID, task.Key)
+	branch := WriterBranch(job.ID, task)
 	dir, err := config.Worktrees.CreateWorktree(job.Repository, branch, job.IntegrationBranch)
 	if err != nil {
 		return nil, fmt.Errorf("create task worktree %q: %w", task.Key, err)
@@ -765,7 +817,7 @@ func integrateEligible(jobID string, config Config, ctx context.Context) (*pipel
 	for {
 		var task *pipeline.Task
 		for i := range job.Plan.Tasks {
-			if job.Plan.Tasks[i].Status == pipeline.TaskIntegrationEligible {
+			if job.Plan.Tasks[i].Status == pipeline.TaskIntegrationEligible || job.Plan.Tasks[i].Status == pipeline.TaskIntegrating {
 				task = &job.Plan.Tasks[i]
 				break
 			}
@@ -773,8 +825,10 @@ func integrateEligible(jobID string, config Config, ctx context.Context) (*pipel
 		if task == nil {
 			break
 		}
-		if _, err := config.Controller.StartIntegration(job.ID, task.Key); err != nil {
-			return nil, "", err
+		if task.Status != pipeline.TaskIntegrating {
+			if _, err := config.Controller.StartIntegration(job.ID, task.Key); err != nil {
+				return nil, "", err
+			}
 		}
 		var sha string
 		if task.Kind == pipeline.TaskRemediation && task.Branch == job.IntegrationBranch {
@@ -789,6 +843,13 @@ func integrateEligible(jobID string, config Config, ctx context.Context) (*pipel
 		} else {
 			sha, err = config.Worktrees.MergeTask(job.Repository, task.Branch, job.IntegrationBranch)
 			if err != nil {
+				var intervention interface{ NeedsIntervention() bool }
+				if errors.As(err, &intervention) && intervention.NeedsIntervention() {
+					reason := "integration requires operator attention: " + err.Error()
+					blocked, blockErr := config.Controller.BlockTask(job.ID, task.Key, reason)
+					notify(config, blocked, outbox.EventBlocked+":"+task.Key, task.Title, reason)
+					return blocked, "", blockErr
+				}
 				return nil, "", fmt.Errorf("integrate task %q: %w", task.Key, err)
 			}
 		}
@@ -827,7 +888,7 @@ func startDraftPRCI(ctx context.Context, job *pipeline.Job, config Config) (*pip
 		if job.Plan != nil && strings.TrimSpace(job.Plan.Summary) != "" {
 			title += ": " + strings.TrimSpace(job.Plan.Summary)
 		}
-		pr, err := config.GitHub.CreatePR(ctx, githubpkg.CreatePROptions{Repo: job.Repository, Title: truncateTitle(title), Head: job.IntegrationBranch, Base: job.TargetBranch, Body: "OpenDev is running required CI checks before final review.", Draft: true})
+		pr, err := findOrCreatePR(ctx, config.GitHub, githubpkg.CreatePROptions{Repo: job.Repository, Title: truncateTitle(title), Head: job.IntegrationBranch, Base: job.TargetBranch, Body: "OpenDev is running required CI checks before final review.", Draft: true})
 		if err != nil {
 			return nil, fmt.Errorf("create draft pull request: %w", err)
 		}
@@ -893,21 +954,19 @@ func findTask(job *pipeline.Job, key string) *pipeline.Task {
 	return nil
 }
 
-func evidenceFrom(raw string) ([]pipeline.ValidationEvidence, error) {
-	if strings.TrimSpace(raw) == "" {
-		return nil, nil
-	}
-	var evidence []pipeline.ValidationEvidence
-	if err := json.Unmarshal([]byte(raw), &evidence); err != nil {
-		return nil, fmt.Errorf("invalid validation_evidence_json: %w", err)
-	}
-	return evidence, nil
-}
-
 var unsafeBranch = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
 
 func taskBranch(jobID, taskKey string) string {
-	return "opendev-task-" + safeBranch(jobID) + "-" + safeBranch(taskKey)
+	return "opendev-task-" + safeBranch(jobID) + "-" + base64.RawURLEncoding.EncodeToString([]byte(taskKey))
+}
+
+func TaskBranch(jobID, taskKey string) string { return taskBranch(jobID, taskKey) }
+
+func WriterBranch(jobID string, task *pipeline.Task) string {
+	if task.WorktreePath != "" && task.Branch != "" {
+		return task.Branch
+	}
+	return taskBranch(jobID, task.Key)
 }
 func safeBranch(value string) string {
 	return strings.Trim(unsafeBranch.ReplaceAllString(value, "-"), "-")
@@ -922,6 +981,23 @@ func toolJSON(value any) *mcp.CallToolResult {
 }
 
 func toolError(err error) *mcp.CallToolResult { return mcp.NewToolResultError(err.Error()) }
+
+func findOrCreatePR(ctx context.Context, client githubpkg.Client, options githubpkg.CreatePROptions) (*githubpkg.PR, error) {
+	pr, err := client.FindPR(ctx, options.Repo, options.Head)
+	if err == nil {
+		return pr, nil
+	}
+	if !errors.Is(err, githubpkg.ErrNotFound) {
+		return nil, err
+	}
+	pr, err = client.CreatePR(ctx, options)
+	if err != nil {
+		if existing, findErr := client.FindPR(ctx, options.Repo, options.Head); findErr == nil {
+			return existing, nil
+		}
+	}
+	return pr, err
+}
 
 func notify(config Config, job *pipeline.Job, eventType, summary, eventError string) {
 	outbox.Notify(config.Outbox, job, eventType, summary, eventError, config.Logger)
