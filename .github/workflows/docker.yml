@@ -2,7 +2,10 @@ name: Docker Image CI
 
 permissions:
   contents: read
-  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
 
 on:
   push:
@@ -11,10 +14,29 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race -tags=integration ./...
+      - run: go vet ./...
+      - run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      with:
+        persist-credentials: false
 
     - name: Login to GitHub Container Registry
       if: github.event_name != 'pull_request'
@@ -37,3 +59,9 @@ jobs:
     - name: Push the timestamped Docker image
       if: github.event_name != 'pull_request'
       run: docker push ghcr.io/iamangus/opendev:${{ steps.vars.outputs.tag }}
+
+    - name: Publish immutable source tag
+      if: github.event_name != 'pull_request'
+      run: |
+        docker tag ghcr.io/iamangus/opendev:latest ghcr.io/iamangus/opendev:sha-${{ github.sha }}
+        docker push ghcr.io/iamangus/opendev:sha-${{ github.sha }}

@@ -14,6 +14,9 @@ import (
 // Evaluate considers only named required checks. Unrelated repository checks
 // must not delay or fail an OpenDev job.
 func Evaluate(required []string, checks *github.PRChecks) (pipeline.CIState, []pipeline.CheckResult, string) {
+	if len(required) == 0 {
+		return pipeline.CIBlocked, nil, ""
+	}
 	byName := make(map[string]github.CheckRun)
 	if checks != nil {
 		for _, check := range checks.CheckRuns {

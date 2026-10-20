@@ -4,21 +4,27 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/iamangus/code-mcp/internal/agentfoundry"
 	"github.com/iamangus/code-mcp/internal/dispatcher"
 	"github.com/iamangus/code-mcp/internal/dispatchstore"
+	"github.com/iamangus/code-mcp/internal/durable"
 	githubpkg "github.com/iamangus/code-mcp/internal/github"
 	"github.com/iamangus/code-mcp/internal/gitops"
 	"github.com/iamangus/code-mcp/internal/graphiti"
@@ -37,15 +43,39 @@ import (
 
 func main() {
 	var (
-		mode      = flag.String("mode", "stdio", "Transport mode: stdio or http (single-server mode only)")
-		addr      = flag.String("addr", ":8080", "HTTP listen address")
-		dir       = flag.String("dir", "", "Single-server mode: absolute path to the worktree root directory")
-		reposDir  = flag.String("repos-dir", "/repos", "Multi-server mode: directory containing all repositories")
-		stateDir  = flag.String("state-dir", "/data", "Directory for durable coding job state")
-		logFormat = flag.String("log-format", "text", "log output format: text or json")
-		logLevel  = flag.String("log-level", "info", "log level: debug, info, warn, error")
+		mode        = flag.String("mode", "stdio", "Transport mode: stdio or http (single-server mode only)")
+		addr        = flag.String("addr", ":8080", "HTTP listen address")
+		dir         = flag.String("dir", "", "Single-server mode: absolute path to the worktree root directory")
+		reposDir    = flag.String("repos-dir", "/repos", "Multi-server mode: directory containing all repositories")
+		stateDir    = flag.String("state-dir", "/data", "Directory for durable coding job state")
+		logFormat   = flag.String("log-format", "text", "log output format: text or json")
+		logLevel    = flag.String("log-level", "info", "log level: debug, info, warn, error")
+		healthCheck = flag.Bool("health-check", false, "Check authenticated local HTTP readiness and exit")
 	)
 	flag.Parse()
+	if *healthCheck {
+		_, port, err := net.SplitHostPort(*addr)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		request, requestErr := http.NewRequest(http.MethodGet, "http://127.0.0.1:"+port+"/readyz", nil)
+		if requestErr != nil {
+			fmt.Fprintln(os.Stderr, requestErr)
+			os.Exit(1)
+		}
+		request.Header.Set("Authorization", "Bearer "+os.Getenv("OPENDEV_TOKEN"))
+		response, err := (&http.Client{Timeout: 3 * time.Second}).Do(request)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			os.Exit(1)
+		}
+		return
+	}
 
 	var level slog.Level
 	switch strings.ToLower(*logLevel) {
@@ -84,7 +114,11 @@ func main() {
 	githubToken := os.Getenv("GITHUB_TOKEN")
 	if githubToken != "" {
 		if owner := os.Getenv("GITHUB_OWNER"); owner != "" {
-			ghClient = githubpkg.NewHTTPClient(githubToken, owner, slog.Default())
+			var options []githubpkg.HTTPClientOption
+			if os.Getenv("GITHUB_OWNER_TYPE") == "organization" {
+				options = append(options, githubpkg.WithOrganizationOwner())
+			}
+			ghClient = githubpkg.NewHTTPClient(githubToken, owner, slog.Default(), options...)
 			logger.Info("GitHub PR integration enabled", "owner", owner)
 		} else {
 			logger.Warn("GITHUB_TOKEN set but GITHUB_OWNER is missing, PR integration disabled")
@@ -92,13 +126,20 @@ func main() {
 	}
 
 	// ── Multi-server mode ──────────────────────────────────────────────────
-	runMultiServer(*addr, *reposDir, *stateDir, githubToken, ghClient, logger)
+	if err := runMultiServer(*addr, *reposDir, *stateDir, githubToken, ghClient, logger); err != nil {
+		logger.Error("OpenDev stopped", "error", err)
+		os.Exit(1)
+	}
 }
 
 // runSingleServer starts profile-aware MCP servers for a single worktree.
 // Each profile is served at /{profile}/mcp on the same HTTP address.
 // In stdio mode only the read profile is served (stdio is single-stream).
 func runSingleServer(mode, addr, dir string, logger *slog.Logger) {
+	if mode != "stdio" && mode != "http" {
+		logger.Error("invalid transport mode", "mode", mode)
+		os.Exit(1)
+	}
 	info, err := os.Stat(dir)
 	if err != nil || !info.IsDir() {
 		fmt.Fprintf(os.Stderr, "error: --dir %q does not exist or is not a directory\n", dir)
@@ -107,7 +148,13 @@ func runSingleServer(mode, addr, dir string, logger *slog.Logger) {
 
 	switch mode {
 	case "http":
+		token := strings.TrimSpace(os.Getenv("OPENDEV_TOKEN"))
+		if token == "" {
+			logger.Error("OPENDEV_TOKEN is required for HTTP mode")
+			os.Exit(1)
+		}
 		mux := http.NewServeMux()
+		registerHealth(mux)
 		state := workspaceStateFor(dir, logger)
 		for _, p := range Profiles {
 			h := newMCPHandlerWithState(p, dir, logger, state)
@@ -116,7 +163,7 @@ func runSingleServer(mode, addr, dir string, logger *slog.Logger) {
 			logger.Info("registered MCP handler", "profile", p, "dir", dir)
 		}
 		logger.Info("starting HTTP MCP server", "addr", addr, "dir", dir)
-		if err := http.ListenAndServe(addr, mux); err != nil {
+		if err := serveHTTP(addr, observeHTTP(logger, requireMCPToken(token, mux))); err != nil {
 			fmt.Fprintf(os.Stderr, "HTTP server error: %v\n", err)
 			os.Exit(1)
 		}
@@ -135,20 +182,28 @@ func runSingleServer(mode, addr, dir string, logger *slog.Logger) {
 //
 // MCP endpoint layout:  http://host:port/{repo}/{branch}/{profile}/mcp
 // Job control MCP:      http://host:port/mcp
-func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githubpkg.Client, logger *slog.Logger) {
+func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githubpkg.Client, logger *slog.Logger) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	mcpToken := strings.TrimSpace(os.Getenv("OPENDEV_TOKEN"))
 	if mcpToken == "" {
 		logger.Error("OPENDEV_TOKEN is required; refusing to expose repository and job MCP tools unauthenticated")
-		return
+		return fmt.Errorf("OPENDEV_TOKEN is required")
 	}
+	stateLock, err := durable.Acquire(stateDir)
+	if err != nil {
+		logger.Error("acquire state directory", "error", err)
+		return err
+	}
+	defer stateLock.Close()
 	gitOps := gitops.NewExec(slog.Default(), githubToken)
-	mgr, err := manager.New(reposDir, gitOps, slog.Default())
+	mgr, err := manager.New(reposDir, gitOps, slog.Default(), ctx)
 	if err != nil {
 		logger.Error("manager initialization failed", "error", err)
-		os.Exit(1)
+		return err
 	}
 	if ghClient != nil {
-		syncOwnedRepositories(context.Background(), ghClient, mgr, logger)
+		syncOwnedRepositories(ctx, ghClient, mgr, logger)
 	}
 
 	var mu sync.RWMutex
@@ -159,7 +214,16 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 		mu.Lock()
 		defer mu.Unlock()
 		for _, p := range Profiles {
+			if branch == "" {
+				continue
+			} // detached reference snapshots have their own routes
+			if info, err := os.Stat(filepath.Join(dir, ".git")); err == nil && info.IsDir() && p == ProfileWrite {
+				continue
+			}
 			key := repo + "/" + branch + "/" + string(p)
+			if _, exists := handlers[key]; exists {
+				continue
+			}
 			handlers[key] = newMCPHandler(p, dir, logger)
 			logger.Info("registered MCP handler", "repo", repo, "branch", branch, "profile", p, "dir", dir)
 		}
@@ -168,19 +232,19 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 	repos, err := mgr.Scan()
 	if err != nil {
 		logger.Error("scanning repos failed", "error", err)
-		os.Exit(1)
+		return err
 	}
 	catalog, err := repositorycatalog.New(stateDir, managerCatalogReader{manager: mgr})
 	if err != nil {
 		logger.Error("repository catalog initialization failed", "error", err)
-		return
+		return err
 	}
 	for _, repo := range repos {
 		if _, err := catalog.Refresh(context.Background(), repo); err != nil {
 			logger.Warn("catalog refresh failed", "repository", repo.Name, "error", err)
 		}
 	}
-	graphServer, err := initializeRepositoryGraph(context.Background(), stateDir, mgr, catalog, repos, logger)
+	graphServer, err := initializeRepositoryGraph(ctx, stateDir, mgr, catalog, repos, logger)
 	if err != nil {
 		logger.Warn("repository graph disabled", "error", err)
 	}
@@ -193,32 +257,49 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 		repositoryService, err = repositories.New(mgr, catalog, ghClient, owners...)
 		if err != nil {
 			logger.Error("repository provisioning initialization failed", "error", err)
-			return
+			return err
 		}
 	}
 	referenceService, err := references.New(catalog, mgr)
 	if err != nil {
 		logger.Error("reference snapshot initialization failed", "error", err)
-		return
+		return err
 	}
 	for _, repo := range repos {
 		for _, b := range repo.Branches {
+			if strings.HasPrefix(filepath.Clean(b.Dir), filepath.Join(repo.Dir, ".opendev")+string(filepath.Separator)) {
+				continue
+			}
 			addHandlers(repo.Name, b.Name, b.Dir)
 		}
 	}
 	logger.Info("startup: repos discovered", "count", len(repos), "dir", reposDir)
 
 	mcpMux := http.NewServeMux()
+	registerHealth(mcpMux)
 	jobStore, err := pipeline.NewStore(stateDir)
 	if err != nil {
 		logger.Error("pipeline state initialization failed", "error", err)
-		return
+		return err
+	}
+	for _, job := range jobStore.List() {
+		if branches, err := mgr.ListBranches(job.Repository); err == nil {
+			for _, branch := range branches {
+				if branch.Name == job.TargetBranch || branch.Name == job.IntegrationBranch || strings.HasPrefix(branch.Name, "opendev-task-"+job.ID+"-") {
+					addHandlers(job.Repository, branch.Name, branch.Dir)
+				}
+			}
+		}
+		for _, snapshot := range job.ReferenceSnapshots {
+			referenceHandlers[job.ID+"/"+snapshot.Repository] = newMCPHandler(ProfileRead, snapshot.Path, logger)
+		}
 	}
 	notificationOutbox, err := outbox.New(stateDir)
 	if err != nil {
 		logger.Error("notification outbox initialization failed", "error", err)
-		return
+		return err
 	}
+	registerMetrics(mcpMux, jobStore, notificationOutbox)
 	if err := notificationOutbox.Reconcile(jobStore.List()); err != nil {
 		logger.Warn("notification outbox reconciliation failed", "error", err)
 	}
@@ -226,19 +307,59 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 	if eventURL == "" || eventToken == "" {
 		logger.Info("Eve notifications disabled; set EVE_URL and EVE_WEBHOOK_TOKEN to enable delivery")
 	} else {
-		outbox.NewDeliverer(notificationOutbox, eventURL, eventToken, logger, jobStore).Start(context.Background())
+		outbox.NewDeliverer(notificationOutbox, eventURL, eventToken, logger, jobStore).Start(ctx)
 	}
 	runStore, err := dispatchstore.New(stateDir)
 	if err != nil {
 		logger.Error("dispatch state initialization failed", "error", err)
-		return
+		return err
 	}
 	jobDispatcher := &lazyDispatcher{
 		runStore: runStore,
 		mcpURL:   opendevURL(addr),
 		mcpToken: mcpToken,
 		logger:   logger,
+		jobStore: jobStore,
+		registerRoutes: func(job *pipeline.Job) error {
+			branches, err := mgr.ListBranches(job.Repository)
+			if err != nil {
+				return err
+			}
+			foundTarget := false
+			wanted := map[string]bool{job.TargetBranch: true, job.IntegrationBranch: true}
+			if job.Plan != nil {
+				for _, task := range job.Plan.Tasks {
+					wanted[task.Branch] = true
+					wanted[jobmcp.WriterBranch(job.ID, &task)] = true
+				}
+			}
+			for _, b := range branches {
+				if b.Name == job.TargetBranch {
+					foundTarget = true
+				}
+				if wanted[b.Name] {
+					addHandlers(job.Repository, b.Name, b.Dir)
+				}
+			}
+			if !foundTarget {
+				dir, err := mgr.CreateWorktree(job.Repository, job.TargetBranch, "")
+				if err != nil {
+					return err
+				}
+				addHandlers(job.Repository, job.TargetBranch, dir)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, snapshot := range job.ReferenceSnapshots {
+				key := job.ID + "/" + snapshot.Repository
+				if _, ok := referenceHandlers[key]; !ok {
+					referenceHandlers[key] = newMCPHandler(ProfileRead, snapshot.Path, logger)
+				}
+			}
+			return nil
+		},
 	}
+	defer jobDispatcher.Close()
 	jobController := pipeline.NewController(jobStore)
 	jobMCPConfig := jobmcp.Config{
 		Store:      jobStore,
@@ -253,6 +374,33 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 			mu.Lock()
 			defer mu.Unlock()
 			referenceHandlers[jobID+"/"+repository] = newMCPHandler(ProfileRead, directory, logger)
+		}, unregister: func(job *pipeline.Job) {
+			mu.Lock()
+			defer mu.Unlock()
+			branches := []string{job.IntegrationBranch}
+			paths := []string{mgr.BranchWorktreeDir(job.Repository, job.IntegrationBranch)}
+			if job.Plan != nil {
+				for _, task := range job.Plan.Tasks {
+					branches = append(branches, task.Branch)
+					paths = append(paths, task.WorktreePath)
+				}
+			}
+			for _, branch := range branches {
+				for _, profile := range Profiles {
+					delete(handlers, job.Repository+"/"+branch+"/"+string(profile))
+				}
+			}
+			for _, snapshot := range job.ReferenceSnapshots {
+				delete(referenceHandlers, job.ID+"/"+snapshot.Repository)
+				paths = append(paths, snapshot.Path)
+			}
+			for _, path := range paths {
+				if path != "" {
+					if absolute, err := filepath.Abs(path); err == nil {
+						workspaceStates.Delete(absolute)
+					}
+				}
+			}
 		}},
 		GitHub:       ghClient,
 		Repositories: repositoryService,
@@ -310,35 +458,45 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 	})
 
 	// Repository lifecycle is exposed through the authenticated MCP endpoint.
-	top := requireMCPToken(mcpToken, mcpMux)
+	top := observeHTTP(logger, requireMCPToken(mcpToken, mcpMux))
 
 	// Reconciliation can launch agent runs with MCP attachments. Accept those
 	// connections before dispatching anything from durable state.
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		logger.Error("server failed to listen", "error", err)
-		return
+		return err
 	}
 	logger.Info("starting multi-server", "addr", addr, "repos_dir", reposDir)
+	httpServer := configuredHTTPServer(top)
+	serverErrors := make(chan error, 1)
 	go func() {
-		if err := http.Serve(listener, top); err != nil {
+		if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("server failed", "error", err)
+			serverErrors <- err
 		}
 	}()
-	if _, err := jobDispatcher.get(context.Background()); err != nil {
+	if _, err := jobDispatcher.get(ctx); err != nil {
 		logger.Error("startup dispatch reconciliation failed", "error", err)
 	}
-	resumePendingHolisticReviews(context.Background(), jobStore, jobController, jobDispatcher, logger)
 	observeCI := func() {
+		if inner, err := jobDispatcher.get(ctx); err == nil {
+			if err := inner.Reconcile(ctx); err != nil {
+				logger.Error("reconcile dispatches", "error", err)
+			}
+		}
 		if repositoryService != nil {
-			if err := repositoryService.ReconcilePendingFoundations(context.Background()); err != nil {
+			if err := repositoryService.ReconcilePendingFoundations(ctx); err != nil {
 				logger.Error("reconcile repository foundations", "error", err)
 			}
 		}
-		if err := jobmcp.ResumeFoundationPlanning(context.Background(), jobMCPConfig); err != nil {
+		if err := jobmcp.ResumeFoundationPlanning(ctx, jobMCPConfig); err != nil {
 			logger.Error("resume foundation planning", "error", err)
 		}
-		if err := jobmcp.ObservePendingCI(context.Background(), jobMCPConfig); err != nil {
+		if err := jobmcp.ReconcileJobs(ctx, jobMCPConfig); err != nil {
+			logger.Error("reconcile job progression", "error", err)
+		}
+		if err := jobmcp.ObservePendingCI(ctx, jobMCPConfig); err != nil {
 			logger.Error("observe draft PR CI", "error", err)
 		}
 	}
@@ -346,30 +504,24 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
-			observeCI()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				observeCI()
+			}
 		}
 	}()
-	select {}
-}
-
-// resumePendingHolisticReviews repairs the crash window after a holistic
-// dispatch is accepted but before its run ID is written to the job. StartHolistic
-// adopts an existing accepted run and refreshes only an unaccepted intent.
-func resumePendingHolisticReviews(ctx context.Context, store *pipeline.Store, controller *pipeline.Controller, runs jobmcp.Dispatcher, logger *slog.Logger) {
-	for _, job := range store.List() {
-		if job.Status != pipeline.JobHolisticReviewing || job.HolisticReviewRunID != "" || job.IntegrationSHA == "" {
-			continue
-		}
-		run, err := runs.StartHolistic(ctx, job)
-		if err != nil {
-			logger.Error("resume pending holistic review", "job_id", job.ID, "error", err)
-			continue
-		}
-		if _, err := controller.StartHolisticReviewer(job.ID, run.RunID, job.IntegrationSHA); err != nil {
-			logger.Error("record resumed holistic review", "job_id", job.ID, "run_id", run.RunID, "error", err)
-		}
+	var serveErr error
+	select {
+	case <-ctx.Done():
+	case serveErr = <-serverErrors:
 	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = httpServer.Shutdown(shutdownCtx)
+	return serveErr
 }
 
 // syncOwnedRepositories gives a standalone OpenDev installation its own local
@@ -416,34 +568,66 @@ func initializeRepositoryGraph(ctx context.Context, stateDir string, mgr *manage
 	if err != nil {
 		return nil, err
 	}
-	for _, repo := range repos {
-		record, err := catalog.Get(repo.Name)
-		if err != nil {
-			logger.Warn("catalog lookup failed", "repository", repo.Name, "error", err)
-			continue
-		}
-		if record == nil {
-			logger.Warn("catalog record is missing", "repository", repo.Name)
-			continue
-		}
-		status, err := mgr.Status(record.Path)
-		if err != nil {
-			logger.Warn("repository status check failed", "repository", repo.Name, "error", err)
-			continue
-		}
-		if status != "" {
-			logger.Info("repository graph indexing skipped for dirty checkout", "repository", repo.Name)
-			continue
-		}
-		snapshot, err := repositorySnapshot(*record)
-		if err != nil {
-			logger.Warn("repository snapshot failed", "repository", repo.Name, "error", err)
-			continue
-		}
-		if _, err := indexer.Index(ctx, snapshot); err != nil {
-			logger.Warn("repository graph indexing failed", "repository", repo.Name, "error", err)
+	refresh := func(repos []manager.RepoInfo) {
+		for _, repo := range repos {
+			if ctx.Err() != nil {
+				return
+			}
+			record, err := catalog.Refresh(ctx, repo)
+			if err != nil {
+				logger.Warn("catalog lookup failed", "repository", repo.Name, "error", err)
+				continue
+			}
+			if record == nil {
+				logger.Warn("catalog record is missing", "repository", repo.Name)
+				continue
+			}
+			status, err := mgr.Status(record.Path)
+			if err != nil {
+				logger.Warn("repository status check failed", "repository", repo.Name, "error", err)
+				continue
+			}
+			if status != "" {
+				logger.Info("repository graph indexing skipped for dirty checkout", "repository", repo.Name)
+				continue
+			}
+			snapshot, err := repositorySnapshot(*record, func(path string) string {
+				content, err := mgr.ReadFileAt(ctx, record.Path, record.HeadSHA, path)
+				if err != nil {
+					return ""
+				}
+				if len(content) > 16<<10 {
+					content = content[:16<<10]
+				}
+				return content
+			})
+			if err != nil {
+				logger.Warn("repository snapshot failed", "repository", repo.Name, "error", err)
+				continue
+			}
+			if _, err := indexer.Index(ctx, snapshot); err != nil {
+				logger.Warn("repository graph indexing failed", "repository", repo.Name, "error", err)
+			}
 		}
 	}
+	go func() {
+		refresh(repos)
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				discovered, err := mgr.Scan()
+				if err != nil {
+					logger.Warn("graph repository scan failed", "error", err)
+					continue
+				}
+				refresh(discovered)
+			}
+		}
+	}()
 	return graphmcp.New(graphmcp.Config{Searcher: client, State: indexStore}), nil
 }
 
@@ -457,8 +641,7 @@ func (r managerCatalogReader) ReadGitMetadata(_ context.Context, dir string) (re
 	return repositorycatalog.GitMetadata{OriginURL: metadata.OriginURL, HeadSHA: metadata.HeadSHA}, nil
 }
 
-func repositorySnapshot(record repositorycatalog.Record) (repositoryindex.Snapshot, error) {
-	read := func(path string) string { return readEvidenceFile(filepath.Join(record.Path, path)) }
+func repositorySnapshot(record repositorycatalog.Record, read func(string) string) (repositoryindex.Snapshot, error) {
 	manifests := make(map[string]string)
 	for _, name := range []string{"go.mod", "package.json", "pyproject.toml", "Cargo.toml", "Dockerfile", "docker-compose.yml", "Chart.yaml", "kustomization.yaml"} {
 		if content := read(name); content != "" {
@@ -474,22 +657,16 @@ func repositorySnapshot(record repositorycatalog.Record) (repositoryindex.Snapsh
 	return repositoryindex.Snapshot{Name: record.Name, Path: record.Path, SHA: record.HeadSHA, OriginURL: record.OriginURL, DefaultBranch: record.DefaultBranch, Epoch: strings.TrimSpace(os.Getenv("GRAPHITI_INDEX_EPOCH")), README: read("README.md"), Docs: docs, Manifests: manifests}, nil
 }
 
-func readEvidenceFile(path string) string {
-	file, err := os.Open(path)
-	if err != nil {
-		return ""
-	}
-	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, 16*1024))
-	if err != nil {
-		return ""
-	}
-	return string(data)
+type worktreeRegistrar struct {
+	worktree   func(repository, branch, directory string)
+	reference  func(jobID, repository, directory string)
+	unregister func(*pipeline.Job)
 }
 
-type worktreeRegistrar struct {
-	worktree  func(repository, branch, directory string)
-	reference func(jobID, repository, directory string)
+func (r worktreeRegistrar) UnregisterJob(job *pipeline.Job) {
+	if r.unregister != nil {
+		r.unregister(job)
+	}
 }
 
 type validationRunner struct{}
@@ -509,20 +686,20 @@ func (r worktreeRegistrar) RegisterReference(jobID, repository, directory string
 // lazyDispatcher defers validating external AgentFoundry configuration until a
 // tool actually requests dispatch, so repository management remains available.
 type lazyDispatcher struct {
-	runStore *dispatchstore.Store
-	mcpURL   string
-	mcpToken string
-	logger   *slog.Logger
+	runStore       *dispatchstore.Store
+	mcpURL         string
+	mcpToken       string
+	logger         *slog.Logger
+	jobStore       *pipeline.Store
+	registerRoutes func(*pipeline.Job) error
 
 	mu             sync.Mutex
-	runner         *agentfoundry.Client
 	dispatcher     *dispatcher.Dispatcher
-	workers        []*dispatcher.Dispatcher
 	outcomeHandler dispatcher.OutcomeHandler
 }
 
 func (d *lazyDispatcher) StartPlanner(ctx context.Context, job *pipeline.Job) (*dispatcher.DispatchRun, error) {
-	inner, err := d.withRoleServers(ctx, job, dispatcher.RolePlanner, "job", 1, job.TargetBranch, false)
+	inner, err := d.get(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -530,7 +707,7 @@ func (d *lazyDispatcher) StartPlanner(ctx context.Context, job *pipeline.Job) (*
 }
 
 func (d *lazyDispatcher) StartPlannerRevision(ctx context.Context, job *pipeline.Job) (*dispatcher.DispatchRun, error) {
-	inner, err := d.withRoleServers(ctx, job, dispatcher.RolePlanner, "revision", job.CIReplanRounds+1, job.TargetBranch, false)
+	inner, err := d.get(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -538,7 +715,7 @@ func (d *lazyDispatcher) StartPlannerRevision(ctx context.Context, job *pipeline
 }
 
 func (d *lazyDispatcher) StartWriter(ctx context.Context, job *pipeline.Job, task *pipeline.Task) (*dispatcher.DispatchRun, error) {
-	inner, err := d.withRoleServers(ctx, job, dispatcher.RoleWriter, task.Key, task.WriterAttempts+1, task.Branch, task.Kind != pipeline.TaskValidation)
+	inner, err := d.get(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -546,7 +723,7 @@ func (d *lazyDispatcher) StartWriter(ctx context.Context, job *pipeline.Job, tas
 }
 
 func (d *lazyDispatcher) StartReviewer(ctx context.Context, job *pipeline.Job, task *pipeline.Task) (*dispatcher.DispatchRun, error) {
-	inner, err := d.withRoleServers(ctx, job, dispatcher.RoleReviewer, task.Key, task.ReviewerAttempts+1, task.Branch, false)
+	inner, err := d.get(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -554,7 +731,7 @@ func (d *lazyDispatcher) StartReviewer(ctx context.Context, job *pipeline.Job, t
 }
 
 func (d *lazyDispatcher) StartHolistic(ctx context.Context, job *pipeline.Job) (*dispatcher.DispatchRun, error) {
-	inner, err := d.withRoleServers(ctx, job, dispatcher.RoleHolistic, "job", 1, safeMCPBranch(job.IntegrationBranch), false)
+	inner, err := d.get(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -569,12 +746,48 @@ func (d *lazyDispatcher) Supersede(ctx context.Context, taskID, reason string) e
 	return inner.Supersede(ctx, taskID, reason)
 }
 
-func (d *lazyDispatcher) InspectJob(ctx context.Context, jobID string) ([]dispatcher.DispatchRun, error) {
+func (d *lazyDispatcher) CancelJob(ctx context.Context, id string) error {
+	runs, err := d.runStore.ListByJob(ctx, id)
+	if err != nil {
+		return err
+	}
+	if len(runs) == 0 {
+		return nil
+	}
+	needsRemote := false
+	for _, run := range runs {
+		if !dispatcher.IsTerminal(run.Status) && run.RunID != "" {
+			needsRemote = true
+		}
+	}
+	if !needsRemote {
+		for _, run := range runs {
+			if run.OutcomeApplied {
+				continue
+			}
+			if !dispatcher.IsTerminal(run.Status) {
+				run.Status = "cancelled"
+			}
+			run.OutcomeApplied = true
+			if err := d.runStore.Save(ctx, run); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	inner, err := d.get(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return inner.InspectJob(ctx, jobID)
+	return inner.CancelJob(ctx, id)
+}
+
+func (d *lazyDispatcher) ArchiveJob(ctx context.Context, id string) error {
+	return d.runStore.ArchiveJob(id)
+}
+
+func (d *lazyDispatcher) InspectJob(ctx context.Context, jobID string) ([]dispatcher.DispatchRun, error) {
+	return d.runStore.ListByJob(ctx, jobID)
 }
 
 func (d *lazyDispatcher) get(ctx context.Context) (*dispatcher.Dispatcher, error) {
@@ -594,43 +807,77 @@ func (d *lazyDispatcher) get(ctx context.Context) (*dispatcher.Dispatcher, error
 		d.mu.Unlock()
 		return nil, fmt.Errorf("configure AgentFoundry dispatcher: %w", err)
 	}
-	inner, err := dispatcher.New(client, d.runStore, dispatcher.Config{Logger: d.logger, OutcomeHandler: d.outcomeHandler})
+	inner, err := dispatcher.New(client, d.runStore, dispatcher.Config{Logger: d.logger, OutcomeHandler: d.outcomeHandler, MCPServersForRun: d.serversForRun})
 	if err != nil {
 		d.mu.Unlock()
 		return nil, err
 	}
 	d.dispatcher = inner
-	d.runner = client
 	d.mu.Unlock()
-	if err := inner.Reconcile(ctx); err != nil {
-		return nil, fmt.Errorf("reconcile AgentFoundry runs: %w", err)
-	}
 	return inner, nil
 }
 
-func (d *lazyDispatcher) withRoleServers(ctx context.Context, job *pipeline.Job, role, taskKey string, attempt int, branch string, writer bool) (*dispatcher.Dispatcher, error) {
-	if _, err := d.get(ctx); err != nil {
-		return nil, err
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	servers := []agentfoundry.MCPServer{{Name: ephemeralMCPServerName(job.ID, role, taskKey, attempt, "jobs"), URL: d.roleMCPURL(role), Transport: "streamable-http", Headers: d.mcpHeaders()}}
-	if branch != "" {
-		servers = append(servers, agentfoundry.MCPServer{Name: ephemeralMCPServerName(job.ID, role, taskKey, attempt, "read"), URL: d.worktreeMCPURL(job.Repository, branch, "read"), Transport: "streamable-http", Headers: d.mcpHeaders()})
-	}
-	if writer {
-		servers = append(servers, agentfoundry.MCPServer{Name: ephemeralMCPServerName(job.ID, role, taskKey, attempt, "write"), URL: d.worktreeMCPURL(job.Repository, branch, "write"), Transport: "streamable-http", Headers: d.mcpHeaders()})
-	}
-	for _, snapshot := range job.ReferenceSnapshots {
-		servers = append(servers, agentfoundry.MCPServer{Name: ephemeralMCPServerName(job.ID, role, taskKey, attempt, "reference-"+snapshot.Repository), URL: d.referenceMCPURL(job.ID, snapshot.Repository), Transport: "streamable-http", Headers: d.mcpHeaders()})
-	}
-	inner, err := dispatcher.New(d.runner, d.runStore, dispatcher.Config{MCPServers: servers, Logger: d.logger, OutcomeHandler: d.outcomeHandler})
+func (d *lazyDispatcher) serversForRun(ctx context.Context, run dispatcher.DispatchRun) ([]agentfoundry.MCPServer, error) {
+	job, err := d.jobStore.Get(run.JobID)
 	if err != nil {
 		return nil, err
 	}
-	// Keep the dispatcher alive so its run-status watcher remains active.
-	d.workers = append(d.workers, inner)
-	return inner, nil
+	if pipeline.Terminal(job.Status) || job.Status == pipeline.JobPaused {
+		return nil, fmt.Errorf("job %s does not permit agent dispatch", job.Status)
+	}
+	if d.registerRoutes != nil {
+		if err := d.registerRoutes(job); err != nil {
+			return nil, err
+		}
+	}
+	branch := job.TargetBranch
+	writer := run.Role == dispatcher.RoleWriter
+	if run.Role == dispatcher.RoleHolistic || run.TaskKey == "revision" {
+		branch = job.IntegrationBranch
+	}
+	if run.Role == dispatcher.RoleWriter || run.Role == dispatcher.RoleReviewer {
+		branch = jobmcp.TaskBranch(job.ID, run.TaskKey)
+		if job.Plan == nil {
+			return nil, fmt.Errorf("task dispatch has no plan")
+		}
+		for _, task := range job.Plan.Tasks {
+			if task.Key == run.TaskKey {
+				if writer {
+					branch = jobmcp.WriterBranch(job.ID, &task)
+				} else if task.Branch != "" {
+					branch = task.Branch
+				}
+			}
+		}
+	}
+	makeServer := func(kind, endpoint string) agentfoundry.MCPServer {
+		return agentfoundry.MCPServer{Name: ephemeralMCPServerName(job.ID, run.Role, run.TaskKey, run.Attempt, kind), URL: endpoint, Transport: "streamable-http", Headers: d.mcpHeaders()}
+	}
+	servers := []agentfoundry.MCPServer{makeServer("jobs", d.roleMCPURL(run.Role)), makeServer("read", d.worktreeMCPURL(job.Repository, branch, "read"))}
+	if writer {
+		servers = append(servers, makeServer("write", d.worktreeMCPURL(job.Repository, branch, "write")))
+	}
+	for _, snapshot := range job.ReferenceSnapshots {
+		servers = append(servers, makeServer("reference-"+snapshot.Repository, d.referenceMCPURL(job.ID, snapshot.Repository)))
+	}
+	return servers, nil
+}
+
+func (d *lazyDispatcher) ExecutionTrace(ctx context.Context, run dispatcher.DispatchRun) (json.RawMessage, error) {
+	inner, err := d.get(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return inner.ExecutionTrace(ctx, run)
+}
+
+func (d *lazyDispatcher) Close() {
+	d.mu.Lock()
+	inner := d.dispatcher
+	d.mu.Unlock()
+	if inner != nil {
+		inner.Close()
+	}
 }
 
 func (d *lazyDispatcher) mcpHeaders() map[string]string {
@@ -651,16 +898,12 @@ func safeMCPName(value string) string {
 
 func (d *lazyDispatcher) worktreeMCPURL(repository, branch, profile string) string {
 	base := strings.TrimSuffix(strings.TrimRight(d.mcpURL, "/"), "/mcp")
-	return base + "/" + repository + "/" + safeMCPBranch(branch) + "/" + profile + "/mcp"
+	return base + "/" + url.PathEscape(repository) + "/" + url.PathEscape(branch) + "/" + profile + "/mcp"
 }
 
 func (d *lazyDispatcher) referenceMCPURL(jobID, repository string) string {
 	base := strings.TrimSuffix(strings.TrimRight(d.mcpURL, "/"), "/mcp")
 	return base + "/references/" + jobID + "/" + repository + "/read/mcp"
-}
-
-func safeMCPBranch(branch string) string {
-	return strings.NewReplacer("/", "-", "\\", "-").Replace(branch)
 }
 
 func opendevURL(addr string) string {
@@ -675,12 +918,43 @@ func opendevURL(addr string) string {
 
 func requireMCPToken(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+		provided, bearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !bearer || token == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func configuredHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{Handler: http.MaxBytesHandler(handler, 8<<20), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 32 << 10}
+}
+
+func registerHealth(mux *http.ServeMux) {
+	for _, path := range []string{"/healthz", "/readyz"} {
+		mux.HandleFunc(path, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"status":"ok"}`)
+		})
+	}
+}
+
+func serveHTTP(addr string, handler http.Handler) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	s := configuredHTTPServer(handler)
+	s.Addr = addr
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = s.Shutdown(shutdown)
+	}()
+	err := s.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
 }

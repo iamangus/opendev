@@ -1,24 +1,26 @@
 package manager
 
 import (
-	"context"
 	"fmt"
+	"github.com/iamangus/code-mcp/internal/identity"
+	"github.com/iamangus/code-mcp/internal/worktree"
 	"os"
 	"path/filepath"
-	"regexp"
 )
-
-var validBranchName = regexp.MustCompile(`^[a-zA-Z0-9._/-]+$`)
 
 // WorktreeDir returns the directory for a repo/branch pair.
 func (m *Manager) WorktreeDir(repo, branch string) (string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	mu := m.pathMutex(m.RepoDir(repo))
+	mu.RLock()
+	defer mu.RUnlock()
 	return m.worktreeDirLocked(repo, branch)
 }
 
 func (m *Manager) worktreeDirLocked(repo, branch string) (string, error) {
 	repoDir := m.RepoDir(repo)
+	if _, err := worktree.Resolve(m.reposDir, repo); err != nil {
+		return "", err
+	}
 	if _, err := os.Stat(repoDir); os.IsNotExist(err) {
 		return "", fmt.Errorf("repo %q not found", repo)
 	}
@@ -35,22 +37,48 @@ func (m *Manager) worktreeDirLocked(repo, branch string) (string, error) {
 
 // CreateWorktree creates a worktree for the given branch, creating the branch if needed.
 func (m *Manager) CreateWorktree(repo, branch, base string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	mu := m.pathMutex(m.RepoDir(repo))
+	mu.Lock()
+	defer mu.Unlock()
 
-	if !validBranchName.MatchString(branch) {
-		return "", fmt.Errorf("invalid branch name: %q", branch)
+	if err := identity.Repository(repo); err != nil {
+		return "", err
+	}
+	if err := identity.Branch(branch); err != nil {
+		return "", err
+	}
+	if base != "" && base[0] == '-' {
+		return "", fmt.Errorf("invalid base revision")
 	}
 
-	ctx := context.Background()
+	ctx := m.ctx
 	repoDir := m.RepoDir(repo)
+	if _, err := worktree.Resolve(m.reposDir, repo); err != nil {
+		return "", err
+	}
 	if _, err := os.Stat(repoDir); os.IsNotExist(err) {
 		return "", fmt.Errorf("repo %q not found", repo)
 	}
 
 	wtDir := m.BranchWorktreeDir(repo, branch)
+	if _, err := worktree.ResolveManaged(repoDir, wtDir); err != nil {
+		return "", err
+	}
 
 	if _, err := os.Stat(wtDir); err == nil {
+		listed, listErr := m.git.WorktreeList(ctx, repoDir)
+		if listErr != nil {
+			return "", listErr
+		}
+		valid := false
+		for _, wt := range listed {
+			if filepath.Clean(wt.Path) == filepath.Clean(wtDir) && wt.Branch == branch {
+				valid = true
+			}
+		}
+		if !valid {
+			return "", fmt.Errorf("existing worktree path is not registered for branch %q", branch)
+		}
 		m.logger.Info("worktree: already exists", "repo", repo, "branch", branch)
 		resolved, err := filepath.EvalSymlinks(wtDir)
 		if err != nil {
@@ -112,10 +140,17 @@ func (m *Manager) CreateWorktree(repo, branch, base string) (string, error) {
 
 // RemoveWorktree removes a branch worktree.
 func (m *Manager) RemoveWorktree(repo, branch string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if err := identity.Repository(repo); err != nil {
+		return err
+	}
+	if err := identity.Branch(branch); err != nil {
+		return err
+	}
+	mu := m.pathMutex(m.RepoDir(repo))
+	mu.Lock()
+	defer mu.Unlock()
 
-	ctx := context.Background()
+	ctx := m.ctx
 	repoDir := m.RepoDir(repo)
 	wtDir := m.BranchWorktreeDir(repo, branch)
 	if filepath.Clean(wtDir) == filepath.Clean(repoDir) {
@@ -127,17 +162,24 @@ func (m *Manager) RemoveWorktree(repo, branch string) error {
 	}
 
 	if err := m.git.WorktreeRemove(ctx, repoDir, wtDir); err != nil {
-		m.logger.Warn("worktree: git worktree remove (non-fatal)", "repo", repo, "branch", branch, "error", err)
+		return err
 	}
 
 	m.logger.Info("worktree removed", "repo", repo, "branch", branch)
-	return os.RemoveAll(wtDir)
+	return nil
 }
 
 // ListBranches returns all branches (default + worktrees) for a repo.
 func (m *Manager) ListBranches(repo string) ([]BranchInfo, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	if err := identity.Repository(repo); err != nil {
+		return nil, err
+	}
+	if _, err := worktree.Resolve(m.reposDir, repo); err != nil {
+		return nil, err
+	}
+	mu := m.pathMutex(m.RepoDir(repo))
+	mu.RLock()
+	defer mu.RUnlock()
 
 	repoDir := m.RepoDir(repo)
 	if _, err := os.Stat(repoDir); os.IsNotExist(err) {

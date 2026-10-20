@@ -9,6 +9,7 @@ package manager
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"os"
@@ -18,6 +19,8 @@ import (
 
 	"github.com/iamangus/code-mcp/internal/foundation"
 	"github.com/iamangus/code-mcp/internal/gitops"
+	"github.com/iamangus/code-mcp/internal/identity"
+	"github.com/iamangus/code-mcp/internal/worktree"
 )
 
 // RepoInfo describes a synced repository and its worktrees.
@@ -37,15 +40,21 @@ func (m *Manager) CreateFoundationBranch(repo, branch, base string) (string, str
 		return "", "", err
 	}
 	for path, content := range foundation.Files() {
-		fullPath := filepath.Join(dir, path)
-		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+		r, rel, err := worktree.OpenRoot(dir, path)
+		if err != nil {
+			return "", "", err
+		}
+		if err := r.MkdirAll(filepath.Dir(rel), 0o755); err != nil {
+			r.Close()
 			return "", "", fmt.Errorf("create foundation directory: %w", err)
 		}
-		if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
+		if err := r.WriteFile(rel, []byte(content), 0o644); err != nil {
+			r.Close()
 			return "", "", fmt.Errorf("write foundation file %s: %w", path, err)
 		}
+		r.Close()
 	}
-	ctx := context.Background()
+	ctx := m.ctx
 	status, err := m.git.Status(ctx, dir)
 	if err != nil {
 		return "", "", fmt.Errorf("read foundation status: %w", err)
@@ -95,24 +104,49 @@ func (e *MergeConflictError) Error() string {
 	return fmt.Sprintf("merge conflict:\n%s", e.Output)
 }
 
+func (e *MergeConflictError) NeedsIntervention() bool { return true }
+
 // Manager manages repositories and worktrees on disk.
 type Manager struct {
-	reposDir string
-	git      gitops.GitOps
-	logger   *slog.Logger
-	mu       sync.RWMutex
+	reposDir  string
+	git       gitops.GitOps
+	logger    *slog.Logger
+	repoLocks sync.Map
+	ctx       context.Context
 }
 
 // New creates a Manager, creating reposDir if it doesn't exist.
-func New(reposDir string, git gitops.GitOps, logger *slog.Logger) (*Manager, error) {
+func New(reposDir string, git gitops.GitOps, logger *slog.Logger, contexts ...context.Context) (*Manager, error) {
+	absolute, err := filepath.Abs(reposDir)
+	if err != nil {
+		return nil, err
+	}
+	reposDir = absolute
 	if err := os.MkdirAll(reposDir, 0755); err != nil {
 		return nil, err
+	}
+	ctx := context.Background()
+	if len(contexts) > 0 && contexts[0] != nil {
+		ctx = contexts[0]
 	}
 	return &Manager{
 		reposDir: reposDir,
 		git:      git,
 		logger:   logger,
+		ctx:      ctx,
 	}, nil
+}
+
+func (m *Manager) pathMutex(path string) *sync.RWMutex {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = path
+	}
+	if rel, err := filepath.Rel(m.reposDir, abs); err == nil && filepath.IsLocal(rel) {
+		abs = filepath.Join(m.reposDir, strings.Split(rel, string(filepath.Separator))[0])
+	}
+	value, _ := m.repoLocks.LoadOrStore(abs, &sync.RWMutex{})
+	return value.(*sync.RWMutex)
 }
 
 // ReposDir returns the root directory for all repos.
@@ -122,15 +156,22 @@ func (m *Manager) ReposDir() string {
 
 // RepositoryMetadata returns the origin URL and current HEAD SHA for a clone.
 func (m *Manager) RepositoryMetadata(repo string) (RepositoryMetadata, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	if err := identity.Repository(repo); err != nil {
+		return RepositoryMetadata{}, err
+	}
+	if _, err := worktree.Resolve(m.reposDir, repo); err != nil {
+		return RepositoryMetadata{}, err
+	}
+	mu := m.pathMutex(m.RepoDir(repo))
+	mu.RLock()
+	defer mu.RUnlock()
 
 	repoDir := m.RepoDir(repo)
 	if !isGitClone(repoDir) {
 		return RepositoryMetadata{}, fmt.Errorf("repo %q not found", repo)
 	}
 
-	ctx := context.Background()
+	ctx := m.ctx
 	originURL, err := m.git.OriginURL(ctx, repoDir)
 	if err != nil {
 		return RepositoryMetadata{}, fmt.Errorf("read origin URL for repo %q: %w", repo, err)
@@ -144,12 +185,13 @@ func (m *Manager) RepositoryMetadata(repo string) (RepositoryMetadata, error) {
 
 // Status returns the porcelain status of an existing local clone or worktree.
 func (m *Manager) Status(dir string) (string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	mu := m.pathMutex(dir)
+	mu.RLock()
+	defer mu.RUnlock()
 	if !isGitClone(dir) {
-		return "", fmt.Errorf("Git worktree %q not found", dir)
+		return "", fmt.Errorf("git worktree %q not found", dir)
 	}
-	status, err := m.git.Status(context.Background(), dir)
+	status, err := m.git.Status(m.ctx, dir)
 	if err != nil {
 		return "", fmt.Errorf("read Git status for %q: %w", dir, err)
 	}
@@ -158,16 +200,17 @@ func (m *Manager) Status(dir string) (string, error) {
 
 // ResolveRevision resolves a revision in an existing local clone or worktree to a commit SHA.
 func (m *Manager) ResolveRevision(dir, revision string) (string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	mu := m.pathMutex(dir)
+	mu.RLock()
+	defer mu.RUnlock()
 	if !isGitClone(dir) {
-		return "", fmt.Errorf("Git worktree %q not found", dir)
+		return "", fmt.Errorf("git worktree %q not found", dir)
 	}
 	revision = strings.TrimSpace(revision)
 	if revision == "" {
-		return "", fmt.Errorf("Git revision is required")
+		return "", fmt.Errorf("git revision is required")
 	}
-	sha, err := m.git.ResolveRevision(context.Background(), dir, revision)
+	sha, err := m.git.ResolveRevision(m.ctx, dir, revision)
 	if err != nil {
 		return "", fmt.Errorf("resolve Git revision %q in %q: %w", revision, dir, err)
 	}
@@ -176,15 +219,16 @@ func (m *Manager) ResolveRevision(dir, revision string) (string, error) {
 
 // AddDetachedWorktree creates a detached worktree at an immutable revision.
 func (m *Manager) AddDetachedWorktree(repoDir, worktreeDir, revision string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	mu := m.pathMutex(repoDir)
+	mu.Lock()
+	defer mu.Unlock()
 	if !isGitClone(repoDir) {
-		return fmt.Errorf("Git source clone %q not found", repoDir)
+		return fmt.Errorf("git source clone %q not found", repoDir)
 	}
 	if strings.TrimSpace(revision) == "" {
-		return fmt.Errorf("Git revision is required")
+		return fmt.Errorf("git revision is required")
 	}
-	if err := m.git.WorktreeAddDetached(context.Background(), repoDir, worktreeDir, revision); err != nil {
+	if err := m.git.WorktreeAddDetached(m.ctx, repoDir, worktreeDir, revision); err != nil {
 		return fmt.Errorf("add detached Git worktree: %w", err)
 	}
 	return nil
@@ -192,12 +236,13 @@ func (m *Manager) AddDetachedWorktree(repoDir, worktreeDir, revision string) err
 
 // IsDetachedWorktree reports whether worktreeDir is a detached worktree of repoDir.
 func (m *Manager) IsDetachedWorktree(repoDir, worktreeDir string) (bool, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	mu := m.pathMutex(repoDir)
+	mu.RLock()
+	defer mu.RUnlock()
 	if !isGitClone(repoDir) {
-		return false, fmt.Errorf("Git source clone %q not found", repoDir)
+		return false, fmt.Errorf("git source clone %q not found", repoDir)
 	}
-	worktrees, err := m.git.WorktreeList(context.Background(), repoDir)
+	worktrees, err := m.git.WorktreeList(m.ctx, repoDir)
 	if err != nil {
 		return false, fmt.Errorf("list Git worktrees: %w", err)
 	}
@@ -211,17 +256,46 @@ func (m *Manager) IsDetachedWorktree(repoDir, worktreeDir string) (bool, error) 
 
 // RepoDir returns the filesystem path for a primary repo clone.
 func (m *Manager) RepoDir(repo string) string {
-	return fmt.Sprintf("%s/%s", m.reposDir, repo)
+	repo = strings.ToLower(strings.TrimSpace(repo))
+	canonical := filepath.Join(m.reposDir, repo)
+	if _, err := os.Lstat(canonical); err == nil {
+		return canonical
+	}
+	// Adopt pre-normalization clones without renaming or deleting user files.
+	if entries, err := os.ReadDir(m.reposDir); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() && strings.EqualFold(entry.Name(), repo) {
+				return filepath.Join(m.reposDir, entry.Name())
+			}
+		}
+	}
+	return canonical
 }
 
 // BranchWorktreeDir returns the filesystem path for a branch worktree.
 func (m *Manager) BranchWorktreeDir(repo, branch string) string {
-	return fmt.Sprintf("%s/%s/.opendev/worktrees/%s", m.reposDir, repo, filesystemBranch(branch))
+	legacy := strings.NewReplacer("/", "-", "\\", "-", "..", "-").Replace(branch)
+	legacyPath := filepath.Join(m.RepoDir(repo), ".opendev", "worktrees", legacy)
+	if legacy != filesystemBranch(branch) {
+		if _, err := os.Lstat(legacyPath); err == nil {
+			if worktrees, err := m.git.WorktreeList(m.ctx, m.RepoDir(repo)); err == nil {
+				for _, wt := range worktrees {
+					if wt.Branch == branch && filepath.Clean(wt.Path) == filepath.Clean(legacyPath) {
+						return legacyPath
+					}
+				}
+			}
+		}
+	}
+	return filepath.Join(m.RepoDir(repo), ".opendev", "worktrees", filesystemBranch(branch))
 }
 
 // filesystemBranch preserves the Git branch name while keeping worktree paths
 // and legacy MCP route fields single-segment.
 func filesystemBranch(branch string) string {
+	if strings.ContainsAny(branch, "/\\") || strings.Contains(branch, "..") || strings.HasPrefix(branch, "ref-") {
+		return "ref-" + base64.RawURLEncoding.EncodeToString([]byte(branch))
+	}
 	safe := strings.NewReplacer("/", "-", "\\", "-", "..", "-").Replace(branch)
 	if safe == "." || safe == "" {
 		return "-"
@@ -231,9 +305,24 @@ func filesystemBranch(branch string) string {
 
 // Commit records all changes in a prepared task worktree and returns its SHA.
 func (m *Manager) Commit(worktreePath string) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	ctx := context.Background()
+	resolved, err := worktree.ResolveManaged(m.reposDir, worktreePath)
+	if err != nil {
+		return "", err
+	}
+	rel, _ := filepath.Rel(m.reposDir, resolved)
+	repo := strings.Split(rel, string(filepath.Separator))[0]
+	if !isManagedWorktree(m.RepoDir(repo), resolved) {
+		return "", fmt.Errorf("only managed task worktrees may be committed")
+	}
+	mu := m.pathMutex(worktreePath)
+	mu.Lock()
+	defer mu.Unlock()
+	release, err := worktree.Coordinate(m.ctx, worktreePath, true)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+	ctx := m.ctx
 	if err := m.git.Commit(ctx, worktreePath, "opendev: complete task"); err != nil {
 		return "", fmt.Errorf("commit task worktree: %w", err)
 	}
@@ -246,7 +335,10 @@ func (m *Manager) Commit(worktreePath string) (string, error) {
 
 // HasChanges reports whether a task worktree contains changes to commit.
 func (m *Manager) HasChanges(worktreePath string) (bool, error) {
-	status, err := m.git.Status(context.Background(), worktreePath)
+	mu := m.pathMutex(worktreePath)
+	mu.RLock()
+	defer mu.RUnlock()
+	status, err := m.git.Status(m.ctx, worktreePath)
 	if err != nil {
 		return false, fmt.Errorf("read task worktree status: %w", err)
 	}
@@ -254,11 +346,27 @@ func (m *Manager) HasChanges(worktreePath string) (bool, error) {
 }
 
 func (m *Manager) HeadCommit(worktreePath string) (string, error) {
-	return m.git.HeadCommit(context.Background(), worktreePath)
+	mu := m.pathMutex(worktreePath)
+	mu.RLock()
+	defer mu.RUnlock()
+	return m.git.HeadCommit(m.ctx, worktreePath)
 }
 
 func (m *Manager) DiffRange(worktreePath, base, target string) (string, error) {
-	return m.git.DiffRange(context.Background(), worktreePath, base, target)
+	mu := m.pathMutex(worktreePath)
+	mu.RLock()
+	defer mu.RUnlock()
+	return m.git.DiffRange(m.ctx, worktreePath, base, target)
+}
+
+func (m *Manager) ReadFileAt(ctx context.Context, dir, sha, path string) (string, error) {
+	reader, ok := m.git.(interface {
+		ReadFileAt(context.Context, string, string, string) (string, error)
+	})
+	if !ok {
+		return "", fmt.Errorf("committed evidence reads are unavailable")
+	}
+	return reader.ReadFileAt(ctx, dir, sha, path)
 }
 
 // MergeTask merges an approved task branch and returns the integration HEAD SHA.
@@ -266,7 +374,7 @@ func (m *Manager) MergeTask(repository, sourceBranch, targetBranch string) (stri
 	if err := m.MergeBranch(repository, sourceBranch, targetBranch); err != nil {
 		return "", err
 	}
-	sha, err := m.git.HeadCommit(context.Background(), m.BranchWorktreeDir(repository, targetBranch))
+	sha, err := m.git.HeadCommit(m.ctx, m.BranchWorktreeDir(repository, targetBranch))
 	if err != nil {
 		return "", fmt.Errorf("read integration SHA: %w", err)
 	}

@@ -77,3 +77,26 @@ func TestCatalogRefreshDoesNotPersistMetadataReadFailure(t *testing.T) {
 		t.Fatalf("Get = %+v, %v", got, err)
 	}
 }
+
+func TestCatalogReturnedRecordsDoNotAliasStoredLifecycle(t *testing.T) {
+	catalog, _ := New(t.TempDir(), &fakeMetadataReader{})
+	record, err := catalog.Save(Record{Name: "repo", Path: "/repos/repo", Aliases: []string{"original"}, Foundation: &Foundation{Status: "ready", Version: "v4"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.Foundation.Status = "mutated"
+	record.Aliases[0] = "mutated"
+	stored, _ := catalog.Get("repo")
+	if stored.Foundation.Status != "ready" || stored.Aliases[0] != "original" {
+		t.Fatal("returned Save record aliases internal state")
+	}
+	stored.Aliases[0] = "also mutated"
+	stored, _ = catalog.Get("repo")
+	if stored.Aliases[0] != "original" {
+		t.Fatal("returned Get record aliases internal state")
+	}
+	refreshed, err := catalog.Refresh(context.Background(), manager.RepoInfo{Name: "repo", Dir: "/repos/repo"})
+	if err != nil || refreshed.Foundation.Status != "ready" {
+		t.Fatalf("refresh lost foundation: %+v %v", refreshed, err)
+	}
+}

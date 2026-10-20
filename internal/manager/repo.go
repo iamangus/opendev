@@ -6,6 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/iamangus/code-mcp/internal/identity"
+	"github.com/iamangus/code-mcp/internal/worktree"
 )
 
 var runtimeExcludePatterns = []string{
@@ -17,11 +20,19 @@ var runtimeExcludePatterns = []string{
 // SyncRepo clones the repo if it doesn't exist. Existing primary mirrors are
 // fetched and fast-forwarded only, leaving active task worktrees untouched.
 func (m *Manager) SyncRepo(repoURL, name string, expectedDefaultBranch ...string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	name = strings.ToLower(strings.TrimSpace(name))
+	if err := identity.Repository(name); err != nil {
+		return err
+	}
+	mu := m.pathMutex(m.RepoDir(name))
+	mu.Lock()
+	defer mu.Unlock()
 
-	ctx := context.Background()
+	ctx := m.ctx
 	repoDir := m.RepoDir(name)
+	if _, err := worktree.Resolve(m.reposDir, name); err != nil {
+		return err
+	}
 
 	if isGitClone(repoDir) {
 		m.logger.Info("repo sync: fetching", "repo", name)
@@ -91,21 +102,25 @@ func (m *Manager) ensureRuntimeExcludes(ctx context.Context, repoDir string) err
 
 // RemoveRepo deletes the main clone and its managed worktrees.
 func (m *Manager) RemoveRepo(name string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if err := identity.Repository(name); err != nil {
+		return err
+	}
+	mu := m.pathMutex(m.RepoDir(name))
+	mu.Lock()
+	defer mu.Unlock()
 
 	repoDir := m.RepoDir(name)
 	if _, err := os.Stat(repoDir); os.IsNotExist(err) {
 		return fmt.Errorf("repo %q not found", name)
 	}
 
-	worktrees, err := m.git.WorktreeList(context.Background(), repoDir)
+	worktrees, err := m.git.WorktreeList(m.ctx, repoDir)
 	if err == nil {
 		for _, worktree := range worktrees {
 			if !isManagedWorktree(repoDir, worktree.Path) {
 				continue
 			}
-			if err := m.git.WorktreeRemove(context.Background(), repoDir, worktree.Path); err != nil {
+			if err := m.git.WorktreeRemove(m.ctx, repoDir, worktree.Path); err != nil {
 				m.logger.Warn("removing worktree failed", "repo", name, "path", worktree.Path, "error", err)
 			}
 		}
@@ -117,8 +132,6 @@ func (m *Manager) RemoveRepo(name string) error {
 
 // Scan discovers all repos and worktrees on disk.
 func (m *Manager) Scan() ([]RepoInfo, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
 	return m.scan()
 }
 
@@ -128,7 +141,7 @@ func (m *Manager) scan() ([]RepoInfo, error) {
 		return nil, err
 	}
 
-	ctx := context.Background()
+	ctx := m.ctx
 	var repos []RepoInfo
 
 	for _, e := range entries {
@@ -140,8 +153,10 @@ func (m *Manager) scan() ([]RepoInfo, error) {
 		if !isGitClone(repoDir) {
 			continue
 		}
-		repoName := name
+		repoName := strings.ToLower(name)
 
+		mu := m.pathMutex(repoDir)
+		mu.RLock()
 		defaultBranch, err := m.git.DefaultBranch(ctx, repoDir)
 		if err != nil {
 			m.logger.Warn("scan: could not determine default branch", "repo", repoName, "error", err)
@@ -149,6 +164,7 @@ func (m *Manager) scan() ([]RepoInfo, error) {
 		}
 
 		branches := m.listWorktrees(repoDir)
+		mu.RUnlock()
 
 		repos = append(repos, RepoInfo{
 			Name:          repoName,
@@ -172,7 +188,7 @@ func isManagedWorktree(repoDir, worktreeDir string) bool {
 }
 
 func (m *Manager) listWorktrees(repoDir string) []BranchInfo {
-	worktrees, err := m.git.WorktreeList(context.Background(), repoDir)
+	worktrees, err := m.git.WorktreeList(m.ctx, repoDir)
 	if err != nil {
 		m.logger.Warn("list worktrees failed", "repo", repoDir, "error", err)
 		return nil

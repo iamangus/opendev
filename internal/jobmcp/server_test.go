@@ -28,7 +28,7 @@ func TestRoleEndpointsExposeOnlyAssignedTools(t *testing.T) {
 		{RoleWriter, []string{"get_code_job", "get_task_diff"}},
 		{RoleReviewer, []string{"get_code_job", "get_task_diff"}},
 		{RoleHolistic, []string{"get_code_job"}},
-		{RoleAdmin, []string{"create_code_job", "fork_public_repository", "get_code_job", "get_code_job_inspection", "get_code_task_inspection", "get_task_diff", "lookup_repository", "migrate_repository_foundation", "provision_repository", "publish_approved_code_job", "reset_holistic_review", "retry_code_task", "start_holistic_rereview", "start_planning"}},
+		{RoleAdmin, []string{"approve_code_job_merge", "archive_code_job", "cancel_code_job", "create_code_job", "fork_public_repository", "get_code_job", "get_code_job_inspection", "get_code_task_inspection", "get_task_diff", "list_notification_events", "lookup_repository", "migrate_repository_foundation", "pause_code_job", "provision_repository", "publish_approved_code_job", "reset_holistic_review", "resume_code_job", "retry_code_planning", "retry_code_task", "retry_notification_event", "start_holistic_rereview", "start_planning"}},
 	} {
 		t.Run(string(tc.role), func(t *testing.T) {
 			ts := httptest.NewServer(NewRole(Config{}, tc.role))
@@ -234,7 +234,7 @@ func TestStartReadyWritersCreatesSlashFreeTaskBranches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(runs) != 1 || len(dispatch.writerTasks) != 1 || dispatch.writerTasks[0].Branch != "opendev-task-"+job.ID+"-api-v1" {
+	if len(runs) != 1 || len(dispatch.writerTasks) != 1 || dispatch.writerTasks[0].Branch != taskBranch(job.ID, "api/v1") || dispatch.writerTasks[0].Branch == taskBranch(job.ID, "api-v1") {
 		t.Fatalf("unexpected writer starts: runs=%v tasks=%+v", runs, dispatch.writerTasks)
 	}
 	updated, err := store.Get(job.ID)
@@ -438,7 +438,7 @@ func TestPublishedJobIgnoresSupersededHolisticOutcome(t *testing.T) {
 	}
 }
 
-func TestUnverifiedWriterBlockerSubmitsWorkForReview(t *testing.T) {
+func TestWriterBlockerPreservesPartialWorkWithoutPublishingIt(t *testing.T) {
 	store, err := pipeline.NewStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -467,11 +467,11 @@ func TestUnverifiedWriterBlockerSubmitsWorkForReview(t *testing.T) {
 	}
 	current, _ := store.Get(job.ID)
 	task := findTask(current, "one")
-	if task.Status != pipeline.TaskReviewing || task.CommitSHA != "commit-sha" || task.WriterRunID != "writer-one" {
-		t.Fatalf("unverified blocker did not submit work for review: job=%+v task=%+v", current, task)
+	if task.Status != pipeline.TaskBlocked || task.CommitSHA != "" || task.WriterRunID != "writer-one" {
+		t.Fatalf("blocker did not preserve partial work: job=%+v task=%+v", current, task)
 	}
-	if current.Status != pipeline.JobReviewing || len(dispatch.reviewerTasks) != 1 {
-		t.Fatalf("reviewer not started for unverified blocker: job=%+v reviewers=%d", current, len(dispatch.reviewerTasks))
+	if len(dispatch.reviewerTasks) != 0 {
+		t.Fatalf("blocked partial work was submitted for review")
 	}
 }
 
@@ -680,17 +680,17 @@ func TestPublishApprovedJobCreatesAndMergesAfterSuccessfulChecks(t *testing.T) {
 	if updated.Status != pipeline.JobPublished || updated.MergeState != pipeline.MergeMerged || updated.PullRequestNumber != 9 {
 		t.Fatalf("unexpected published job: %+v", updated)
 	}
-	if got := fakeMethods(github); fmt.Sprint(got) != "[CreatePR GetPR GetPRChecks MergePR]" {
+	if got := fakeMethods(github); fmt.Sprint(got) != "[FindPR CreatePR GetPR GetPRChecks MergePR]" {
 		t.Fatalf("unexpected GitHub calls: %v", got)
 	}
-	create := github.Calls[0].Args[0].(githubpkg.CreatePROptions)
+	create := github.Calls[1].Args[0].(githubpkg.CreatePROptions)
 	if create.Title != "Test change" || create.Body != "## Summary\nTest" {
 		t.Fatalf("pull request presentation = %#v", create)
 	}
 	if _, err := publishApprovedJob(context.Background(), job.ID, Config{Store: store, Controller: controller, GitHub: github}); err != nil {
 		t.Fatal(err)
 	}
-	if got := fakeMethods(github); fmt.Sprint(got) != "[CreatePR GetPR GetPRChecks MergePR]" {
+	if got := fakeMethods(github); fmt.Sprint(got) != "[FindPR CreatePR GetPR GetPRChecks MergePR]" {
 		t.Fatalf("published retry made GitHub calls: %v", got)
 	}
 }

@@ -7,12 +7,14 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"github.com/iamangus/code-mcp/internal/locks"
@@ -21,12 +23,72 @@ import (
 
 const MaxFileSize = 1 << 20 // 1 MiB
 
-// fuzzyMatchThreshold is the minimum LCS-based similarity ratio required to
-// accept a fuzzy match in search_and_replace. A value of 0.85 requires the
-// candidate window to share at least 85% of characters with the search_block
-// after whitespace normalisation. Below this threshold the match is too
-// ambiguous to apply safely, and the closest snippet is returned to the agent.
-const fuzzyMatchThreshold = 0.85
+const maxToolOutput = 32 << 10
+
+var temporarySequence atomic.Uint64
+
+func readBounded(root, path string) ([]byte, error) {
+	r, rel, err := worktree.OpenRoot(root, path)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	f, err := r.Open(rel)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("not a regular file")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, MaxFileSize+1))
+	if len(data) > MaxFileSize {
+		return nil, fmt.Errorf("file exceeds maximum size of 1 MiB")
+	}
+	return data, err
+}
+
+func atomicReplace(root, path string, content []byte) error {
+	if len(content) > MaxFileSize {
+		return fmt.Errorf("file exceeds maximum size of 1 MiB")
+	}
+	r, rel, err := worktree.OpenRoot(root, path)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	fi, err := r.Stat(rel)
+	if err != nil {
+		return err
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("not a regular file")
+	}
+	tmp := filepath.Join(filepath.Dir(rel), fmt.Sprintf(".opendev-edit-%d-%d", os.Getpid(), temporarySequence.Add(1)))
+	f, err := r.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer r.Remove(tmp)
+	if _, err = f.Write(content); err == nil {
+		err = f.Chmod(fi.Mode().Perm())
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return r.Rename(tmp, rel)
+}
 
 func revision(content string) string {
 	sum := sha256.Sum256([]byte(content))
@@ -108,6 +170,11 @@ var ignoreDirs = map[string]bool{
 
 // ReadFile reads the entire content of a file within the worktree.
 func ReadFile(ctx context.Context, worktreeRoot, filePath string, lm *locks.Manager) (string, error) {
+	release, err := worktree.Coordinate(ctx, worktreeRoot, false)
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	abs, err := worktree.Resolve(worktreeRoot, filePath)
 	if err != nil {
 		return "", err
@@ -117,14 +184,7 @@ func ReadFile(ctx context.Context, worktreeRoot, filePath string, lm *locks.Mana
 	}
 	defer lm.RUnlock(abs)
 
-	info, err := os.Stat(abs)
-	if err != nil {
-		return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: file not found: %s", filePath)}
-	}
-	if info.Size() > MaxFileSize {
-		return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: file %s exceeds maximum size of 1 MiB", filePath)}
-	}
-	content, err := os.ReadFile(abs)
+	content, err := readBounded(worktreeRoot, filePath)
 	if err != nil {
 		return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: cannot read file: %v", err)}
 	}
@@ -133,6 +193,11 @@ func ReadFile(ctx context.Context, worktreeRoot, filePath string, lm *locks.Mana
 
 // ReadLines reads a range of lines (1-indexed, inclusive) from a file.
 func ReadLines(ctx context.Context, worktreeRoot, filePath string, startLine, endLine int, lm *locks.Manager) (string, error) {
+	release, err := worktree.Coordinate(ctx, worktreeRoot, false)
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	abs, err := worktree.Resolve(worktreeRoot, filePath)
 	if err != nil {
 		return "", err
@@ -142,11 +207,20 @@ func ReadLines(ctx context.Context, worktreeRoot, filePath string, startLine, en
 	}
 	defer lm.RUnlock(abs)
 
-	f, err := os.Open(abs)
+	r, rel, err := worktree.OpenRoot(worktreeRoot, filePath)
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+	f, err := r.Open(rel)
 	if err != nil {
 		return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: file not found: %s", filePath)}
 	}
 	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		return "", fmt.Errorf("not a regular file")
+	}
 
 	if startLine < 1 {
 		return "", &worktree.ToolError{Message: "Tool Error: start_line must be >= 1"}
@@ -157,10 +231,19 @@ func ReadLines(ctx context.Context, worktreeRoot, filePath string, startLine, en
 
 	var lines []string
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 4096), MaxFileSize)
 	lineNum := 0
+	outputSize := 0
 	for scanner.Scan() {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		lineNum++
 		if lineNum >= startLine && lineNum <= endLine {
+			outputSize += len(scanner.Text()) + 1
+			if outputSize > maxToolOutput {
+				return strings.Join(lines, "\n") + "\n[output truncated; request a smaller line range]", nil
+			}
 			lines = append(lines, scanner.Text())
 		}
 		if lineNum > endLine {
@@ -178,6 +261,11 @@ func ReadLines(ctx context.Context, worktreeRoot, filePath string, startLine, en
 
 // CreateFile creates a new file at the given path with the provided content.
 func CreateFile(ctx context.Context, worktreeRoot, filePath, content string, lm *locks.Manager) (string, error) {
+	release, err := worktree.Coordinate(ctx, worktreeRoot, false)
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	abs, err := worktree.Resolve(worktreeRoot, filePath)
 	if err != nil {
 		return "", err
@@ -187,15 +275,34 @@ func CreateFile(ctx context.Context, worktreeRoot, filePath, content string, lm 
 	}
 	defer lm.Unlock(abs)
 
-	if _, err := os.Stat(abs); err == nil {
-		return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: file already exists: %s", filePath)}
+	if len(content) > MaxFileSize {
+		return "", fmt.Errorf("file exceeds maximum size of 1 MiB")
 	}
-
-	if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
+	r, rel, err := worktree.OpenRoot(worktreeRoot, filePath)
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+	if err := r.MkdirAll(filepath.Dir(rel), 0755); err != nil {
 		return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: cannot create parent directories: %v", err)}
 	}
 
-	if err := os.WriteFile(abs, []byte(content), 0644); err != nil {
+	f, err := r.OpenFile(rel, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	if os.IsExist(err) {
+		return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: file already exists: %s", filePath)}
+	}
+	if err != nil {
+		return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: cannot create file: %v", err)}
+	}
+	_, err = f.WriteString(content)
+	if err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
 		return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: cannot write file: %v", err)}
 	}
 	return fmt.Sprintf("File created successfully: %s", abs), nil
@@ -203,6 +310,11 @@ func CreateFile(ctx context.Context, worktreeRoot, filePath, content string, lm 
 
 // ListDirectory lists the contents of a directory, optionally recursively.
 func ListDirectory(ctx context.Context, worktreeRoot, dirPath string, recursive bool, lm *locks.Manager) (string, error) {
+	release, err := worktree.Coordinate(ctx, worktreeRoot, false)
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	abs, err := worktree.Resolve(worktreeRoot, dirPath)
 	if err != nil {
 		return "", err
@@ -214,16 +326,28 @@ func ListDirectory(ctx context.Context, worktreeRoot, dirPath string, recursive 
 	}
 
 	var sb strings.Builder
+	r, relDir, err := worktree.OpenRoot(worktreeRoot, dirPath)
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
 
 	if recursive {
-		walkErr := filepath.Walk(abs, func(path string, fi os.FileInfo, err error) error {
+		walkErr := fs.WalkDir(r.FS(), relDir, func(path string, fi fs.DirEntry, err error) error {
+			if cancelErr := ctx.Err(); cancelErr != nil {
+				return cancelErr
+			}
+			if sb.Len() >= maxToolOutput {
+				sb.WriteString("[output truncated]\n")
+				return filepath.SkipAll
+			}
 			if err != nil {
 				return nil
 			}
-			if fi.IsDir() && ignoreDirs[fi.Name()] && path != abs {
+			if fi.IsDir() && ignoreDirs[fi.Name()] && path != relDir {
 				return filepath.SkipDir
 			}
-			rel, _ := filepath.Rel(abs, path)
+			rel, _ := filepath.Rel(relDir, path)
 			if rel == "." {
 				return nil
 			}
@@ -240,11 +364,26 @@ func ListDirectory(ctx context.Context, worktreeRoot, dirPath string, recursive 
 			return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: error walking directory: %v", walkErr)}
 		}
 	} else {
-		entries, err2 := os.ReadDir(abs)
+		f, err2 := r.Open(relDir)
+		if err2 != nil {
+			return "", err2
+		}
+		defer f.Close()
+		entries, err2 := f.ReadDir(1024)
+		if err2 == io.EOF {
+			err2 = nil
+		}
 		if err2 != nil {
 			return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: cannot read directory: %v", err2)}
 		}
 		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+			if sb.Len() >= maxToolOutput {
+				sb.WriteString("[output truncated]\n")
+				break
+			}
 			if ignoreDirs[entry.Name()] {
 				continue
 			}
@@ -253,6 +392,9 @@ func ListDirectory(ctx context.Context, worktreeRoot, dirPath string, recursive 
 			} else {
 				sb.WriteString(fmt.Sprintf("  %s\n", entry.Name()))
 			}
+		}
+		if len(entries) == 1024 {
+			sb.WriteString("[output truncated: directory entry limit]\n")
 		}
 	}
 
@@ -266,7 +408,12 @@ func ListDirectory(ctx context.Context, worktreeRoot, dirPath string, recursive 
 const maxGrepOutput = 32 << 10 // 32 KiB
 
 func GrepSearch(ctx context.Context, worktreeRoot, query, directory string, lm *locks.Manager) (string, error) {
-	searchPath := worktreeRoot
+	release, err := worktree.Coordinate(ctx, worktreeRoot, false)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+	searchPath := "."
 	if directory != "" {
 		searchPath = directory
 	}
@@ -276,7 +423,7 @@ func GrepSearch(ctx context.Context, worktreeRoot, query, directory string, lm *
 	}
 
 	if _, lookErr := exec.LookPath("rg"); lookErr == nil {
-		if out, truncated, runErr := grepWithRipgrep(ctx, abs, query); runErr == nil {
+		if out, truncated, runErr := grepWithRipgrep(ctx, worktreeRoot, abs, query); runErr == nil {
 			return boundGrepOutput(out, truncated), nil
 		}
 		// Fall through to the in-process walker when ripgrep is unusable.
@@ -291,6 +438,9 @@ func GrepSearch(ctx context.Context, worktreeRoot, query, directory string, lm *
 	truncated := false
 
 	walkErr := filepath.Walk(abs, func(path string, fi os.FileInfo, err error) error {
+		if cancelErr := ctx.Err(); cancelErr != nil {
+			return cancelErr
+		}
 		if err != nil {
 			return nil
 		}
@@ -302,6 +452,9 @@ func GrepSearch(ctx context.Context, worktreeRoot, query, directory string, lm *
 		}
 		if truncated {
 			return filepath.SkipAll
+		}
+		if !fi.Mode().IsRegular() {
+			return nil
 		}
 		// Skip files that cannot reasonably contain a useful text match.
 		if fi.Size() > 1<<20 {
@@ -315,7 +468,7 @@ func GrepSearch(ctx context.Context, worktreeRoot, query, directory string, lm *
 				return nil, err
 			}
 			defer lm.RUnlock(path)
-			return os.ReadFile(path)
+			return readBounded(worktreeRoot, path)
 		}()
 		if readErr != nil {
 			return nil
@@ -362,9 +515,20 @@ func GrepSearch(ctx context.Context, worktreeRoot, query, directory string, lm *
 // grepWithRipgrep runs ripgrep over the resolved path and returns up to
 // maxGrepOutput+1 bytes so callers can detect truncation without buffering an
 // unbounded result.
-func grepWithRipgrep(ctx context.Context, abs, query string) (string, bool, error) {
+func grepWithRipgrep(ctx context.Context, root, abs, query string) (string, bool, error) {
+	r, rel, err := worktree.OpenRoot(root, abs)
+	if err != nil {
+		return "", false, err
+	}
+	defer r.Close()
+	dir, err := r.Open(rel)
+	if err != nil {
+		return "", false, err
+	}
+	defer dir.Close()
 	cmd := exec.CommandContext(ctx, "rg", "--no-heading", "-n", "-C", "2", "--glob", "!.opendev/**", "--glob", "!.git/**", "-e", query, ".")
-	cmd.Dir = abs
+	cmd.ExtraFiles = []*os.File{dir}
+	cmd.Dir = "/proc/self/fd/3"
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return "", false, err
@@ -374,19 +538,26 @@ func grepWithRipgrep(ctx context.Context, abs, query string) (string, bool, erro
 	if err := cmd.Start(); err != nil {
 		return "", false, err
 	}
-	defer func() {
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		_, _ = cmd.Process.Wait()
-	}()
-
 	data := make([]byte, maxGrepOutput+1)
 	n, readErr := io.ReadFull(stdout, data)
 	if readErr != nil && readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		return "", false, readErr
 	}
 	truncated := n == len(data)
+	if truncated {
+		_ = cmd.Process.Kill()
+	}
+	waitErr := cmd.Wait()
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	if !truncated && waitErr != nil {
+		if exit, ok := waitErr.(*exec.ExitError); !ok || exit.ExitCode() != 1 {
+			return "", false, fmt.Errorf("ripgrep failed: %w", waitErr)
+		}
+	}
 	return string(data[:n]), truncated, nil
 }
 
@@ -401,6 +572,14 @@ func boundGrepOutput(out string, truncated bool) string {
 // SearchAndReplace finds a block of text in a file and replaces it.
 // It first tries an exact match, then falls back to fuzzy matching.
 func SearchAndReplace(ctx context.Context, worktreeRoot, filePath, searchBlock, replaceBlock, expectedRevision string, lm *locks.Manager) (string, error) {
+	release, err := worktree.Coordinate(ctx, worktreeRoot, false)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+	if searchBlock == "" || len(searchBlock) > MaxFileSize || len(replaceBlock) > MaxFileSize {
+		return "", &worktree.ToolError{Message: "Tool Error: search_block must be nonempty and edit blocks must not exceed 1 MiB"}
+	}
 	abs, err := worktree.Resolve(worktreeRoot, filePath)
 	if err != nil {
 		return "", err
@@ -410,7 +589,7 @@ func SearchAndReplace(ctx context.Context, worktreeRoot, filePath, searchBlock, 
 	}
 	defer lm.Unlock(abs)
 
-	data, err := os.ReadFile(abs)
+	data, err := readBounded(worktreeRoot, filePath)
 	if err != nil {
 		return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: cannot read file: %v", err)}
 	}
@@ -426,94 +605,61 @@ func SearchAndReplace(ctx context.Context, worktreeRoot, filePath, searchBlock, 
 	}
 	if count == 1 {
 		newContent := strings.Replace(content, searchBlock, replaceBlock, 1)
-		if err := os.WriteFile(abs, []byte(newContent), 0644); err != nil {
+		if err := atomicReplace(worktreeRoot, filePath, []byte(newContent)); err != nil {
 			return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: cannot write file: %v", err)}
 		}
 		return fmt.Sprintf("Successfully replaced in %s. This result does not authorize another edit: call read_file on %s again before the next search_and_replace; its result carries the expected_revision to use.", filePath, filePath), nil
 	}
 
-	// Fuzzy match: normalize whitespace and compare line-by-line windows
+	// Normalize whitespace only: approximate character matches can silently
+	// edit the wrong code. KMP over lines keeps the fallback linear in file size.
 	searchLines := strings.Split(searchBlock, "\n")
 	fileLines := strings.Split(content, "\n")
-
-	normalizeLines := func(lines []string) string {
-		parts := make([]string, len(lines))
-		for i, l := range lines {
-			parts[i] = strings.Join(strings.Fields(strings.TrimSpace(l)), " ")
-		}
-		return strings.Join(parts, "\n")
+	for i := range searchLines {
+		searchLines[i] = strings.Join(strings.Fields(searchLines[i]), " ")
 	}
-
-	normalizedSearch := normalizeLines(searchLines)
-	windowSize := len(searchLines)
-
-	bestRatio := 0.0
+	prefix := make([]int, len(searchLines))
+	for i, j := 1, 0; i < len(searchLines); i++ {
+		for j > 0 && searchLines[i] != searchLines[j] {
+			j = prefix[j-1]
+		}
+		if searchLines[i] == searchLines[j] {
+			j++
+		}
+		prefix[i] = j
+	}
 	bestStart := -1
-	bestEnd := -1
-
-	for i := 0; i <= len(fileLines)-windowSize; i++ {
-		window := fileLines[i : i+windowSize]
-		normalizedWindow := normalizeLines(window)
-		ratio := similarity(normalizedSearch, normalizedWindow)
-		if ratio > bestRatio {
-			bestRatio = ratio
-			bestStart = i
-			bestEnd = i + windowSize
+	for i, j := 0, 0; i < len(fileLines); i++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		line := strings.Join(strings.Fields(fileLines[i]), " ")
+		for j > 0 && line != searchLines[j] {
+			j = prefix[j-1]
+		}
+		if line == searchLines[j] {
+			j++
+		}
+		if j == len(searchLines) {
+			if bestStart >= 0 {
+				return "", &worktree.ToolError{Message: "Tool Error: ambiguous whitespace-normalized search_block; provide more context"}
+			}
+			bestStart = i - j + 1
+			j = prefix[j-1]
 		}
 	}
-
-	if bestRatio >= fuzzyMatchThreshold {
+	if bestStart >= 0 {
+		bestEnd := bestStart + len(searchLines)
 		var newLines []string
 		newLines = append(newLines, fileLines[:bestStart]...)
 		newLines = append(newLines, strings.Split(replaceBlock, "\n")...)
 		newLines = append(newLines, fileLines[bestEnd:]...)
 		newContent := strings.Join(newLines, "\n")
-		if err := os.WriteFile(abs, []byte(newContent), 0644); err != nil {
+		if err := atomicReplace(worktreeRoot, filePath, []byte(newContent)); err != nil {
 			return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: cannot write file: %v", err)}
 		}
 		return fmt.Sprintf("Successfully replaced in %s. This result does not authorize another edit: call read_file on %s again before the next search_and_replace; its result carries the expected_revision to use.", filePath, filePath), nil
 	}
 
-	snippet := ""
-	if bestStart >= 0 {
-		snippet = strings.Join(fileLines[bestStart:bestEnd], "\n")
-	}
-	return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: search_block not found in %s (best match similarity: %.2f). Closest match:\n%s", filePath, bestRatio, snippet)}
-}
-
-// similarity computes 2*LCS_chars / (len(a)+len(b)).
-func similarity(a, b string) float64 {
-	if len(a) == 0 && len(b) == 0 {
-		return 1.0
-	}
-	lcs := lcsLength(a, b)
-	return float64(2*lcs) / float64(len(a)+len(b))
-}
-
-// lcsLength computes the length of the longest common subsequence of two strings.
-func lcsLength(a, b string) int {
-	ra := []rune(a)
-	rb := []rune(b)
-	m, n := len(ra), len(rb)
-	if m == 0 || n == 0 {
-		return 0
-	}
-	prev := make([]int, n+1)
-	curr := make([]int, n+1)
-	for i := 1; i <= m; i++ {
-		for j := 1; j <= n; j++ {
-			if ra[i-1] == rb[j-1] {
-				curr[j] = prev[j-1] + 1
-			} else if curr[j-1] > prev[j] {
-				curr[j] = curr[j-1]
-			} else {
-				curr[j] = prev[j]
-			}
-		}
-		prev, curr = curr, prev
-		for k := range curr {
-			curr[k] = 0
-		}
-	}
-	return prev[n]
+	return "", &worktree.ToolError{Message: fmt.Sprintf("Tool Error: search_block not found in %s; provide exact text or whitespace-only differences", filePath)}
 }

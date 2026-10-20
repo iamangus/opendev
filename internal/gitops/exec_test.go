@@ -183,3 +183,31 @@ func writeFile(t *testing.T, path, content string) {
 		t.Fatal(err)
 	}
 }
+
+func TestMergeConflictRestoresCleanTarget(t *testing.T) {
+	dir := t.TempDir()
+	runCmd(t, dir, "git", "init", "-b", "main")
+	runCmd(t, dir, "git", "config", "user.name", "Test")
+	runCmd(t, dir, "git", "config", "user.email", "test@example.test")
+	writeFile(t, filepath.Join(dir, "file"), "base\n")
+	runCmd(t, dir, "git", "add", ".")
+	runCmd(t, dir, "git", "commit", "-m", "base")
+	runCmd(t, dir, "git", "checkout", "-b", "other")
+	writeFile(t, filepath.Join(dir, "file"), "other\n")
+	runCmd(t, dir, "git", "commit", "-am", "other")
+	runCmd(t, dir, "git", "checkout", "main")
+	writeFile(t, filepath.Join(dir, "file"), "main\n")
+	runCmd(t, dir, "git", "commit", "-am", "main")
+	g := NewExec(slog.Default(), "")
+	if err := g.Merge(context.Background(), dir, "other"); err == nil {
+		t.Fatal("expected conflict")
+	}
+	status, err := g.Status(context.Background(), dir)
+	if err != nil || status != "" {
+		t.Fatalf("conflict left dirty target: %q %v", status, err)
+	}
+	data, _ := os.ReadFile(filepath.Join(dir, "file"))
+	if string(data) != "main\n" {
+		t.Fatal("target contents not restored")
+	}
+}

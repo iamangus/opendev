@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/iamangus/code-mcp/internal/durable"
 	"github.com/iamangus/code-mcp/internal/pipeline"
 )
 
@@ -51,7 +52,7 @@ type Event struct {
 	TerminalFailure bool       `json:"terminal_failure,omitempty"`
 }
 
-var errEventFailed = errors.New("Eve agent processing failed")
+var errEventFailed = errors.New("eve agent processing failed")
 
 type persisted struct {
 	Events []Event `json:"events"`
@@ -91,7 +92,10 @@ func (s *Store) Enqueue(event Event) error {
 		return nil
 	}
 	now := time.Now().UTC()
-	event.CreatedAt, event.NextAttemptAt = now, now
+	if event.CreatedAt.IsZero() {
+		event.CreatedAt = now
+	}
+	event.NextAttemptAt = now
 	s.events[event.ID] = event
 	if err := s.saveLocked(); err != nil {
 		delete(s.events, event.ID)
@@ -177,6 +181,14 @@ func (s *Store) Reconcile(jobs []*pipeline.Job) error {
 		if job == nil {
 			continue
 		}
+		for _, transition := range job.Events {
+			if err := s.Enqueue(Event{ID: eventID(job.ID, transition.ID), Type: strings.Split(transition.Type, ":")[0], JobID: job.ID, Status: string(transition.Status), Summary: transition.Summary, Errors: transition.Error, PullRequestURL: job.PullRequestURL, CreatedAt: transition.CreatedAt}); err != nil {
+				return err
+			}
+		}
+		if len(job.Events) > 0 {
+			continue
+		}
 		if job.Status != pipeline.JobCreated {
 			if err := s.Enqueue(eventFor(job, EventStarted, "", "")); err != nil {
 				return err
@@ -210,6 +222,51 @@ func (s *Store) Reconcile(jobs []*pipeline.Job) error {
 	return nil
 }
 
+func (s *Store) List() []Event {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := make([]Event, 0, len(s.events))
+	for _, event := range s.events {
+		result = append(result, event)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].CreatedAt.Before(result[j].CreatedAt) })
+	return result
+}
+
+func (s *Store) PendingCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	count := 0
+	for _, event := range s.events {
+		if event.DeliveredAt == nil && !event.TerminalFailure {
+			count++
+		}
+	}
+	return count
+}
+
+func (s *Store) Retry(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	event, ok := s.events[id]
+	if !ok {
+		return fmt.Errorf("notification event not found")
+	}
+	if event.DeliveredAt != nil {
+		return fmt.Errorf("notification already delivered")
+	}
+	previous := event
+	event.TerminalFailure = false
+	event.LastError = ""
+	event.NextAttemptAt = time.Now().UTC()
+	s.events[id] = event
+	if err := s.saveLocked(); err != nil {
+		s.events[id] = previous
+		return err
+	}
+	return nil
+}
+
 // Notify is intentionally best-effort: a notification persistence failure must not affect a job.
 func Notify(store *Store, job *pipeline.Job, eventType, summary, eventError string, logger *slog.Logger) {
 	if store == nil || job == nil {
@@ -224,7 +281,30 @@ func eventFor(job *pipeline.Job, eventType, summary, eventError string) Event {
 	if summary == "" {
 		summary = job.Directive
 	}
-	return Event{ID: eventID(job.ID, eventType), Type: strings.Split(eventType, ":")[0], JobID: job.ID, Status: string(job.Status), Summary: summary, PullRequestURL: job.PullRequestURL, Errors: eventError}
+	identity := eventType
+	for i := len(job.Events) - 1; i >= 0; i-- {
+		if job.Events[i].Type == eventType {
+			event := job.Events[i]
+			return Event{ID: eventID(job.ID, event.ID), Type: strings.Split(eventType, ":")[0], JobID: job.ID, Status: string(event.Status), Summary: summary, Errors: eventError, PullRequestURL: job.PullRequestURL, CreatedAt: event.CreatedAt}
+		}
+	}
+	if strings.HasPrefix(eventType, "ci_") {
+		if job.CI != nil {
+			identity += ":" + job.CI.HeadSHA
+		}
+		identity += fmt.Sprintf(":%d:%d", job.CIReplanRounds, job.HolisticRounds)
+	}
+	if strings.HasPrefix(eventType, EventBlocked+":") || strings.HasPrefix(eventType, EventCancelled+":") {
+		key := strings.SplitN(eventType, ":", 2)[1]
+		if job.Plan != nil {
+			for _, task := range job.Plan.Tasks {
+				if task.Key == key {
+					identity += fmt.Sprintf(":%d:%d", task.WriterAttempts, task.ReviewerAttempts)
+				}
+			}
+		}
+	}
+	return Event{ID: eventID(job.ID, identity), Type: strings.Split(eventType, ":")[0], JobID: job.ID, Status: string(job.Status), Summary: summary, PullRequestURL: job.PullRequestURL, Errors: eventError}
 }
 
 func eventID(jobID, eventType string) string {
@@ -338,7 +418,7 @@ func (d *Deliverer) deliver(ctx context.Context, event Event) error {
 	}
 	defer statusResponse.Body.Close()
 	if statusResponse.StatusCode != http.StatusOK {
-		return fmt.Errorf("Eve event status returned %s", statusResponse.Status)
+		return fmt.Errorf("eve event status returned %s", statusResponse.Status)
 	}
 	var status struct {
 		State     string `json:"state"`
@@ -353,7 +433,7 @@ func (d *Deliverer) deliver(ctx context.Context, event Event) error {
 	case "failed":
 		return fmt.Errorf("%w: %s", errEventFailed, status.LastError)
 	case "pending", "leased":
-		return fmt.Errorf("Eve event is %s", status.State)
+		return fmt.Errorf("eve event is %s", status.State)
 	default:
 		return fmt.Errorf("unknown Eve event state %q", status.State)
 	}
@@ -413,7 +493,7 @@ func (s *Store) saveLocked() error {
 	if err := os.Rename(name, s.path); err != nil {
 		return fmt.Errorf("replace outbox state: %w", err)
 	}
-	return nil
+	return durable.SyncDirectory(s.path)
 }
 func min(a, b int) int {
 	if a < b {

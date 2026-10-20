@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/iamangus/code-mcp/internal/durable"
 )
 
 // State records the latest graph indexing outcome for one repository.
@@ -145,5 +147,5 @@ func (s *Store) saveLocked(next State) error {
 	if err := os.Rename(tmpName, s.path); err != nil {
 		return fmt.Errorf("replace repository index state: %w", err)
 	}
-	return nil
+	return durable.SyncDirectory(s.path)
 }

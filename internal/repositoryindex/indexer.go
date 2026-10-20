@@ -61,7 +61,7 @@ func NewIndexer(store StateStore, client IngestionClient) (*Indexer, error) {
 		return nil, fmt.Errorf("repository index store is required")
 	}
 	if client == nil {
-		return nil, fmt.Errorf("Graphiti ingestion client is required")
+		return nil, fmt.Errorf("graphiti ingestion client is required")
 	}
 	return &Indexer{store: store, client: client}, nil
 }

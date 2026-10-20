@@ -4,11 +4,13 @@ package validation
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/iamangus/code-mcp/internal/limits"
+	"github.com/iamangus/code-mcp/internal/worktree"
 
 	"gopkg.in/yaml.v3"
 )
@@ -39,7 +41,12 @@ func Run(ctx context.Context, worktreePath, name string) (Result, error) {
 	if name == "" {
 		return Result{}, fmt.Errorf("validation_name is required")
 	}
-	data, err := os.ReadFile(filepath.Join(worktreePath, policyPath))
+	r, relPolicy, err := worktree.OpenRoot(worktreePath, policyPath)
+	if err != nil {
+		return Result{}, err
+	}
+	defer r.Close()
+	data, err := r.ReadFile(relPolicy)
 	if err != nil {
 		return Result{}, fmt.Errorf("read %s: %w", policyPath, err)
 	}
@@ -54,10 +61,13 @@ func Run(ctx context.Context, worktreePath, name string) (Result, error) {
 	if strings.TrimSpace(definition.Command) == "" {
 		return Result{}, fmt.Errorf("validation %q has no command", name)
 	}
-	if definition.Timeout <= 0 {
+	if definition.Timeout <= 0 || definition.Timeout > 1800 {
 		definition.Timeout = 300
 	}
 	dir := filepath.Clean(filepath.Join(worktreePath, definition.Directory))
+	if _, err := worktree.Resolve(worktreePath, dir); err != nil {
+		return Result{}, err
+	}
 	rel, err := filepath.Rel(worktreePath, dir)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return Result{}, fmt.Errorf("validation %q has an invalid directory", name)
@@ -68,8 +78,11 @@ func Run(ctx context.Context, worktreePath, name string) (Result, error) {
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, "sh", "-c", definition.Command)
 	cmd.Dir = dir
-	output, runErr := cmd.CombinedOutput()
-	result := Result{Name: name, Command: definition.Command, Directory: definition.Directory, Output: string(output), DurationMS: time.Since(started).Milliseconds()}
+	cmd.WaitDelay = time.Second
+	output := &limits.Buffer{Limit: 64 << 10}
+	cmd.Stdout, cmd.Stderr = output, output
+	runErr := cmd.Run()
+	result := Result{Name: name, Command: definition.Command, Directory: definition.Directory, Output: output.String(), DurationMS: time.Since(started).Milliseconds()}
 	if cmd.ProcessState != nil {
 		result.ExitCode = cmd.ProcessState.ExitCode()
 	}

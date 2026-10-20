@@ -1,24 +1,45 @@
 package manager
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/iamangus/code-mcp/internal/identity"
+	"github.com/iamangus/code-mcp/internal/worktree"
 )
 
 // PushBranch pushes the branch worktree to origin.
 func (m *Manager) PushBranch(repo, branch string) error {
+	if err := identity.Repository(repo); err != nil {
+		return err
+	}
+	if err := identity.Branch(branch); err != nil {
+		return err
+	}
+	mu := m.pathMutex(m.RepoDir(repo))
+	mu.Lock()
+	defer mu.Unlock()
 	wtDir := m.BranchWorktreeDir(repo, branch)
-	return m.git.Push(context.Background(), wtDir, branch)
+	return m.git.Push(m.ctx, wtDir, branch)
 }
 
 // MergeBranch merges sourceBranch into targetBranch within the given repo.
 func (m *Manager) MergeBranch(repo, sourceBranch, targetBranch string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if err := identity.Repository(repo); err != nil {
+		return err
+	}
+	if err := identity.Branch(sourceBranch); err != nil {
+		return err
+	}
+	if err := identity.Branch(targetBranch); err != nil {
+		return err
+	}
+	mu := m.pathMutex(m.RepoDir(repo))
+	mu.Lock()
+	defer mu.Unlock()
 
-	ctx := context.Background()
+	ctx := m.ctx
 	repoDir := m.RepoDir(repo)
 
 	defaultBranch, err := m.git.DefaultBranch(ctx, repoDir)
@@ -41,9 +62,14 @@ func (m *Manager) MergeBranch(repo, sourceBranch, targetBranch string) error {
 		}
 	}
 
+	release, err := worktree.Coordinate(ctx, targetDir, true)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if err := m.git.Merge(ctx, targetDir, sourceBranch); err != nil {
 		errStr := err.Error()
-		if strings.Contains(errStr, "CONFLICT") || strings.Contains(errStr, "conflict") {
+		if strings.Contains(errStr, "CONFLICT") || strings.Contains(errStr, "conflict") || strings.Contains(errStr, "pre-existing merge") || strings.Contains(errStr, "must be clean") {
 			return &MergeConflictError{Output: errStr}
 		}
 		return err
@@ -58,10 +84,11 @@ func (m *Manager) MergeBranch(repo, sourceBranch, targetBranch string) error {
 
 // GetCommits returns commits unique to the branch (not in default branch).
 func (m *Manager) GetCommits(repo, branch string) ([]CommitInfo, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	mu := m.pathMutex(m.RepoDir(repo))
+	mu.RLock()
+	defer mu.RUnlock()
 
-	ctx := context.Background()
+	ctx := m.ctx
 	repoDir := m.RepoDir(repo)
 
 	defaultBranch, err := m.git.DefaultBranch(ctx, repoDir)

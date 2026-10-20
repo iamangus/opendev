@@ -134,6 +134,16 @@ func (c *Controller) RetryWriter(jobID, taskKey, runID string) (*Job, error) {
 	})
 }
 
+func (c *Controller) RetryReview(jobID, taskKey, runID string) (*Job, error) {
+	return c.store.updateTask(jobID, taskKey, func(_ *Job, task *Task) error {
+		if task.Status != TaskReviewing || task.ReviewerRunID != runID {
+			return transition(task.Status, "retry review")
+		}
+		task.ReviewerRunID = ""
+		return nil
+	})
+}
+
 // ResumeBlockedWriter re-opens a task its Writer reported blocked. The block
 // reason stays in durable history; a fresh Writer attempt decides anew.
 func (c *Controller) ResumeBlockedWriter(jobID, taskKey string) (*Job, error) {
@@ -234,6 +244,7 @@ func (s *Store) recordNoChanges(jobID, taskKey, runID, reason string, evidence [
 				job.Status = JobNoChanges
 			}
 		}
+		refreshEligibility(job.Plan)
 		return nil
 	})
 }
@@ -361,6 +372,9 @@ func (s *Store) recordHolisticReview(jobID, runID, integrationSHA string, verdic
 	if strings.TrimSpace(runID) == "" || strings.TrimSpace(integrationSHA) == "" || (verdict != ReviewApproved && verdict != ReviewChangesRequested && verdict != ReviewBlocked) {
 		return nil, fmt.Errorf("%w: valid holistic review is required", ErrInvalidTransition)
 	}
+	if verdict == ReviewApproved && (strings.TrimSpace(content.Title) == "" || strings.TrimSpace(content.Body) == "") {
+		return nil, fmt.Errorf("%w: approved holistic review requires pull request title and body", ErrInvalidTransition)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	job, ok := s.jobs[jobID]
@@ -442,6 +456,7 @@ func (s *Store) startHolisticRereview(jobID, integrationSHA string) (*Job, error
 		return nil, transition(job.Status, "start holistic re-review")
 	}
 	job.Status = JobHolisticReviewing
+	job.HolisticRounds++
 	job.IntegrationSHA = integrationSHA
 	job.HolisticReviewRunID = ""
 	job.HolisticReviewSHA = ""
@@ -479,7 +494,7 @@ func (s *Store) recordMerge(jobID string) (*Job, error) {
 	if job.MergeState == MergeMerged && job.Status == JobPublished {
 		return cloneJob(job), nil
 	}
-	if job.MergeState != MergeOpen || job.HolisticReviewVerdict != ReviewApproved {
+	if job.Status != JobReadyToPublish || job.MergeState != MergeOpen || job.HolisticReviewVerdict != ReviewApproved {
 		return nil, transition(job.Status, "record merge")
 	}
 	job.MergeState, job.Status = MergeMerged, JobPublished
@@ -494,10 +509,12 @@ func (s *Store) updateJob(jobID string, update func(*Job) error) (*Job, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	if err := update(job); err != nil {
+	candidate := cloneJob(job)
+	if err := update(candidate); err != nil {
 		return nil, err
 	}
-	return s.saveAndCloneLocked(job)
+	s.jobs[jobID] = candidate
+	return s.saveAndCloneLocked(candidate)
 }
 
 func (s *Store) updateTask(jobID, taskKey string, update func(*Job, *Task) error) (*Job, error) {
@@ -510,12 +527,14 @@ func (s *Store) updateTask(jobID, taskKey string, update func(*Job, *Task) error
 	if job.Plan == nil {
 		return nil, fmt.Errorf("%w: job has no plan", ErrInvalidTransition)
 	}
-	for i := range job.Plan.Tasks {
-		if job.Plan.Tasks[i].Key == taskKey {
-			if err := update(job, &job.Plan.Tasks[i]); err != nil {
+	candidate := cloneJob(job)
+	for i := range candidate.Plan.Tasks {
+		if candidate.Plan.Tasks[i].Key == taskKey {
+			if err := update(candidate, &candidate.Plan.Tasks[i]); err != nil {
 				return nil, err
 			}
-			return s.saveAndCloneLocked(job)
+			s.jobs[jobID] = candidate
+			return s.saveAndCloneLocked(candidate)
 		}
 	}
 	return nil, fmt.Errorf("%w: task %q", ErrNotFound, taskKey)
@@ -609,4 +628,35 @@ func hasIntegratedTask(plan *Plan) bool {
 		}
 	}
 	return false
+}
+
+func refreshEligibility(plan *Plan) {
+	if plan == nil {
+		return
+	}
+	for i := range plan.Tasks {
+		task := &plan.Tasks[i]
+		if task.Status == TaskApproved && integrationPrerequisitesMet(plan, task) {
+			task.Status = TaskIntegrationEligible
+		}
+	}
+}
+
+// StartReviewRemediation creates review-driven work without pretending CI failed.
+func (c *Controller) StartReviewRemediation(jobID, description string) (*Job, error) {
+	return c.store.updateJob(jobID, func(job *Job) error {
+		if job.Status != JobHolisticReviewing || job.Plan == nil || job.HolisticReviewVerdict != ReviewChangesRequested {
+			return transition(job.Status, "start holistic remediation")
+		}
+		key := fmt.Sprintf("holistic-remediation-%d", job.HolisticRounds)
+		for _, task := range job.Plan.Tasks {
+			if task.Key == key {
+				return nil
+			}
+		}
+		job.Plan.Tasks = append(job.Plan.Tasks, Task{Key: key, Kind: TaskImplementation, Title: "Address holistic review feedback", Description: description, AcceptanceCriteria: []string{"Address the holistic review findings", "Preserve previously accepted behavior"}, Status: TaskPlanned, ReviewVerdict: ReviewPending})
+		job.Plan.IntegrationOrder = append(job.Plan.IntegrationOrder, key)
+		job.Status = JobPlanned
+		return nil
+	})
 }

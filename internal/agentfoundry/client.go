@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // MCPServer configures an ephemeral MCP server for one agent run.
@@ -50,7 +51,7 @@ type Client struct {
 }
 
 func NewClient(baseURL, apiKey string) (*Client, error) {
-	return NewClientWithHTTPClient(baseURL, apiKey, http.DefaultClient)
+	return NewClientWithHTTPClient(baseURL, apiKey, &http.Client{Timeout: 30 * time.Second})
 }
 
 // NewClientWithHTTPClient is useful when callers need custom transport or timeout settings.
@@ -63,7 +64,7 @@ func NewClientWithHTTPClient(baseURL, apiKey string, httpClient *http.Client) (*
 		return nil, fmt.Errorf("invalid AgentFoundry URL scheme")
 	}
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
 	return &Client{baseURL: u, httpClient: httpClient, apiKey: apiKey}, nil
 }
@@ -140,7 +141,7 @@ func (c *Client) GetRunByTaskID(ctx context.Context, taskID string) (*Run, error
 		return nil, fmt.Errorf("AgentFoundry request failed: %s", resp.Status)
 	}
 	var run Run
-	if err := json.NewDecoder(resp.Body).Decode(&run); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(&run); err != nil {
 		return nil, fmt.Errorf("decode AgentFoundry response: %w", err)
 	}
 	return &run, nil
@@ -189,7 +190,7 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body io.Reader
 		return fmt.Errorf("AgentFoundry request failed: %s", resp.Status)
 	}
 	if output != nil {
-		if err := json.NewDecoder(resp.Body).Decode(output); err != nil {
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(output); err != nil {
 			return fmt.Errorf("decode AgentFoundry response: %w", err)
 		}
 	}
