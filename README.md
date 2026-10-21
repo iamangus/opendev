@@ -108,6 +108,22 @@ validations:
 
 These commands run on the GitHub Actions runner, not through an agent shell tool. Without a policy, CI discovers Go, npm, Python, and Rust projects (including nested modules), or a root Makefile. A repository with no supported validations fails rather than receiving a false green check. npm auto-discovery requires a package lock and a test or build script. Explicit profiles are `auto`, `go`, `node`, `python`, `rust`, and `make`.
 
+### Job dashboard
+
+Open `/ui/` on the multi-repository HTTP server to track jobs. The dashboard is
+embedded in the Go binary and container; no Node.js or frontend build is needed.
+Paste the existing `OPENDEV_TOKEN` to connect. It is kept only in the current
+tab's memory, never in URLs, cookies, or browser storage, and must be re-entered
+after a page reload. Use HTTPS when accessing OpenDev remotely.
+
+The read-only dashboard refreshes every ten seconds (paused in background tabs),
+with search, status filters, task progress, blockers, review feedback, CI checks,
+PR links, and recent transitions. It lists unarchived jobs; archived jobs can be
+opened directly using `/ui/#job=JOB_ID`. Disconnect clears displayed job data.
+The static page is public, but all job data uses the existing bearer-protected
+`GET /ui/api/jobs` and `GET /ui/api/jobs/{id}` endpoints. No new auth mechanism
+or job-changing HTTP endpoints are introduced.
+
 ### Job controls and recovery
 
 - `create_code_job` accepts `merge_policy: auto|manual` (default `auto`). Manual jobs prepare a reviewed, CI-gated PR and wait for `approve_code_job_merge`; all merge gates remain enforced.
@@ -172,7 +188,7 @@ Private repository access uses the configured GitHub credentials.
 
 ## Development
 
-Go 1.26.9 or later is required (including the HTTP/TLS standard-library security fixes). Before publishing:
+Go 1.26.10 or later is required (including the HTTP/TLS and certificate-validation standard-library security fixes). Before publishing:
 
 ```sh
 go test -race -tags=integration ./...

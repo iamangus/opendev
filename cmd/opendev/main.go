@@ -30,6 +30,7 @@ import (
 	"github.com/iamangus/code-mcp/internal/graphiti"
 	"github.com/iamangus/code-mcp/internal/graphmcp"
 	"github.com/iamangus/code-mcp/internal/jobmcp"
+	"github.com/iamangus/code-mcp/internal/jobui"
 	"github.com/iamangus/code-mcp/internal/manager"
 	"github.com/iamangus/code-mcp/internal/outbox"
 	"github.com/iamangus/code-mcp/internal/pipeline"
@@ -457,8 +458,18 @@ func runMultiServer(addr, reposDir, stateDir, githubToken string, ghClient githu
 		h.ServeHTTP(w, r)
 	})
 
-	// Repository lifecycle is exposed through the authenticated MCP endpoint.
-	top := observeHTTP(logger, requireMCPToken(mcpToken, mcpMux))
+	// Only static dashboard assets are public. Its read-only job API shares the
+	// existing bearer boundary with MCP; the browser keeps that token in memory.
+	publicMux := http.NewServeMux()
+	dashboardAPI := http.NewServeMux()
+	jobui.Register(publicMux, dashboardAPI, jobStore)
+	// Keep the REST patterns in a separate mux: a job ID such as "mcp" would
+	// otherwise ambiguously intersect the wildcard repository MCP route.
+	protectedMux := http.NewServeMux()
+	protectedMux.Handle("/ui/api/", dashboardAPI)
+	protectedMux.Handle("/", mcpMux)
+	publicMux.Handle("/", requireMCPToken(mcpToken, protectedMux))
+	top := observeHTTP(logger, publicMux)
 
 	// Reconciliation can launch agent runs with MCP attachments. Accept those
 	// connections before dispatching anything from durable state.

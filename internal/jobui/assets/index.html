@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>OpenDev · Coding jobs</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./app.css">
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <a class="brand" href="./" aria-label="OpenDev jobs"><span class="brand-mark" aria-hidden="true">od<span>_</span></span><span>OpenDev<span class="brand-caption">Coding workspace</span></span></a>
+      <div class="header-actions"><span class="connection" id="connection" role="status"><span class="dot"></span><span id="connection-label">Not connected</span></span><button class="button subtle" id="disconnect" hidden>Disconnect</button></div>
+    </header>
+
+    <main>
+      <div class="page-heading"><div><p class="eyebrow">CONTROL ROOM</p><h1>Coding jobs</h1><p class="muted">From the first plan to the final pull request.</p></div><div class="refresh-controls"><span id="last-updated" class="muted small">Read-only · refreshes every 10s</span><button class="button" id="refresh" disabled><span aria-hidden="true">↻</span> Refresh</button></div></div>
+
+      <section class="connect-panel" id="connect-panel" aria-labelledby="connect-title">
+        <div><h2 id="connect-title">Connect to your workspace</h2><p class="muted">Use your existing OpenDev token. It stays in this tab’s memory, not in browser storage.</p></div>
+        <form id="connect-form" autocomplete="off"><label class="sr-only" for="token">OpenDev bearer token</label><input id="token" type="password" autocomplete="off" placeholder="OPENDEV_TOKEN" required spellcheck="false"><button class="button primary" id="connect-button" type="submit">Connect <span aria-hidden="true">→</span></button></form>
+        <p id="auth-error" class="error-text" role="alert" hidden></p>
+      </section>
+
+      <section class="stats" aria-label="Filter jobs by status">
+        <button class="stat selected" data-filter="all" aria-pressed="true"><span class="stat-label">All jobs</span><strong id="count-all">—</strong><span class="stat-note">Unarchived jobs</span></button>
+        <button class="stat" data-filter="active" aria-pressed="false"><span class="stat-label"><span class="dot blue"></span> Active</span><strong id="count-active">—</strong><span class="stat-note">Planning through publication</span></button>
+        <button class="stat" data-filter="attention" aria-pressed="false"><span class="stat-label"><span class="dot amber"></span> Needs attention</span><strong id="count-attention">—</strong><span class="stat-note">Blocked, paused, or failed</span></button>
+        <button class="stat" data-filter="completed" aria-pressed="false"><span class="stat-label"><span class="dot green"></span> Finished</span><strong id="count-completed">—</strong><span class="stat-note">Published, unchanged, or cancelled</span></button>
+      </section>
+
+      <div id="load-error" class="notice error-notice" role="alert" hidden></div>
+
+      <div class="workspace">
+        <section class="jobs-panel" aria-labelledby="jobs-title">
+          <div class="panel-heading"><h2 id="jobs-title">Job activity</h2><span id="result-count" class="muted small">—</span></div>
+          <div class="search-wrap"><span aria-hidden="true">⌕</span><label class="sr-only" for="search">Search jobs by repository, directive, or ID</label><input type="search" id="search" placeholder="Search jobs or repositories…" maxlength="200" disabled></div>
+          <ul id="jobs" class="job-list" aria-label="Coding jobs"></ul>
+          <div id="list-empty" class="empty-state"><span class="empty-icon" aria-hidden="true">⌘</span><h3>Everything in one place</h3><p class="muted">Connect to follow your coding jobs as they move through the pipeline.</p></div>
+          <nav class="pagination" aria-label="Job pages" id="pagination" hidden><button class="button subtle" id="previous">← Previous</button><span class="muted small" id="page-label"></span><button class="button subtle" id="next">Next →</button></nav>
+        </section>
+
+        <section class="detail-panel" id="detail" aria-label="Selected job details" aria-busy="false">
+          <div class="detail-placeholder"><span class="detail-symbol" aria-hidden="true">↗</span><h2>A clear view of the work.</h2><p class="muted">Select a job to see its tasks, review feedback, CI checks, and recent activity.</p><span class="read-only-label">STATUS & INSPECTION ONLY</span></div>
+        </section>
+      </div>
+      <noscript><p class="notice">Enable JavaScript to connect and view live job status.</p></noscript>
+      <footer><span>OpenDev</span><span>Read-only visibility. No job changes are made from this dashboard.</span></footer>
+    </main>
+  </div>
+</body>
+</html>
