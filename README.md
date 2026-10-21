@@ -188,7 +188,7 @@ Private repository access uses the configured GitHub credentials.
 
 ## Development
 
-Go 1.26.9 or later is required (including the HTTP/TLS standard-library security fixes). Before publishing:
+Go 1.26.10 or later is required (including the HTTP/TLS and certificate-validation standard-library security fixes). Before publishing:
 
 ```sh
 go test -race -tags=integration ./...
