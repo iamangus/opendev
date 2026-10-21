@@ -103,4 +103,29 @@ func TestMultiServerRestoresAuthenticatedRuntimeRoutes(t *testing.T) {
 			t.Errorf("%s: got %d %v, want %d", test.path, status, err, test.status)
 		}
 	}
+	for _, test := range []struct {
+		path, token string
+		status      int
+	}{
+		{"/ui/", "", 200},
+		{"/ui/app.js", "", 200},
+		{"/ui/api/jobs", "", 401},
+		{"/ui/api/jobs/" + job.ID, "", 401},
+		{"/ui/api/jobs", "test-secret", 200},
+		{"/ui/api/jobs/" + job.ID, "test-secret", 200},
+		{"/ui/api/jobs/mcp", "test-secret", 404},
+	} {
+		request, _ := http.NewRequest(http.MethodGet, "http://"+address+test.path, nil)
+		if test.token != "" {
+			request.Header.Set("Authorization", "Bearer "+test.token)
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != test.status {
+			t.Errorf("dashboard %s: got %d, want %d", test.path, response.StatusCode, test.status)
+		}
+	}
 }
